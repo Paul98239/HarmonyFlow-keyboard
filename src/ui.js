@@ -69,7 +69,6 @@ export function rafThrottle(fn) {
    ═══════════════════════════════════════════ */
 const uiStore = new Store({
   openPanel: null,        // 'song' | null：控制列彈出面板
-  poseSwitching: false,   // 現場人數切換中（模型重建 1~2 秒）：下拉停用，避免 UI 與 vision 對不上
   systemNote: null,       // { text, isError } | null：系統控制 bar 下方的狀態提示（鏡頭錯誤／人數切換失敗）
 });
 
@@ -159,8 +158,10 @@ function mountUiScale() {
 // （被拔除／被搶走時 vision.js 經 setCameraStateListener 通知，按一下即重連）。
 // 「現場人數」：MediaPipe 的 numPoses 與追蹤 ID 的上限（1~4）。沒有預設值——還沒選之前
 // vision.js 不推論；分譜的「指派演奏者」下拉也只列到這個人數（vision.js 的 setPoseCountListener，
-// 由 main.js 接到播放器）。vision.js 開頁就在背景把 1~4 人的模型都預建好，選人數通常是秒切換；
-// 只有背景還沒建完那極少數情況才會等 1~2 秒模型重建。切換人數等於重置骨架 ID。
+// 由 main.js 接到播放器）。vision.js 是懶惰載入、只維持一份使用中的實例：選人數（或換到還沒
+// 選過的人數）通常要等 1~2 秒模型重建，等待期間 vision.js 用舊的那份繼續正常推論、畫面不會
+// 凍結，只是新人數還沒生效；下拉不鎖，靠 POSE_COUNT_DEBOUNCE_MS 防抖與 runPoseCountSwitch()
+// 的單飛機制擋掉快速連續切換。切換人數（真的生效那一刻）等於重置骨架 ID。
 // 「重置骨架 ID」：vision.js 的 hardReset()，只有按鈕這一條觸發路徑（沒有鍵盤快捷鍵）。
 const cameraBtn = document.getElementById('btn-camera-toggle');
 const poseCountSelect = document.getElementById('poseCountSelect');
@@ -182,24 +183,45 @@ const systemBarActions = {
   },
 };
 
+const POSE_COUNT_DEBOUNCE_MS = 300; // 停在同一個值這麼久才真的觸發模型重建
+
+let poseCountTimer = 0;
+let poseCountWanted = 0;    // 使用者最後停留的值
+let poseCountRunning = false;
+
 const systemBarFields = {
-  'pose-count': async (el) => {
+  'pose-count': (el) => {
     const n = Number(el.value);
     if (!n) return; // Number('') 是 0，setPoseCount(0) 會拋錯
-    // 切換中鎖住下拉：模型重建要 1~2 秒，期間再改值會讓 UI 與 vision 對不上。
-    uiStore.set({ poseSwitching: true });
-    try {
-      await setPoseCount(n);
-      uiStore.set({ systemNote: null });
-    } catch (err) {
-      // 模型重建失敗時 vision.js 已經把原本的設定載回來，render 讀 getPoseCount() 就會讓下拉跟著回去
-      console.error('❌ 現場人數切換失敗', err);
-      uiStore.set({ systemNote: { text: `現場人數切換失敗：${err?.message || err}`, isError: true } });
-    } finally {
-      uiStore.set({ poseSwitching: false });
-    }
+    poseCountWanted = n;
+    clearTimeout(poseCountTimer);
+    poseCountTimer = setTimeout(runPoseCountSwitch, POSE_COUNT_DEBOUNCE_MS);
   },
 };
+
+// 單飛：同一時間只有一個 setPoseCount 在跑。跑完再回頭看使用者最後要的值，不一致就再跑
+// 一輪（處理「切換途中又改主意」）；guard 擋住理論上的無限重試。
+async function runPoseCountSwitch() {
+  if (poseCountRunning) return;
+  poseCountRunning = true;
+  try {
+    for (let guard = 0; guard < 3 && poseCountWanted && poseCountWanted !== getPoseCount(); guard++) {
+      try {
+        await setPoseCount(poseCountWanted);
+        console.log(`現場人數已切換為 ${poseCountWanted}`);
+        uiStore.set({ systemNote: null }); // 蓋掉上一次可能留著的失敗訊息
+      } catch (err) {
+        // 建置失敗時 vision.js 什麼都沒動，render 讀 getPoseCount() 會讓下拉退回原值
+        console.error('❌ 現場人數切換失敗', err);
+        uiStore.set({ systemNote: { text: `現場人數切換失敗：${err?.message || err}`, isError: true } });
+        poseCountWanted = getPoseCount(); // 不無限重試
+        break;
+      }
+    }
+  } finally {
+    poseCountRunning = false;
+  }
+}
 
 function mountSystemBar() {
   // 攝影機狀態一變就寫 note（message 是關閉原因或開啟失敗的文字，"" ＝ 使用者自己關的），
@@ -218,10 +240,10 @@ function renderSystemBar({ ui, camera, poseCount }) {
   cameraBtn.classList.toggle('is-on', camera.on);
   cameraBtn.disabled = camera.busy;
 
-  // 0（還沒選）對不到任何 option；設成 '' 會選回那個 disabled 的 placeholder。
-  const value = poseCount ? String(poseCount) : '';
+  // 下拉刻意不鎖（沒有池子後鎖 1~2 秒等於選錯不能改），靠防抖＋單飛擋快速連續切換；
+  // 切換成功與否都由 getPoseCount() 校正畫面上的值。
+  const value = poseCount ? String(poseCount) : ''; // 0（還沒選）對不到任何 option
   if (poseCountSelect.value !== value) poseCountSelect.value = value;
-  poseCountSelect.disabled = ui.poseSwitching;
 
   const text = ui.systemNote?.text || '';
   if (note.textContent !== text) note.textContent = text;

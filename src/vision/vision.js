@@ -38,11 +38,12 @@ const DEFAULT_POSE_MODEL = "lite";
 // MediaPipe 的 numPoses（同時追幾個人）。這個數字決定 MediaPipe 的工作模式：「追到的人數 ≥
 // numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
 // 「追到的人數 < numPoses」時偵測器每幀重跑，幽靈與抖動都是這個狀態的產物。
-// landmarker 開頁時以 DEFAULT_POSE_COUNT 預先建好、其餘 1~maxUsers 的 numPoses 在背景預建
-// （見 landmarkerPool），但還沒在系統控制 bar 選「現場人數」之前不推論（chosenPoseCount 為 0
-// 時 processFrame 跳過 detectForVideo）。使用者選了 N 才武裝偵測，numPoses 與追蹤層的槽位數
-// （＝ ID 上限）都設成 N（見 setPoseCount）。設小了多出來的人不會被偵測到，這是設定的字面意思。
-const DEFAULT_POSE_COUNT = CONFIG.maxUsers;
+// landmarker 是完全懶惰載入的：開頁不預建任何一份，還沒在系統控制 bar 選「現場人數」之前
+// 不推論（chosenPoseCount 為 0 時 processFrame 跳過 detectForVideo）。使用者選 N 才第一次
+// 建置 numPoses=N 的實例並武裝偵測，追蹤層的槽位數（＝ ID 上限）也設成 N（見 setPoseCount）。
+// 設小了多出來的人不會被偵測到，這是設定的字面意思。只維持一份使用中的實例（見
+// requestLandmarker()）：換人數／換模型變體時，新的建好才換手，等待期間畫面用舊的那份
+// 繼續正常推論，不會凍結，只是新設定生效前有 1~2 秒延遲（見 src/ui.js 的「調整人數中⋯」提示）。
 const POSE_COLORS = ["#00FFFF", "#FF6B6B", "#51CF66", "#FFD43B"]; // 4 人的代表色彩（依鎖定槽位對應）
 const BONE_WIDTH = 2;      // 骨架連線寬度（px）
 const JOINT_RADIUS = 2;    // 關節圓點半徑（px）
@@ -175,14 +176,14 @@ let consecutiveFrameErrors = 0; // 連續幀處理失敗計數，超過 FRAME_ER
 let lastProcessedVideoTime = -1; // 上一次真的送去推論的 video.currentTime（rAF 降級路徑用來跳過重複幀）
 let visionFileset = null; // FilesetResolver 的結果，切換模型時重用，不必重新載入 WASM
 let currentModelVariant = DEFAULT_POSE_MODEL;
-let currentPoseCount = DEFAULT_POSE_COUNT; // 目前使用中的 landmarker 的 numPoses（見 DEFAULT_POSE_COUNT）
-let chosenPoseCount = 0;                   // 系統控制 bar 選的「現場人數」；0 ＝ 還沒選 ＝ 不推論
-// numPoses(1~maxUsers) → 已建好（或建置中）的 PoseLandmarker promise，只對 currentModelVariant
-// 有效。開機建好 DEFAULT_POSE_COUNT 那份後，其餘人數在背景預建；選人數（setPoseCount）時池子
-// 裡多半已經有了，直接秒切換不必等模型重建。切換 model 變體（setPoseModel）時整組作廢重建。
-let landmarkerPool = new Map();
-let poolGeneration = 0; // 每次 setPoseModel 切變體 +1，讓切換前就在背景建置中的舊變體實例作廢
-let latestRequestedPoseCount = 0; // setPoseCount 的「最後一次呼叫勝出」判斷用
+let currentPoseCount = 0; // 目前使用中的 landmarker 的 numPoses；0 ＝ 還沒建過任何一份
+let chosenPoseCount = 0;  // 系統控制 bar 選的「現場人數」；0 ＝ 還沒選 ＝ 不推論
+// 唯一一個「在飛」的建置：{ variant, numPoses, promise }。同一組 config 重複要求共用同一顆
+// promise；換成別組 config 時舊的直接作廢（MediaPipe 沒有取消 API，只能在它 resolve 時
+// close 掉，見 requestLandmarker()）。取代 landmarkerPool／poolGeneration／
+// latestRequestedPoseCount：只有一份在飛，用物件識別（pendingBuild !== build）就完全取代
+// 世代號，不會有「舊變體被當成新變體快取」的情形。
+let pendingBuild = null;
 
 // ── 幀迴圈 ──
 // frameHandle：已排程的下一幀代號（rVFC 與 rAF 的 id 都 ≥ 1，0 ＝ 沒有排程中的回呼）。
@@ -843,10 +844,9 @@ function refreshStageHint() {
 }
 
 /* ═══════════════════════════════════════════
-   🧠 Pose 模型載入／numPoses 實例池
+   🧠 Pose 模型載入（單一實例，懶惰載入）
    ═══════════════════════════════════════════ */
-// 純粹建置，不動任何模組層狀態——這份實例在被 activate 之前都只是「建好放著」，可能是背景
-// 預建的其他人數，不該搶著把 currentModelVariant／currentPoseCount 改成自己的值。
+// 純粹建置，不動任何模組層狀態。
 async function loadPoseModel(variant, numPoses) {
   const modelAssetPath = POSE_MODELS[variant];
   if (!modelAssetPath) throw new Error(`未知的 pose 模型：${variant}`);
@@ -865,36 +865,43 @@ async function loadPoseModel(variant, numPoses) {
   });
 }
 
-// 拿（或開始建）某個人數的 landmarker，一律針對 currentModelVariant；同一個人數重複呼叫共用
-// 同一個建置中的 promise，不會重複建置。用 poolGeneration 擋過期結果：呼叫當下記住世代，
-// 建置完成時若世代已經變了（代表使用者中途用 setPoseModel 切了變體），直接關掉這份、不放進
-// 池子——避免舊變體的實例被誤當成新變體的快取。
-function getPooledLandmarker(numPoses) {
-  const cached = landmarkerPool.get(numPoses);
-  if (cached) return cached;
-  const myGeneration = poolGeneration;
-  const promise = loadPoseModel(currentModelVariant, numPoses).then((landmarker) => {
-    if (myGeneration !== poolGeneration) {
-      landmarker.close();
-      throw new Error("pose 模型變體已切換，捨棄過期的建置結果");
+// 唯一的建置入口。回傳：建好的 landmarker，或 null ＝「等待期間被更新的請求取代，這次不算
+// 數」（不是錯誤，呼叫端不該顯示錯誤訊息）。
+// 合併：同一組 (variant, numPoses) 在飛時直接共用同一顆 promise，不會建第二份。
+// 取代：不同組 config 進來時，舊的那個建置沒有人「要」了——但 MediaPipe 沒有取消 API，
+// 底層的 loadPoseModel() 仍會實際跑完，只是結果一出來就發現自己已經被取代、直接 close 丟棄；
+// 這代表使用者連續改變心意時（例如 2→3 選了之後 debounce 才剛觸發建置，建置中途又選 4），
+// 短暫幾秒內可能有兩個 loadPoseModel() 的 WASM／GPU 建置真的同時在跑——不是嚴格意義上的
+// 「同時只有一個 in-flight」，只是同一時間只有一個結果會被採用，另一個一建好就丟棄。這個
+// 重疊窗口短暫且會自我修正，跟拿掉常駐 4 份實例池的目標（降低穩定狀態的記憶體用量）不衝突。
+function requestLandmarker(variant, numPoses) {
+  if (pendingBuild && pendingBuild.variant === variant && pendingBuild.numPoses === numPoses) {
+    return pendingBuild.promise;
+  }
+  abandonPendingBuild();
+  const build = { variant, numPoses, promise: null };
+  build.promise = loadPoseModel(variant, numPoses).then(
+    (landmarker) => {
+      if (pendingBuild !== build) { landmarker.close(); return null; } // 已被取代：建好就直接丟
+      pendingBuild = null;
+      return landmarker;
+    },
+    (err) => {
+      if (pendingBuild === build) pendingBuild = null;
+      throw err; // 真正的失敗照樣往上拋，由呼叫端決定要不要顯示錯誤
     }
-    return landmarker;
-  });
-  landmarkerPool.set(numPoses, promise);
-  promise.catch(() => {
-    if (landmarkerPool.get(numPoses) === promise) landmarkerPool.delete(numPoses);
-  });
-  return promise;
+  );
+  pendingBuild = build;
+  return build.promise;
 }
 
-// 背景把其餘人數都預建好，之後選人數時多半已經在池子裡、秒切換。任何一個失敗都不擋其他
-// 人數也不擋主流程——這純粹是「讓之後選人數更快」的背景工作，失敗了退回「選的時候才建」，
-// 行為不會比沒有這個池子差，所以失敗只 warn。
-function warmUpRemainingCounts(excludeCount) {
-  for (let n = 1; n <= CONFIG.maxUsers; n++) {
-    if (n === excludeCount) continue;
-    getPooledLandmarker(n).catch((err) => console.warn(`⚠️ 背景預建 numPoses=${n} 失敗`, err));
-  }
+// 舊的在飛建置換人要了：清掉參照（它 resolve 時會自己走「已被取代」分支 close 掉），
+// 額外掛一個 catch 吞掉可能的 rejection 當防禦——目前設計下應該總有呼叫端在 await 它、
+// 不會真的變成 unhandled rejection，這裡純粹是多一層保險，不影響原呼叫端自己的錯誤處理。
+function abandonPendingBuild() {
+  const build = pendingBuild;
+  pendingBuild = null;
+  build?.promise.catch(() => {});
 }
 
 /* ═══════════════════════════════════════════
@@ -910,10 +917,9 @@ async function initSystem() {
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
     );
 
-    setStatus("正在載入 Pose 模型⋯");
-    poseLandmarker = await getPooledLandmarker(DEFAULT_POSE_COUNT);
-    currentPoseCount = DEFAULT_POSE_COUNT;
-    warmUpRemainingCounts(DEFAULT_POSE_COUNT); // 背景預建其餘人數，不 await、不擋開機流程
+    // Pose landmarker 完全懶惰載入，開機不建：chosenPoseCount 這時候是 0，使用者選人數之前
+    // processFrame() 本來就不推論，開機搶建一份可以證明完全沒被用過，只會白白拖慢開機、
+    // 多養一份常駐記憶體。真正共用的固定成本（WASM runtime）已經在上一步載入完成。
 
     setStatus("正在啟動鏡頭⋯");
     // 開機走的就是系統控制 bar 「開啟鏡頭」同一條路，只是失敗時這裡仍視為致命（error overlay）。
@@ -955,40 +961,33 @@ export function getPoseModelVariant() {
 }
 
 // 執行期切換 pose 模型。lite 抖動明顯時可切到 full／heavy 換取穩定度，代價是推論較慢。
-// 目前只有 lite 在用，這條路徑很少被呼叫：整個實例池是綁著「單一模型變體」設計的（池子只
-// 存這個變體的 1~maxUsers 份），切變體代表舊變體那些實例全部沒用了，作廢重建。
+// 目前只有 lite 在用、UI 沒有曝露這個功能，機制保留給日後接下拉選單。
 export async function setPoseModel(variant) {
   if (!POSE_MODELS[variant]) throw new Error(`未知的 pose 模型：${variant}`);
   if (!visionFileset || variant === currentModelVariant) return;
 
-  const previousVariant = currentModelVariant;
-  const staleEntries = [...landmarkerPool.entries()]; // [numPoses, promise][]，切失敗時要復原
-  poolGeneration++; // 讓舊變體所有建置中／已建好的池子項目在完成時自己作廢
-  landmarkerPool.clear();
-  currentModelVariant = variant;
+  // 還沒建過任何一份（使用者還沒選人數）：只要改記錄，第一次真的要建時自然就用新變體。
+  // 已知限制（目前 UI 未曝露變體切換，不影響現況）：如果這個分支命中時剛好有一個
+  // pendingBuild 正在飛（使用者選了人數、還沒建完），那個建置仍然用「舊」變體跑完，
+  // 這次的變體變更不會套用到它身上，要等下一次 setPoseCount 才會用新變體重建。
+  if (!poseLandmarker) { currentModelVariant = variant; return; }
 
-  const activeCount = currentPoseCount;
+  const targetCount = currentPoseCount;
   let landmarker;
   try {
-    landmarker = await getPooledLandmarker(activeCount);
+    landmarker = await requestLandmarker(variant, targetCount);
   } catch (err) {
-    // 新變體建置失敗：把舊變體的池子復原、變體名稱改回去，舊實例都還活著、沒被關掉，
-    // poseLandmarker 也沒被動過，行為等同「這次切換沒發生過」。
-    console.error(`❌ 切換 pose 模型失敗（${variant}），還原為 ${previousVariant}`, err);
-    poolGeneration++; // 再 +1：萬一剛剛失敗的建置晚一步才 resolve，也不會被誤當成當前世代
-    currentModelVariant = previousVariant;
-    landmarkerPool = new Map(staleEntries);
+    // 復原不需要做任何事：currentModelVariant 與 poseLandmarker 從頭到尾都沒被動過，
+    // 等待期間畫面一直用舊的那一份正常推論，行為等同「這次切換沒發生過」。
+    console.error(`❌ 切換 pose 模型失敗（${variant}），維持 ${currentModelVariant}`, err);
     throw err;
   }
-  poseLandmarker = landmarker;
-  currentPoseCount = activeCount;
-  warmUpRemainingCounts(activeCount);
+  if (!landmarker) return; // 等待期間被更新的請求取代（例如使用者改了人數）
 
-  // 舊變體的實例確定沒人用了才關掉（等它們各自 resolve，避免正在切換空窗期 processFrame
-  // 手上還拿著即將被關閉的舊實例）。
-  for (const [, entry] of staleEntries) {
-    entry.then((lm) => { if (lm !== landmarker) lm.close(); }).catch(() => {});
-  }
+  const stale = poseLandmarker;
+  poseLandmarker = landmarker;   // 換手；賦值是同步的，下一幀起就是新的
+  currentModelVariant = variant;
+  stale.close();                 // processFrame 是同步的、不跨 await，不可能有哪一幀手上還拿著它
 }
 
 // 「現場人數」確定之後的監聽者（main.js 把它接到播放器的 setPlayerCount：分譜的「指派演奏者」
@@ -999,26 +998,32 @@ export function setPoseCountListener(fn) {
 }
 
 // 系統控制 bar 選的「現場人數」；0 ＝ 還沒選（此時不推論）。
-// 不是 landmarker 的 numPoses（那是 currentPoseCount，開頁就預建成 4）。
+// 不是 landmarker 的 numPoses（那是 currentPoseCount，懶惰載入、第一次選人數才建）。
 export function getPoseCount() {
   return chosenPoseCount;
 }
 
-// 系統控制 bar 「現場人數」：從實例池拿（或等）對應人數的 landmarker，切成使用中，並武裝
-// 偵測。池子裡已經有的話幾乎是同步完成，不會有感延遲；還沒有的話退回等待建置完成，行為
-// 跟沒有池子時一樣。latestRequestedPoseCount 確保連續快速切換時最後一次呼叫才會真的生效
-// （不會因為前一次呼叫晚 resolve 而把畫面切回舊的人數）。
+// 系統控制 bar 「現場人數」：懶惰建置對應人數的 landmarker，建好才換手並武裝偵測——等待期間
+// （第一次選人數、或這個人數還沒建過時，約 1~2 秒）畫面用舊的那份（若有）繼續正常推論，
+// 不會凍結；成功不特別提示，失敗才由 src/ui.js 顯示在系統控制 bar 的錯誤訊息裡。
 export async function setPoseCount(count) {
   if (!Number.isInteger(count) || count < 1 || count > CONFIG.maxUsers) {
     throw new Error(`現場人數必須是 1~${CONFIG.maxUsers} 的整數：${count}`);
   }
   if (!visionFileset) throw new Error("視覺系統尚未就緒，無法設定現場人數");
-  latestRequestedPoseCount = count;
-  const landmarker = await getPooledLandmarker(count);
-  if (latestRequestedPoseCount !== count) return; // 等待期間使用者又選了別的人數，這次不算數
-  poseLandmarker = landmarker;
+
+  // 已經是這個 numPoses（重選同一個值／失敗後重試）：不重建，只要把偵測武裝起來。
+  if (poseLandmarker && currentPoseCount === count) { applyPoseCount(count); return true; }
+
+  const landmarker = await requestLandmarker(currentModelVariant, count);
+  if (!landmarker) return false; // 被更新的請求取代，這次不算數（不是錯誤）
+
+  const stale = poseLandmarker;
+  poseLandmarker = landmarker;   // 等待期間每一幀都還在用舊人數那一份，畫面不會凍結
   currentPoseCount = count;
+  stale?.close();                // 舊的立刻釋放——省記憶體的重點就在這一行
   applyPoseCount(count);
+  return true;
 }
 
 // 人數確定之後：武裝偵測、追蹤層的槽位數（＝ ID 上限）跟著人數走。換槽位數要重建
@@ -1092,8 +1097,10 @@ export function stopCamera() {
 window.addEventListener("beforeunload", () => {
   stopFrameLoop();
   cameraStream?.getTracks().forEach((t) => t.stop());
-  // poseLandmarker 只是池子裡「目前使用中」的那份，其餘背景預建的實例也要一起關掉。
-  for (const entry of landmarkerPool.values()) entry.then((lm) => lm.close()).catch(() => {});
+  // 只剩兩份可能活著：目前使用中的，跟正在建置中還沒交棒的那份（如果有）。
+  poseLandmarker?.close();
+  poseLandmarker = null;
+  abandonPendingBuild(); // 清掉參照，它 resolve 時會自己走「已被取代」分支 close
 
   if (gl) {
     gl.deleteTexture(glTexture);

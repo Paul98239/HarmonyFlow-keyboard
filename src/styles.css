@@ -305,7 +305,8 @@ body, html {
 .tl-scroll > *:first-child { padding-right: 2.4em; }
 
 /* ── 播放資訊 pill（#top-center-stack 第一個子元素，跟下面的控制列垂直疊在一起、都置中）──
-   內容只有「切換鈕＋歌名」，沒有進度條／時間讀數（沒有可拖曳的時間軸，見 humanPerformer.js）。
+   內容只有「切換鈕＋歌名」，沒有時間讀數／可拖曳的時間軸——唯讀的播放進度是另一個獨立元素
+   #topProgressBar（見下方 .top-progress-bar），不是這個 pill 的一部分。
    歌名完整顯示、不可用省略號截斷：pill 用 width:max-content 跟著內容自然變寬，只有 max-width
    攔住。max-width 直接沿用 #camera-frame 的寬度公式（min(100vw, 100vh*16/9)）——pill 最寬
    就是攝影機外框本身的寬度，天生不會超出外框，不用另外量測或用 JS 同步兩個元素的寬度。
@@ -329,6 +330,30 @@ body, html {
   border-radius: var(--radius-pill);
   box-shadow: var(--shadow-md);
 }
+
+/* ── 頂端進度條：獨立於播放 pill，純視覺 ──
+   寬度直接沿用 #camera-frame 的寬度公式（min(100vw, 100vh*16/9)）：#app-shell 用
+   justify-content:center 置中 #camera-frame，這個元素也用 left:50%+translateX(-50%) 置中，
+   兩者水平中心對齊，寬度公式一致就會跟外框左右邊緣切齊，不用 JS 量測或同步兩個元素的寬度
+   （跟 .toolbar-playback 的 max-width 用同一招）。
+   顏色語彙對應工作列／歌曲 pill：未播部分＝--border（跟 pill 的邊框同一組灰），已播部分＝
+   --accent（跟「播放中」「面板開啟」那些 is-on 狀態同一種黃）。
+   不掛任何 hover 淡化規則——這是刻意的：它是一眼帶過的進度指示，不該要先把滑鼠移過去才
+   看得到；固定在頂端也不會被下面的播放 pill 或控制列淡化影響。 */
+.top-progress-bar {
+  position: fixed;
+  top: 0; left: 50%;
+  transform: translateX(-50%);
+  z-index: 51; /* 在 #top-center-stack（50）之上一層，永遠可見，不被疊層蓋住 */
+  font-size: var(--ui-fs); /* 粗細用 em，要跟其他浮動元件同一套縮放基準，不吃 body 字級 */
+  appearance: none; -webkit-appearance: none; border: 0;
+  width: min(100vw, 100vh * 16 / 9);
+  height: 0.35em;
+  background: var(--border);
+}
+.top-progress-bar::-webkit-progress-bar { background: transparent; }
+.top-progress-bar::-webkit-progress-value { background: var(--accent); }
+.top-progress-bar::-moz-progress-bar { background: var(--accent); }
 
 /* 播放 pill 與控制列各自獨立淡化，純 CSS :hover／:has()／:focus-within，沒有 JS 計時器、
    沒有延遲：碰到（或鍵盤焦點進去）就顯示，沒碰到立刻淡化。工作列碰到時歌曲條也跟著顯示（可以順便看到現在播的是哪首），

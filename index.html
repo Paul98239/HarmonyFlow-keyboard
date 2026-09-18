@@ -33,7 +33,7 @@
 
   <!-- 版面骨架（HTML-first：所有靜態 UI 都寫在這裡，JS 只綁行為與填動態清單）：
        #app-shell 佔滿視窗，flex 置中一個 #camera-frame（視窗裝得下的最大 16:9 方框，見 src/styles.css），
-       攝影機畫面永久蓋著黑幕（#stage-blackout，見 src/styles.css）、進度細線在框內；頂端置中疊
+       攝影機畫面永久蓋著黑幕（#stage-blackout，見 src/styles.css）；頂端置中疊
        一欄 #top-center-stack（position:fixed，不受 #camera-frame 的 overflow:hidden 裁切）：
        播放 pill（#toolbar-playback）在上，系統控制／選歌控制列（#control-row）在下，兩者垂直
        分層、水平都置中，結構上就不會互相遮蔽。
@@ -44,11 +44,21 @@
        #stage-hint）。#stage-hint 是舞台中央的提示，absolute 定位、不佔 #stage 的 grid 格。
        唯一會重複的結構「分譜列」放在 <template id="tpl-part-row">，由 JS clone 後填聲部名。
        #app-shell 的 inert：開機期間整個 app 惰性（點不到、Tab 不到），src/ui.js 收起載入畫面時解除。
-       控制項的行為經 data-action（click）／data-field（change／input）委派到 #top-center-stack（src/ui.js）。 -->
+       控制項的行為經 data-action（click）／data-field（change／input）委派到 #top-center-stack（src/ui.js）。
+       #topProgressBar 是獨立於 #top-center-stack 之外的第三個 #app-shell 直接子元素：唯讀播放
+       進度，跨滿 #camera-frame 寬度、貼齊視窗頂邊，不可互動、不顯示任何時間文字，見下方元素
+       本身的註解與 src/midi/humanPerformer.js 的 getPositionSeconds()。 -->
   <div id="app-shell" inert>
+    <!-- 頂端進度條：純視覺、跨滿攝影機外框寬度、不可互動、不顯示任何時間文字。進度是播放頭在
+         原譜的第幾秒換算成比例（humanPerformer.getPositionSeconds() / score.durationSeconds）
+         ——沒人觸發時完全靜止、有觸發時會跳，這是拍級事件驅動的誠實呈現，不做補間動畫。用
+         <progress> 而不是可互動控制項：天生唯讀、不接點擊／拖曳、不會被 Tab 聚焦，也不做
+         seek——憑空跳過的拍要不要補聲音會直接牴觸「沒接手就靜音、沒有代打」，見
+         src/midi/humanPerformer.js。 -->
+    <progress id="topProgressBar" class="top-progress-bar" max="1" value="0" aria-label="播放進度" hidden></progress>
     <div id="top-center-stack">
       <!-- 播放 pill：一顆播放／暫停切換鈕（狀態靠顏色＋圖示）＋歌名（完整顯示、不用省略號截斷）。
-           沒有進度條／seek：指派聲部靠拋物線手勢逐步觸發，沒有一條可以拖曳的時間軸。 -->
+           沒有 seek：指派聲部靠拋物線手勢逐拍觸發，唯讀進度另外顯示在 #topProgressBar。 -->
       <div id="toolbar-playback" class="toolbar-playback">
         <button id="btnPlayPause" class="btn tb-toggle" type="button" data-action="play-pause" disabled aria-label="播放／暫停">
           <span class="tb-toggle-icon" aria-hidden="true"></span>

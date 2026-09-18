@@ -74,6 +74,7 @@ function makeVoice(partId, slot, notes, kind, channel) {
     limitSec: 0,            // 播放頭不能超過的界線
     claimed: false,         // 指派聲部是否曾經被自己的演奏者接手過（見 _emitDueNotes 的用法）
     lastSeq: null,          // 上次觀察到的手勢 triggerSeq，null＝還沒對過基準
+    lastSlot: undefined,    // 上次觀察到的指派槽位，與現在不同就重新對齊基準（見 _handleTriggers）
   };
 }
 
@@ -245,6 +246,7 @@ export class HumanPerformer {
       voice.limitSec = 0;
       voice.claimed = false;
       voice.lastSeq = null;
+      voice.lastSlot = undefined;
     }
     this._mCursor = 0;
     this._beatIndex = this._meaningful[0] ?? 0;
@@ -261,10 +263,29 @@ export class HumanPerformer {
   }
 
   /**
+   * 目前播放到「樂譜原始時間」的第幾秒（跟 note 的 startSeconds／endSeconds 同一個座標系）。
+   * 取所有聲部（含未指派）playSec 的最大值：未指派聲部照真實經過時間連續前進、指派聲部只在
+   * 自己的演奏者觸發時才跳，取最大值就能用同一個定義同時涵蓋「完全沒人指派＝整份自動播放」
+   * 與「有人指派」兩種情境。沒人揮手時這個值會完全停住、有觸發時會一次跳好幾拍——這是拍級
+   * 事件驅動的真實狀態，不是要被平滑掉的抖動，畫面不用補間動畫。純讀取、無副作用。
+   * @returns {number} 秒，夾在 [0, score.durationSeconds]；沒有樂譜或沒有聲部時 0
+   */
+  getPositionSeconds() {
+    if (!this._score || this._voices.size === 0) return 0;
+    let sec = 0;
+    for (const voice of this._voices.values()) {
+      if (voice.playSec > sec) sec = voice.playSec;
+    }
+    const total = this._score.durationSeconds;
+    return total > 0 ? Math.min(sec, total) : sec; // 曲末 limitSec 變 Infinity，夾住不超過總長
+  }
+
+  /**
    * 由 midiPlayer.js 的排程 tick（~12ms）每次呼叫。
    * @param {number} nowMs  performance.now()
-   * @param {(partId:string) => {present:boolean, triggerSeq:number}} getGestureFor
-   *        該聲部指派 ID 目前的手勢狀態：present＝在場、triggerSeq＝拋物線觸發的累加計數。
+   * @param {(partId:string) => {present:boolean, triggerSeq:number, slot:number|null}} getGestureFor
+   *        該聲部指派 ID 目前的手勢狀態：present＝在場、triggerSeq＝拋物線觸發的累加計數、
+   *        slot＝目前指派到的演奏者槽位（沒指派是 null）。
    */
   tick(nowMs, getGestureFor) {
     if (!this._playing) return;
@@ -290,7 +311,21 @@ export class HumanPerformer {
     for (const voice of this._voices.values()) {
       if (voice.kind !== 'human') continue;
       const gesture = getGestureFor(voice.partId);
-      if (voice.lastSeq === null) { voice.lastSeq = gesture.triggerSeq; continue; } // 首次只記基準
+
+      if (voice.lastSeq === null) {
+        // 首次觀察：只記基準，不算觸發。
+        voice.lastSeq = gesture.triggerSeq;
+        voice.lastSlot = gesture.slot;
+        continue;
+      }
+      if (gesture.slot !== voice.lastSlot) {
+        // 指派的槽位變了（改指派到別的演奏者、或人數變小被動清掉指派）：別的槽位的觸發
+        // 計數是另一條獨立的累加序列，直接拿來比會被誤判成一次憑空冒出來的觸發，讓這個
+        // 聲部無端前進一步。重新對齊基準，這一刻不算觸發。
+        voice.lastSlot = gesture.slot;
+        voice.lastSeq = gesture.triggerSeq;
+        continue;
+      }
       if (gesture.triggerSeq === voice.lastSeq) continue;
       voice.lastSeq = gesture.triggerSeq;
 

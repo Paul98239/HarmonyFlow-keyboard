@@ -64,6 +64,8 @@ const LOADING_INDICATOR_DELAY_MS = 120; // 按播放後延遲這麼久才顯示 
  * @property {object[]} parts            score.parts；長度 > 1 才顯示分譜區塊
  * @property {Map<string, number>} assignments partId → 演奏者 ID；改動時換新 Map
  * @property {number} playerCount        系統控制 bar 選的「現場人數」；0 ＝ 還沒選
+ * @property {number} positionSeconds    目前播放位置（樂譜原始秒數，同 note.startSeconds 座標系）；
+ *                                       頂端進度條唯讀顯示用，沒有任何 seek 路徑會寫它
  * @property {{ items: object[], categories: string[], query: string, category: string, status: 'idle' | 'searching' | 'ready' | 'empty' | 'error', selectedId: string }} library
  */
 export const playerStore = new Store(/** @type {PlayerState} */ ({
@@ -75,6 +77,7 @@ export const playerStore = new Store(/** @type {PlayerState} */ ({
   parts: [],
   assignments: new Map(),
   playerCount: 0,
+  positionSeconds: 0,
   library: { items: [], categories: [], query: '', category: '', status: 'idle', selectedId: '' },
 }));
 
@@ -112,13 +115,16 @@ const allPartIds = () => playerStore.state.parts.map((p) => p.id);
 // 目前確實存在於 score 又被指派出去的聲部 id。
 const assignedPartIds = () => allPartIds().filter((id) => playerStore.state.assignments.has(id));
 // humanPerformer.tick() 每個 tick 問一次：這個聲部指派的演奏者 ID 現在的手勢狀態
-// （在場與否、拋物線觸發的累加計數）。
+// （在場與否、拋物線觸發的累加計數、目前指派到的槽位）。多回報 slot 是讓
+// humanPerformer.js 能偵測「指派中途變了」（改指派、或人數變小被動清掉指派），
+// 避免把換槽位那一刻誤判成一次真的觸發。
 const gestureFor = (partId) => {
-  const slot = playerStore.state.assignments.get(partId);
-  if (!slot) return { present: false, triggerSeq: 0 };
+  const slot = playerStore.state.assignments.get(partId) ?? null;
+  if (!slot) return { present: false, triggerSeq: 0, slot: null };
   return {
     present: presentSlots.includes(slot),
     triggerSeq: arcTriggerSeqBySlot[slot] ?? 0,
+    slot,
   };
 };
 
@@ -149,7 +155,7 @@ export function setGesturePerformanceState(state) {
    分譜載入
    ═══════════════════════════════════════════ */
 function clearScore() {
-  playerStore.set({ score: null, parts: [], assignments: new Map() });
+  playerStore.set({ score: null, parts: [], assignments: new Map(), positionSeconds: 0 });
 }
 
 // 選歌之後的「載入」步驟：解析＋更新分譜清單，不啟動音源引擎。
@@ -324,7 +330,7 @@ export async function warmUpMidiEngine() {
   return ok;
 }
 
-// 200ms 的 UI tick：播完偵測、humanGate 定期補算。
+// 200ms 的 UI tick：播完偵測、humanGate 定期補算、頂端進度條同步。
 function uiTick() {
   if (!isSongLoading && synth.isLoaded() && !endHandled && synth.isFinished()) {
     endHandled = true;
@@ -334,6 +340,14 @@ function uiTick() {
   // humanGain 總開關的定期補算：讓「播放→暫停／播完」這類狀態轉變即使當下
   // 沒有新的手勢狀態進來，也會在 200ms 內把 humanGain 收到正確位置（synth.js 那邊 target 去重）。
   updateHumanGate();
+
+  // 唯讀進度：位置來自 humanPerformer（原譜座標），不是真實經過時間——沒人觸發就會停住不動。
+  // 用「跟目前 store 值的差距夠不夠大」節流，不是整數秒（沒有文字要顯示，不需要卡在整數）：
+  // 差距小於 0.05s（畫面上幾乎看不出來的寬度變化）就不寫，避免每 200ms 都排一輪全區塊 render。
+  const pos = synth.isLoaded() ? synth.humanPerformer.getPositionSeconds() : 0;
+  if (Math.abs(pos - playerStore.state.positionSeconds) > 0.05) {
+    playerStore.set({ positionSeconds: pos });
+  }
 }
 
 // 真人聲部的排程 tick：把每個指派聲部目前的手勢狀態（在場／觸發計數）交給
@@ -358,6 +372,9 @@ export function startPlayer() {
 const pill = document.getElementById('toolbar-playback');
 const btn = document.getElementById('btnPlayPause');
 const statusText = document.getElementById('midiStatusText');
+// 頂端進度條：獨立於這個 pill 之外的元素（見 index.html），只在這裡讀 DOM 參照，不影響
+// fitSongTitle() 量的 pill／btn 寬度。
+const topProgressBar = document.getElementById('topProgressBar');
 
 const IDLE_TITLE = '等待選擇歌曲...';
 
@@ -400,6 +417,17 @@ function renderTransportPill({ player }) {
   if (statusText.textContent !== text) {
     statusText.textContent = text;
     fitSongTitle();
+  }
+}
+
+// 頂端進度條：跟 renderTransportPill 平行、互不依賴。沒有分譜資訊（score 為 null 或
+// durationSeconds 為 0）就整條收起來，不顯示沒有意義的 0% 進度。
+function renderTopProgress({ player }) {
+  const total = player.score?.durationSeconds || 0;
+  topProgressBar.hidden = !(total > 0);
+  if (total > 0) {
+    const ratio = Math.min(1, player.positionSeconds / total);
+    if (topProgressBar.value !== ratio) topProgressBar.value = ratio;
   }
 }
 
@@ -613,6 +641,7 @@ export function mount() {
 }
 export function render(snapshot) {
   renderTransportPill(snapshot);
+  renderTopProgress(snapshot);
   renderSongPanel(snapshot);
   renderLibraryPicker(snapshot);
 }
