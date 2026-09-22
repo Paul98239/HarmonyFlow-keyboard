@@ -1,25 +1,35 @@
 // ============================================================
-//  humanPerformer.js — 拍級事件驅動排程器（純邏輯，無 DOM／CDN）
+//  humanPerformer.js — 事件驅動排程器（純邏輯，無 DOM／CDN）
 //
-//  沒有背景時鐘、沒有拍速估計：共用拍位只在「有效觸發」發生的那一刻才前進，其他時間完全
-//  靜止。每個聲部有自己的播放頭 `playSec`（依真實經過時間前進）與上限 `limitSec`（播放頭
-//  不能超過的界線）——觸發只做一件事：把某個聲部的上限推到「這一拍結束」。
+//  沒有背景時鐘：共用拍位只在「有效觸發」發生的那一刻才前進，其他時間完全靜止，沒有觸發
+//  就不會自己往前走（曾經試過拍速估計器＋電腦代打的版本，因為沒人揮手曲子也會自己前進而
+//  被拿掉，見專案的 git 歷史；這裡的拍速估計只影響「已經被揮手推進的範圍」爬多快，不會
+//  重新長出自動前進的背景時鐘）。每個聲部有自己的播放頭 `playSec`（依現場拍速前進）與
+//  上限 `limitSec`（播放頭不能超過的界線）。
 //
 //  指派聲部：演奏者在目前拍上還有沒播出的音，觸發就在原地把上限推到拍尾（claim）；沒有的
-//  話，把共用拍位跳到下一個「有意義的拍」（任一被指派聲部有音符從那一拍開始的拍，休止符
-//  跟正在響的長音都不算，自動被跳過），再 claim。跳過的過程中，其他被指派聲部若剛好也有
-//  音符落在被跳過的拍上，這一輪沒被自己的演奏者觸發＝直接靜音丟棄，不會被電腦補（沒有
-//  代打），也不會因為共用拍位路過就被誤判成發聲——這是這個排程器最容易出錯的地方，見
-//  `_advanceBeat()` 的註解。
+//  話，把共用拍位直接推到這個聲部「下一個真正有音符的拍」（`_advanceToNextNote()`，可能
+//  一次跨過好幾個沒有音符的空拍——全音符只需要一次觸發，不需要對著空拍反覆揮手），再
+//  claim。跳過的過程中，其他被指派聲部若剛好也有音符落在被跳過的拍上，這一輪沒被自己的
+//  演奏者觸發＝直接靜音丟棄，不會被電腦補（沒有代打），也不會因為共用拍位路過就被誤判成
+//  發聲——這是這個排程器最容易出錯的地方，見 `_advanceToNextNote()` 的註解。
+//
+//  現場拍速：每次推進時，用「這次觸發的真實間隔 ÷ 這次跨過的拍數」量一次「現場每拍幾秒」
+//  （`_updateLiveTempo()`），指數平滑後驅動 `_tempoScale()`——播放頭與正在響的音的剩餘
+//  時長都依這個比例縮放，讓揮手快慢直接對應音樂快慢。拍位本身的格線（哪一拍在原譜上是
+//  幾秒）來自 `buildBeatGrid()`，是 SMF 規格保證的確定性計算；但「一次揮手對應推進到哪、
+//  現場拍速怎麼從離散事件反推」全部是應用層假設，不是規格——這幾個假設列在
+//  `DEFAULT_PERFORMER_CONFIG` 旁邊的模組常數註解裡。
 //
 //  未指派聲部（真正的電腦伴奏）：上限永遠等於 `_frontierSec`（全域值＝目前所有指派演奏者
-//  推進最遠的那一位），完全不受自己有沒有觸發影響，任何一次觸發把拍位往前推，伴奏就跟著
-//  反應式播放——沿用最早版本「伴奏進度綁在推進最遠的那一位」的語意。完全沒有人被指派時，
-//  `_frontierSec` 從 `load()` 就直接設成 `Infinity`，等同整份照真實經過時間連續自動播放。
+//  推進最遠的那一位），完全不受自己有沒有觸發影響，任何一次觸發把拍位往前推，伴奏的播放頭
+//  也會立刻對齊到新拍起點，跟著反應式播放，不會累積落後。完全沒有人被指派時，`_frontierSec`
+//  從 `load()` 就直接設成 `Infinity`，等同整份照真實經過時間連續自動播放。
 //
-//  正在響的音只由它自己的合成器、在 `playSec` 真的越過它自己的 `endSeconds` 時才關閉，
-//  不會因為共用拍位的跳躍被提前掐斷或重疊發聲。velocity 一律用樂譜原值，不套用手勢公式；
-//  不重播 CC／pitch-bend，音色只在 load() 時套用一次。
+//  正在響的音各自倒數自己的原譜時長（依現場拍速縮放的 `remain`，見 `_emitDueNotes()`／
+//  `_releaseDue()`），完全獨立於播放頭的跳躍：跳拍不會把它提前掐斷，也不會被它擋住不能出
+//  下一個音。velocity 一律用樂譜原值，不套用手勢公式；不重播 CC／pitch-bend，音色只在
+//  load() 時套用一次。
 // ============================================================
 
 import { buildBeatGrid } from './midiParser.js';
@@ -29,6 +39,16 @@ export const DEFAULT_PERFORMER_CONFIG = Object.freeze({
 });
 
 const CHANNELS_PER_PORT = 16;
+
+/* ═══════════════════════════════════════════
+   拍速跟隨的常數（應用層假設，不是規格——規格沒有「揮手」這種東西，見檔頭說明）
+   ═══════════════════════════════════════════ */
+
+const TEMPO_SMOOTHING = 0.65;      // 新量到的拍速佔 65%，一次揮手就跟上大半，又擋得住單次誤判
+const TEMPO_MIN_INTERVAL_S = 0.05; // 比這更短的間隔當誤觸發，不拿來估拍速
+const TEMPO_MAX_INTERVAL_S = 4;    // 比這更長＝中途停下來，不拿來估拍速（沿用上一次量到的值）
+const TEMPO_SCALE_MIN = 0.25;      // 播放頭爬的速度相對原譜的下限，避免揮太慢時直接卡死
+const TEMPO_SCALE_MAX = 4;         // 上限，避免揮太快時把播放頭甩飛
 
 /* ═══════════════════════════════════════════
    輸出 channel 分配
@@ -69,7 +89,7 @@ function makeVoice(partId, slot, notes, kind, channel) {
   return {
     partId, slot, kind, channel, notes,
     cursor: 0,              // 下一個「還沒排程」的音符在 notes 裡的位置
-    sounding: new Map(),    // note(音高) → endSeconds
+    sounding: new Map(),    // note(音高) → { remain }：還剩幾樂譜秒才該關閉
     playSec: 0,             // 這個聲部的播放頭
     limitSec: 0,            // 播放頭不能超過的界線
     claimed: false,         // 指派聲部是否曾經被自己的演奏者接手過（見 _emitDueNotes 的用法）
@@ -125,10 +145,11 @@ export class HumanPerformer {
     this._score = null;
     this._beats = [];          // buildBeatGrid() 的結果；空陣列＝無法算拍（SMPTE division）
     this._voices = new Map();  // partId → voice
-    this._meaningful = [];     // 有意義的拍：任一被指派聲部有音符從這一拍開始（升冪、去重）
-    this._mCursor = 0;         // 在 _meaningful 裡的位置，只前進不回頭
     this._beatIndex = 0;       // 目前共用拍位在 _beats 裡的 index
+    this._startBeatIndex = 0;  // load() 算出的起始拍位，stop() 要退回這裡
     this._frontierSec = 0;     // 未指派聲部的播放頭上限＝目前指派演奏者推進最遠的那一位
+    this._liveSecPerBeat = null; // 現場量到的「每拍幾秒」，null＝還沒量到、用原譜速度
+    this._lastAdvanceMs = null;  // 上一次推進拍位的時刻，量拍速的基準
     this.unplacedPartIds = [];
     this._playing = false;
     this._lastTickMs = null;   // null＝下一次 tick() 不推進播放頭，只記錄基準
@@ -140,7 +161,7 @@ export class HumanPerformer {
   }
 
   /**
-   * 載入這首歌：建立聲部、套初始音色，準備好共用拍格線與「有意義的拍」索引。
+   * 載入這首歌：建立聲部、套初始音色，準備好共用拍格線與起始拍位。
    * @param {import('./midiParser.js').ParsedMidi} score  parseMidi() 的結果（不會被修改）
    * @param {Map<string,number>|[string,number][]} assignments  partId → 演奏者槽位
    */
@@ -163,29 +184,35 @@ export class HumanPerformer {
       const part = partById.get(voice.partId);
       const synth = voice.kind === 'human' ? this.humanSynth : this.accompSynth;
       this._applyInitialPatch(synth, voice.channel, part);
-      // CC7 不在「reset all controllers」清單裡，channel 又是跨曲重複使用：明確送一次 GM
-      // 預設值 100，避免沿用到別的曲子／別的聲部在同一個 channel 索引上留下的音量設定。
+      // CC7 不在「reset all controllers」清單裡（已用 GML-v1 §3.2.5.2 驗證），channel 又是
+      // 跨曲重複使用：明確送一次 GM 預設值 100，避免沿用到別的曲子／別的聲部在同一個
+      // channel 索引上留下的音量設定。
       try { synth?.controllerChange(voice.channel, 7, 100); } catch (err) {}
     }
 
     this._tagNotesWithBeat();
+    this._startBeatIndex = this._computeStartBeatIndex();
+    this._beatIndex = this._startBeatIndex;
 
-    // 「有意義的拍」只看被指派聲部：未指派聲部的音符不需要被接手，不影響這份索引。
-    const meaningfulSet = new Set();
+    // 完全沒有人被指派、或指派了但完全沒有音符時，永遠不會有觸發，_frontierSec 沒有任何
+    // 路徑可以被推進——必須在這裡顯式退回「整份照真實經過時間連續自動播放」，不能指望
+    // 一般邏輯自動長出這個特例。
+    const hasHumanNotes = [...this._voices.values()].some((v) => v.kind === 'human' && v.notes.length > 0);
+    this._frontierSec = hasHumanNotes
+      ? this._beats[this._beatIndex].startSeconds // 前奏：未指派聲部先照實時播到第一個真人入場點
+      : Infinity;
+  }
+
+  // 所有指派聲部裡，最早出現音符的那一拍——拍位的起點，也是 stop() 之後要退回的原點。
+  // 沒有指派聲部、或指派了但完全沒有音符時回傳 0（此時 _frontierSec 會是 Infinity，這個
+  // 值不會被實際用到，只是給個確定的初始狀態）。
+  _computeStartBeatIndex() {
+    let first = Infinity;
     for (const voice of this._voices.values()) {
-      if (voice.kind !== 'human') continue;
-      for (const n of voice.notes) meaningfulSet.add(n.beatIndex);
+      if (voice.kind !== 'human' || !voice.notes.length) continue;
+      if (voice.notes[0].beatIndex < first) first = voice.notes[0].beatIndex;
     }
-    this._meaningful = [...meaningfulSet].sort((a, b) => a - b);
-    this._mCursor = 0;
-    this._beatIndex = this._meaningful[0] ?? 0;
-
-    // 完全沒有人被指派時，永遠不會有觸發，_frontierSec 沒有任何路徑可以被推進——必須在這裡
-    // 顯式退回「整份照真實經過時間連續自動播放」，不能指望一般邏輯自動長出這個特例。
-    const hasAssigned = [...this._voices.values()].some((v) => v.kind === 'human');
-    this._frontierSec = (!hasAssigned || !this._meaningful.length)
-      ? Infinity
-      : this._beats[this._meaningful[0]].startSeconds; // 前奏：未指派聲部先照實時播到第一個真人入場點
+    return Number.isFinite(first) ? first : 0;
   }
 
   // 用只前進的游標把每個聲部的 notes（已依 startTick 排序）逐顆標上 beatIndex。
@@ -237,7 +264,7 @@ export class HumanPerformer {
     }
   }
 
-  // 停止／換歌前的清場：收音＋每個聲部的播放狀態全部歸零。
+  // 停止／換歌前的清場：收音＋每個聲部的播放狀態全部歸零，拍速估計也重來。
   stop() {
     this.pause();
     for (const voice of this._voices.values()) {
@@ -248,8 +275,9 @@ export class HumanPerformer {
       voice.lastSeq = null;
       voice.lastSlot = undefined;
     }
-    this._mCursor = 0;
-    this._beatIndex = this._meaningful[0] ?? 0;
+    this._liveSecPerBeat = null;
+    this._lastAdvanceMs = null;
+    this._beatIndex = this._startBeatIndex;
   }
 
   isPlaying() { return this._playing; }
@@ -264,9 +292,9 @@ export class HumanPerformer {
 
   /**
    * 目前播放到「樂譜原始時間」的第幾秒（跟 note 的 startSeconds／endSeconds 同一個座標系）。
-   * 取所有聲部（含未指派）playSec 的最大值：未指派聲部照真實經過時間連續前進、指派聲部只在
+   * 取所有聲部（含未指派）playSec 的最大值：未指派聲部照現場拍速連續前進、指派聲部只在
    * 自己的演奏者觸發時才跳，取最大值就能用同一個定義同時涵蓋「完全沒人指派＝整份自動播放」
-   * 與「有人指派」兩種情境。沒人揮手時這個值會完全停住、有觸發時會一次跳好幾拍——這是拍級
+   * 與「有人指派」兩種情境。沒人揮手時這個值會完全停住、有觸發時會一次跳好幾拍——這是
    * 事件驅動的真實狀態，不是要被平滑掉的抖動，畫面不用補間動畫。純讀取、無副作用。
    * @returns {number} 秒，夾在 [0, score.durationSeconds]；沒有樂譜或沒有聲部時 0
    */
@@ -292,22 +320,39 @@ export class HumanPerformer {
     const dt = this._lastTickMs == null ? 0 : (nowMs - this._lastTickMs) / 1000;
     this._lastTickMs = nowMs;
 
-    this._handleTriggers(getGestureFor);
+    this._handleTriggers(getGestureFor, nowMs);
     this._advancePlayheads(dt);
     this._emitDueNotes();
   }
 
+  // 目前這一拍在原譜上是幾秒——固定拍長，來自規格保證的格線（buildBeatGrid()），不是估計。
+  _scoreSecPerBeat() {
+    const beat = this._beats[this._beatIndex];
+    return beat.endSeconds - beat.startSeconds;
+  }
+
+  // 播放頭該用多快的速度爬，相對原譜速度的比例：原譜這一拍幾秒 ÷ 現場量到的每拍幾秒，
+  // 夾在上下限之間。還沒量到現場拍速時回 1（＝照原譜速度播）。這是應用層假設（N2／N4），
+  // 不是規格資料。
+  _tempoScale() {
+    if (this._liveSecPerBeat == null) return 1;
+    const scale = this._scoreSecPerBeat() / this._liveSecPerBeat;
+    return Math.min(TEMPO_SCALE_MAX, Math.max(TEMPO_SCALE_MIN, scale));
+  }
+
   _advancePlayheads(dt) {
     if (dt <= 0) return;
+    const step = dt * this._tempoScale();
     for (const voice of this._voices.values()) {
       const limit = voice.kind === 'accomp' ? this._frontierSec : voice.limitSec;
-      voice.playSec = Math.min(voice.playSec + dt, limit);
+      voice.playSec = Math.min(voice.playSec + step, limit);
+      for (const sounding of voice.sounding.values()) sounding.remain -= step;
     }
   }
 
   // 逐一檢查每個指派聲部有沒有新觸發：有的話，這一拍上這個聲部若還有沒播出的音就地
-  // claim；沒有就把共用拍位推到下一個有意義的拍，再 claim。
-  _handleTriggers(getGestureFor) {
+  // claim；沒有就把共用拍位推到這個聲部下一個真正有音符的拍，再 claim。
+  _handleTriggers(getGestureFor, nowMs) {
     for (const voice of this._voices.values()) {
       if (voice.kind !== 'human') continue;
       const gesture = getGestureFor(voice.partId);
@@ -330,7 +375,7 @@ export class HumanPerformer {
       voice.lastSeq = gesture.triggerSeq;
 
       if (this._hasPendingInCurrentBeat(voice)) this._claim(voice);
-      else { this._advanceBeat(); this._claim(voice); }
+      else { this._advanceToNextNote(voice, nowMs); this._claim(voice); }
     }
   }
 
@@ -339,60 +384,72 @@ export class HumanPerformer {
     return !!n && n.beatIndex === this._beatIndex;
   }
 
-  // claim：只動「這一個」被觸發的聲部——播放頭夾到這一拍起點、上限至少推到這一拍結束。
+  // claim：只動「這一個」被觸發的聲部——播放頭夾到這一拍起點、上限推到這一拍結束。
   // 拍內若有多顆音符（十六分音符群），會在接下來幾個 tick 依各自原始時間差自然鋪開，不會
   // 被壓成和弦。
   //
-  // 上限不能只設成「這一拍結束」：跨越好幾拍的長音（使用者的全音符案例）起點雖然落在這一
-  // 拍，endSeconds 卻遠在後面，上限沒跟著延伸的話，這顆音會被 _releaseDue() 無限期晾著、
-  // isFinished() 也永遠不會是 true，除非使用者再多觸發一次——但那次觸發在音樂上毫無意義
-  // （沒有新的音要播），跟「一顆長音只需要一次手勢」的設計目標矛盾。所以要往前掃這一拍裡
-  // 所有還沒播出的音符（同一拍＝和弦或音群），取它們 endSeconds 的最大值：這個範圍就是這次
-  // claim 保證要讓其發生的東西，不會因此提前暴露下一拍才該出現的音（下一拍的音要嘛 beatIndex
-  // 不同、要嘛還沒被這次觸發的演奏者接手）。
+  // 上限只到「這一拍結束」就夠了：長音（例如全音符）自己會不會撐超過這一拍的時長，交給
+  // _emitDueNotes()／_releaseDue() 用獨立的 remain 倒數處理（見那兩個函式的註解），不需要
+  // 在這裡往前掃這一拍裡的音符去延伸 limitSec——這樣新的觸發可以立刻讓下一個音出來，不會
+  // 被前一個還在響的長音卡住（這正是這次要修的「揮手快於原譜就無限累積延遲」的根因）。
   _claim(voice) {
     voice.claimed = true;
     const beat = this._beats[this._beatIndex];
-    // 播放頭只有在這個聲部目前完全沒有音在響時，才能直接跳到這一拍起點——跳過的是純粹的
-    // 休止符靜默，沒有可聽見的後果。如果還有音在響（演奏者提早觸發下一步，長音的真實時長
-    // 還沒走完），播放頭維持原地不動，交給 _advancePlayheads() 依真實經過時間自然推進到
-    // 它自己的 endSeconds 再放：不能用這裡的跳躍把正在響的音提前切斷，即使跳躍是它自己的
-    // 演奏者觸發的也一樣。
-    if (voice.sounding.size === 0) {
-      voice.playSec = Math.max(voice.playSec, beat.startSeconds);
-    }
-    let limit = beat.endSeconds;
-    for (let i = voice.cursor; i < voice.notes.length && voice.notes[i].beatIndex === this._beatIndex; i++) {
-      if (voice.notes[i].endSeconds > limit) limit = voice.notes[i].endSeconds;
-    }
-    voice.limitSec = Math.max(voice.limitSec, limit);
+    voice.playSec = Math.max(voice.playSec, beat.startSeconds);
+    voice.limitSec = Math.max(voice.limitSec, beat.endSeconds);
   }
 
-  // 把共用拍位跳到下一個「有意義的拍」（游標只前進不回頭）。
+  // 把共用拍位推到「這個聲部下一個真正有音符的拍」——不是機械化前進一拍，而是直接跳到
+  // voice.notes[voice.cursor] 所在的那一拍，可能一次跨過好幾個沒有音符的空拍（全音符只
+  // 需要一次觸發，不用對著空拍反覆揮手；四分音符連續進行時效果等同一拍一次，因為下一個
+  // 音就在下一拍）。
   //
   // 這裡不能對「所有」指派聲部都把 playSec／limitSec 推到新拍起點——被路過、但沒被自己的
   // 演奏者觸發的聲部，若音符的 startSeconds 剛好等於新拍起點，會被 _emitDueNotes() 誤判成
   // 到期發聲，等於用另一個名字重新做了一次代打。正確做法：被路過的聲部只丟棄游標（沒接手
   // 的音直接靜音丟棄，不會被之後任何觸發「追討」回來），播放頭與上限完全不動；只有真正
   // 觸發這次前進的那個聲部，才會在這個函式之後緊接著呼叫的 _claim() 裡移動播放頭。
-  _advanceBeat() {
-    while (this._mCursor < this._meaningful.length && this._meaningful[this._mCursor] <= this._beatIndex) {
-      this._mCursor++;
-    }
-    if (this._mCursor >= this._meaningful.length) { this._enterFinale(); return; }
-    this._beatIndex = this._meaningful[this._mCursor];
-    const beat = this._beats[this._beatIndex];
+  _advanceToNextNote(voice, nowMs) {
+    const nextNote = voice.notes[voice.cursor];
+    if (!nextNote) { this._enterFinale(); return; }
 
-    for (const voice of this._voices.values()) {
-      if (voice.kind !== 'human') continue;
-      while (voice.cursor < voice.notes.length && voice.notes[voice.cursor].beatIndex < this._beatIndex) {
-        voice.cursor++;
+    const prevBeatIndex = this._beatIndex;
+    this._beatIndex = nextNote.beatIndex;
+    this._updateLiveTempo(nowMs, Math.max(1, this._beatIndex - prevBeatIndex));
+
+    const beat = this._beats[this._beatIndex];
+    for (const other of this._voices.values()) {
+      if (other === voice) continue;
+      if (other.kind === 'human') {
+        while (other.cursor < other.notes.length && other.notes[other.cursor].beatIndex < this._beatIndex) {
+          other.cursor++;
+        }
+      } else if (other.playSec < beat.startSeconds) {
+        other.playSec = beat.startSeconds;
+        while (other.cursor < other.notes.length && other.notes[other.cursor].startSeconds < beat.startSeconds) {
+          other.cursor++;
+        }
       }
     }
     this._frontierSec = beat.endSeconds; // 未指派聲部的上限＝目前推進最遠的那一位
   }
 
-  // 曲末：沒有下一個有意義的拍了，把所有聲部的上限放到無限，讓尾音／尾奏自然播完。
+  // 用這次推進的真實間隔（除以跨過的拍數，見 _advanceToNextNote()）估計「現場每拍幾秒」，
+  // 指數平滑後混進 _liveSecPerBeat。間隔太短（誤觸發）或太長（中途停下來）都不採用，沿用
+  // 上一次量到的值——這整套都是應用層假設（N2／N4），假設演奏者揮得平均、不做 swing。
+  _updateLiveTempo(nowMs, beatsSpanned) {
+    if (this._lastAdvanceMs != null) {
+      const secPerBeat = ((nowMs - this._lastAdvanceMs) / 1000) / beatsSpanned;
+      if (secPerBeat > TEMPO_MIN_INTERVAL_S && secPerBeat < TEMPO_MAX_INTERVAL_S) {
+        this._liveSecPerBeat = this._liveSecPerBeat == null
+          ? secPerBeat
+          : this._liveSecPerBeat * (1 - TEMPO_SMOOTHING) + secPerBeat * TEMPO_SMOOTHING;
+      }
+    }
+    this._lastAdvanceMs = nowMs;
+  }
+
+  // 曲末：沒有下一個音符了，把所有聲部的上限放到無限，讓尾音／尾奏自然播完。
   _enterFinale() {
     for (const voice of this._voices.values()) voice.limitSec = Infinity;
     this._frontierSec = Infinity;
@@ -414,18 +471,19 @@ export class HumanPerformer {
       while (voice.cursor < voice.notes.length && voice.notes[voice.cursor].startSeconds <= voice.playSec) {
         const n = voice.notes[voice.cursor];
         try { synth?.noteOn(voice.channel, n.note, n.velocity); } catch (err) {}
-        voice.sounding.set(n.note, n.endSeconds);
+        voice.sounding.set(n.note, { remain: n.durationSeconds });
         voice.cursor++;
       }
     }
   }
 
-  // 關掉這個聲部裡「播放頭真的越過它自己 endSeconds」的音——不會因為共用拍位的跳躍被
-  // 提前掐斷，也不會重疊發聲。
+  // 關掉這個聲部裡「剩餘時長真的倒數到 0」的音——remain 由 _advancePlayheads() 依現場拍速
+  // 每個 tick 扣減，完全獨立於播放頭的跳躍：不會因為共用拍位的跳躍被提前掐斷，也不會被
+  // 還沒放完的長音擋住下一個音出不來（這正是這次要修的兩個 bug 的共同解法）。
   _releaseDue(voice) {
     const synth = voice.kind === 'human' ? this.humanSynth : this.accompSynth;
-    for (const [note, endSeconds] of [...voice.sounding]) {
-      if (endSeconds > voice.playSec) continue;
+    for (const [note, sounding] of [...voice.sounding]) {
+      if (sounding.remain > 0) continue;
       try { synth?.noteOff(voice.channel, note); } catch (err) {}
       voice.sounding.delete(note);
     }

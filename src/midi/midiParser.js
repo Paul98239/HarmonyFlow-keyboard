@@ -1,19 +1,22 @@
 // ============================================================
-//  midiParser.js — Standard MIDI File 解析／切分／重新編碼（純邏輯，無 DOM／CDN 依賴）
+//  midiParser.js — Standard MIDI File 解析／重新編碼（純邏輯，無 DOM／CDN 依賴）
 //
-//  依 MMA 官方規格（Standard MIDI Files 1.0，SMF）手寫，不依賴任何第三方套件：這裡要能把
-//  一份總譜精確拆成分部再寫回合法的 .mid，所以保留每一個位元組層級的事件（controller、
-//  bank select、SysEx、port…），切分時只做「篩選 ＋ 補齊全域資訊」。
+//  依 MMA 官方規格（Standard MIDI Files 1.0，SMF，RP-001）手寫，不依賴任何第三方套件。
 //
 //  典型用法：
 //    const parsed = parseMidi(await file.arrayBuffer());
 //    parsed.parts   // → 這份總譜有哪些聲部（細到 track × channel × program，即「樂器」）
-//    parsed.notes   // → humanPerformer.js 直接拿這份（連同 parts、buildMeasureGrid()）
-//                   //   建立聲部，不需要先用 extractParts 切成 Blob 再解碼一次。
-//    extractParts()／splitByTrack()／splitByPart() 目前只有 test-midi-parser.html（分譜驗證頁）
-//    在用，拿來跟 MuseScore 個別匯出的分譜比對正確性。
+//    parsed.notes   // → humanPerformer.js 直接拿這份（連同 parts、buildMeasureGrid()）建立聲部
 //
 //  本模組不碰 Blob／DOM／AudioContext——包成 Blob 是呼叫端的事。
+//
+//  ── 本模組的界線：規格保證什麼、應用層假設什麼 ──
+//  SMF 規格真正寫進檔案的是「格線」：時間解析度（division）、速度（FF 51）、拍號（FF 58）。
+//  這三樣加起來足以把任何一個 tick 精確還原成「第幾拍、第幾秒」，`buildTempoMap()`／
+//  `makeTickToSeconds()`／`buildMeasureGrid()`／`buildBeatGrid()` 這條鏈是確定性計算，不是
+//  推導。規格沒有寫進檔案的是格線上的「音樂意義」：小節線本身、弱起、強弱、swing、複拍子
+//  的實際律動——這些只能由應用層推導，而推導必然帶假設，本模組只在明確標示假設（A1～A13，
+//  散在各函式的 JSDoc／註解裡）的地方才做這類啟發式推導，其餘一律照規格算出來的數字為準。
 // ============================================================
 
 /* ═══════════════════════════════════════════
@@ -41,18 +44,6 @@ export const META = Object.freeze({
   KEY_SIGNATURE: 0x59,
   SEQUENCER_SPECIFIC: 0x7f,
 });
-
-// 「全曲共用」而非「屬於某一軌」的 meta。切分聲部時這些一定要複製進分部檔，
-// 否則分部會用預設的 120bpm 4/4 播放，跟總譜對不起來。
-// 刻意不含 COPYRIGHT／TEXT 這類純註記：複製到每一份分部只會變成雜訊，漏掉也不影響演奏結果。
-/** @type {Set<number>} */
-const GLOBAL_META = new Set([
-  META.SET_TEMPO,
-  META.TIME_SIGNATURE,
-  META.KEY_SIGNATURE,
-  META.SMPTE_OFFSET,
-  META.MARKER, // 排練記號：合奏對位時要靠它，屬於全曲
-]);
 
 // Channel voice message：高 4 bit 是類型、低 4 bit 是 channel。
 const CHANNEL_TYPE = Object.freeze({
@@ -130,7 +121,10 @@ const GM_PROGRAM_NAMES = Object.freeze([
   'Telephone Ring', 'Helicopter', 'Applause', 'Gunshot',
 ]);
 
-// GM 打擊樂 channel（第 10 軌，索引 9）上 program 代表的是鼓組而非旋律樂器。
+// GM1 打擊樂固定使用第 10 個 MIDI channel（索引 9，不是第 10 個 track）上 program 代表的
+// 是鼓組而非旋律樂器。GM2 允許透過 bank 79H(121)+program change 讓 channel 10 變成旋律
+// 通道、或透過 bank 78H(120)+program change 讓其他 channel（含 11）變成節奏通道（A11）——
+// 本模組的 isDrum 判定只看 channel 號碼，不看 bank，這個 GM2 選用功能不受支援。
 const GM_DRUM_KITS = Object.freeze({
   0: 'Standard Kit', 8: 'Room Kit', 16: 'Power Kit', 24: 'Electronic Kit',
   25: 'TR-808 Kit', 32: 'Jazz Kit', 40: 'Brush Kit', 48: 'Orchestra Kit', 56: 'Sound FX Kit',
@@ -217,7 +211,6 @@ export class MidiParseError extends Error {
 
 const utf8Strict = new TextDecoder('utf-8', { fatal: true });
 const latin1 = new TextDecoder('latin1');
-const textEncoder = new TextEncoder();
 
 // SMF 規格寫的是 ASCII，但實務上（MuseScore、Sibelius 等）中文曲名／聲部名都以
 // UTF-8 寫入。先嚴格試 UTF-8，失敗才退回 Latin-1——反過來的話，中文會變成亂碼卻
@@ -426,7 +419,10 @@ function decorateMeta(ev, warn, trackIndex) {
       break;
     case META.SMPTE_OFFSET:
       if (d.length >= 5) {
-        ev.smpteOffset = { hours: d[0], minutes: d[1], seconds: d[2], frames: d[3], subFrames: d[4] };
+        // hr 是壓縮格式 0yyzzzzz：yy＝影格率代碼（MIDI Time Code 規格）、zzzzz 才是真正的
+        // 0-23 小時，遮掉高 3 位元才不會把影格率代碼誤讀成小時數（本模組目前沒有任何地方
+        // 讀取 smpteOffset，這裡只是讓解碼本身正確）。
+        ev.smpteOffset = { hours: d[0] & 0x1f, minutes: d[1], seconds: d[2], frames: d[3], subFrames: d[4] };
       }
       break;
     case META.TIME_SIGNATURE:
@@ -437,10 +433,12 @@ function decorateMeta(ev, warn, trackIndex) {
         ev.thirtySecondNotesPer24Clocks = d[3];
       } else if (d.length === 2) {
         // 部分編碼器只寫 numerator/denominator，省略 metronome／32分音符這兩個純顯示用欄位；
-        // 規格沒訂這種簡化版的預設值，沿用業界慣用的 24 clocks/click、8 個 32分音符。
+        // 規格沒訂這種簡化版的預設值，沿用業界慣用的 24 clocks/click、8 個 32分音符（RP-001
+        // 自己的逐位元組範例把「24 clocks/click」編碼成十六進位 0x18，不是 0x24——0x24 是
+        // 十進位 36，跟這裡要的十進位 24 是兩回事，字面量必須寫成十進位）。
         ev.numerator = d[0];
         ev.denominator = 2 ** d[1];
-        ev.clocksPerClick = 0x24;
+        ev.clocksPerClick = 24;
         ev.thirtySecondNotesPer24Clocks = 0x08;
       } else {
         warn(`track ${trackIndex} 的 tick ${ev.tick}：拍號事件 FF58 長度應為 4（或簡化版 2），實際 ${d.length}，已忽略`);
@@ -642,6 +640,11 @@ function buildSignatureList(tracks, type, decorate, fallback) {
    解析：音符配對
    ═══════════════════════════════════════════ */
 
+// 一個「聲部」＝ track × channel × program 這個組合。這個 id 不含 port（A8）與 bank（A9）：
+// 同一軌內若用 FF21 中途切換 port、channel 號碼重複的兩段會被誤併成同一聲部；同一
+// channel＋program 但中途換過 bank（音色庫內的變體音色，例如同一個 Vibraphone 換成
+// wide 版）的音符也會被當成同一聲部，bank 只用來標註顯示名稱（見 collectParts()），
+// 不影響切分。這兩者在這個專案目前遇到的檔案裡都沒有出現過。
 function partIdOf(trackIndex, channel, program) {
   return `t${trackIndex}c${channel}p${program}`;
 }
@@ -660,9 +663,9 @@ function makeNote(trackIndex, onEvent, endTick, offVelocity, tickToSeconds, prog
   const endSeconds = tickToSeconds(endTick);
   return {
     // 產生這顆音的那個 note-on 事件本身（同一個物件，不是複製）：note 這一層有樂理資訊
-    // （拍點、樂句、和弦），事件那一層才是 extractParts() 真正會編碼出去的東西。目前沒有
-    // 任何地方會改寫它（parseMidi 的輸出都當唯讀），保留這個參照是為了萬一之後需要
-    // 就地改力度之類的加工時，兩層資料能對得起來，不必再重新對應一次。
+    // （拍點、樂句、和弦），事件那一層才是位元組層級的原始資料。目前沒有任何地方會改寫它
+    // （parseMidi 的輸出都當唯讀），保留這個參照是為了萬一之後需要就地改力度之類的加工時，
+    // 兩層資料能對得起來，不必再重新對應一次。
     onEvent,
     trackIndex,
     channel: onEvent.channel,
@@ -831,12 +834,16 @@ function collectParts(tracks, notes, warn) {
     stat.sumDurationTicks += note.durationTicks;
   }
 
-  // 各 (track, channel, program) 的 Bank Select（CC0 MSB / CC32 LSB）。MIDI 規格：選音色是
-  // 「先送 bank select（CC0、CC32），再送 program change」。bank 取「這個 program change
-  // 當下生效的值」——記譜軟體通常把 bank select 和 program change 寫在同一個音色設定區塊；
-  // 沒有 program change 的 channel 就取整軌看到的最後一組（此時 program 是 GM 預設值 0）。
-  // GM／GM2 melodic 的預設 bank MSB 是 0（GM2 也接受 121），MSB 120 是 GM2 的節奏（鼓組）
-  // bank；其他 MSB 代表檔案選了非 GM 的變體音色。
+  // 各 (track, channel, program) 的 Bank Select（CC0 MSB / CC32 LSB）。GM2 §3.3.1：Bank
+  // Select 本身不改變聲音，要等後續 Program Change 才生效——這裡的 `running` map 只累積
+  // 「這一軌目前收到的 bank 值」，只有在 Program Change 那一刻才真正寫進 `banks`，就是這個
+  // 生效規則的實作，不需要另外拆 pendingBank／activeBank 兩個欄位。沒有 program change 的
+  // channel 就取整軌看到的最後一組（此時 program 是 GM 預設值 0）——這種情況嚴格來說那個
+  // bank 從未真正生效過，這裡是用「最後一組」硬猜，屬已知的邊緣情況（A9）。
+  // GM2 §3.3.1 明訂的預設值：除 channel 10 外預設 79H/00H（MSB=121），channel 10 預設
+  // 78H/00H（MSB=120，節奏 bank）——這裡的 MSB 120 判斷鼓組跟這個規格一致；MSB 121 是
+  // GM2 melodic 的規格預設值，不是「MSB 0 為主、121 也接受」這種說法（A12，只是文件敘述，
+  // 這段程式碼本身沒有寫死任何預設 bank 常數）。其他 MSB 代表檔案選了非 GM 的變體音色。
   const banks = new Map(); // id → { msb, lsb }
   for (const track of tracks) {
     const running = new Map(); // channel → { msb, lsb }（這一軌目前生效的 bank）
@@ -867,7 +874,7 @@ function collectParts(tracks, notes, warn) {
     const track = tracks[stat.trackIndex];
     const program = stat.program;
     const bank = banks.get(id) || { msb: 0, lsb: 0 };
-    const isDrum = stat.channel === DRUM_CHANNEL;      // 規格：第 10 個 channel（索引 9）
+    const isDrum = stat.channel === DRUM_CHANNEL;      // 只看 channel 號碼，不看 bank（A11，見 GM_DRUM_KITS 旁的說明）
     const percussionKit = isDrum || bank.msb === 120;  // GM2 節奏 bank 也是鼓組
     // 打擊／鼓組聲部沒有音高譜號的概念，clef／role／medianNote 一律 null（命名退回數字尾碼）
     const medianNote = percussionKit ? null : medianOf(pitches);
@@ -1174,8 +1181,7 @@ export function parseMidi(input) {
 }
 
 /* ═══════════════════════════════════════════
-   小節格線：多人合奏共用同步用（humanPerformer.js）。不塞進 parseMidi() 的回傳值，
-   避免影響 test-midi-parser.html 的分譜比對基準。
+   小節格線：多人合奏共用同步用（humanPerformer.js）。不塞進 parseMidi() 的回傳值。
    ═══════════════════════════════════════════ */
 
 /**
@@ -1187,9 +1193,21 @@ export function parseMidi(input) {
  * 依拍號（timeSignatures）與 ticksPerQuarter 推算全曲的小節線。拍號中途變更處強制斷一條
  * 小節線，該段落最後一小節可能因此不是完整長度；樂曲真正結尾的最後一小節不截短，保留完整
  * 名目長度（讓演奏者仍有整小節的揮手窗口）。SMPTE division 沒有「四分音符」這個概念，
- * ticksPerQuarter 為 null，回傳空陣列——呼叫端退回沒有格線的路徑。弱起拍（anacrusis）
- * 目前不處理，格線一律從 tick 0 起算。
- * @param {ParsedMidi} parsed  parseMidi() 的結果
+ * ticksPerQuarter 為 null，回傳空陣列——呼叫端退回沒有格線的路徑（A5，應用層限制，不是
+ * 規格的一部分）。弱起拍（anacrusis）目前不處理，格線一律從 tick 0 起算，檔案若有弱起，
+ * 所有小節線與拍位會整體平移（A1）。
+ *
+ * 「一拍＝拍號分母那個音符」（`beatTicks = tpq*4/denominator`）是這裡唯一的假設（A2）：
+ * 6/8 會被切成 6 個八分音符單位，不是實際律動的 2 個附點四分音符——RP-001 自己的 6/8 範例
+ * 明講節拍器是每三個八分音符響一次（每小節 2 次），跟這裡的切法是兩件事，複拍子的實際
+ * 律動不在這裡推導。`bb`／`thirtySecondNotesPer24Clocks`（FF58 第 4 個位元組）沒有被這條
+ * 公式採用（A10）：規格上它容許非 8 的值，但 `bb=8`（一個四分音符＝8 個三十二分音符）是
+ * 純算術關係，不是廠商可調的慣例，沒有已知檔案用別的值，列為低優先假設。
+ *
+ * 拍號本身無效（`numerator<=0` 或算出的 `measureTicks<=0`，例如 `denominator` 透過
+ * `2**d[1]` 算出離譜的大值）時，會送一則警告並把這段拍號當 4/4 處理再繼續，不會讓迴圈
+ * 卡在原地出不來（曾經是真的會凍結分頁的無限迴圈）。
+ * @param {ParsedMidi} parsed  parseMidi() 的結果（可能被追加警告，見上）
  * @returns {Measure[]}
  */
 export function buildMeasureGrid(parsed) {
@@ -1197,6 +1215,7 @@ export function buildMeasureGrid(parsed) {
   if (!tpq) return [];
   const sigs = parsed.timeSignatures; // 保證至少一筆、且第一筆在 tick 0
   const pieceEnd = Math.max(parsed.durationTicks, sigs[sigs.length - 1].tick + 1);
+  const warn = makeWarn(parsed.warnings);
 
   const grid = [];
   let tick = 0;
@@ -1204,8 +1223,20 @@ export function buildMeasureGrid(parsed) {
     const sig = sigs[i];
     const isLastSection = i + 1 >= sigs.length;
     const sectionEnd = isLastSection ? pieceEnd : sigs[i + 1].tick;
-    const measureTicks = Math.round((tpq * 4 * sig.numerator) / sig.denominator);
-    const beatTicks = Math.round((tpq * 4) / sig.denominator);
+    let numerator = sig.numerator;
+    let denominator = sig.denominator;
+    let measureTicks = Math.round((tpq * 4 * numerator) / denominator);
+    if (!(measureTicks > 0)) {
+      // 拍號無效（分子 <=0，或分母透過 2**d[1] 算出超大值把 measureTicks 除到趨近 0）：
+      // 這裡的 tick 永遠不會前進，下面的 while 迴圈會原地卡死。警告後退回 4/4；連 4/4
+      // 都算不出正數（denominator 本身也異常）就整段退回「一拍＝一個四分音符」。
+      warn(`拍號 ${sig.numerator}/${sig.denominator}（tick ${sig.tick}）無效，已當作 4/4 處理`);
+      numerator = 4;
+      denominator = 4;
+      measureTicks = Math.round((tpq * 4 * numerator) / denominator);
+      if (!(measureTicks > 0)) measureTicks = tpq * numerator;
+    }
+    const beatTicks = Math.round((tpq * 4) / denominator) || tpq;
 
     while (tick < sectionEnd) {
       const full = tick + measureTicks;
@@ -1216,8 +1247,8 @@ export function buildMeasureGrid(parsed) {
         endTick,
         startSeconds: parsed.tickToSeconds(tick),
         endSeconds: parsed.tickToSeconds(endTick),
-        numerator: sig.numerator,
-        denominator: sig.denominator,
+        numerator,
+        denominator,
         beatTicks,
       });
       tick = endTick;
@@ -1233,9 +1264,11 @@ export function buildMeasureGrid(parsed) {
 
 /**
  * 把小節格線（`buildMeasureGrid()`）切成拍格線：每小節 `numerator` 拍、每拍 `beatTicks`——
- * 兩者都是檔案真實的 division 與拍號算出來的，不是猜的。拍號中途變更造成的截短小節，
- * 最後一拍夾到 `measure.endTick`；長度為 0 就不收。SMPTE division（`buildMeasureGrid()`
- * 回空陣列）這裡也回空陣列。
+ * 兩者都是檔案真實的 division 與拍號算出來的，不是猜的，拍長本身來自規格保證的格線。但
+ * 「一拍在音樂上算不算一個律動單位」是呼叫端的事（見 `buildMeasureGrid()` 的 A2）：6/8
+ * 這類複拍子切出來的「拍」不等於實際指揮的律動單位。拍號中途變更造成的截短小節，最後一拍
+ * 夾到 `measure.endTick`；長度為 0 就不收。SMPTE division（`buildMeasureGrid()` 回空陣列）
+ * 這裡也回空陣列。
  * @param {ParsedMidi} parsed  parseMidi() 的結果
  * @returns {Beat[]}
  */
@@ -1335,193 +1368,10 @@ export function encodeMidi({ format = 1, division, tracks }) {
   return w.toUint8Array();
 }
 
-/* ═══════════════════════════════════════════
-   切分：抽出指定聲部
-   ═══════════════════════════════════════════ */
-
-// 同一 tick 內的排序權重。切分時唯一會「插隊」的是補進來的全域 meta（速度／拍號／調號），
-// 它們可能來自別軌、沒有既定位置；其餘事件一律維持原始相對順序，靠 sort 的穩定性保證。
-// 除了軌名之外，其他 meta 都不能往前排——FF21（MIDI Port）與 FF20（Channel Prefix）是
-// 「宣告接下來的事件屬於哪個 port／channel」的位置性事件，記譜軟體會把它夾在各 channel 的
-// 設定區塊之間，提前等於把它宣告的範圍整個改掉。bank select → program change → note on 的
-// 先後也只是靠「維持原序」來保證。
-function eventRank(ev) {
-  if (ev.kind !== 'meta') return 2;
-  if (ev.type === META.TRACK_NAME || ev.type === META.INSTRUMENT_NAME) return 0;
-  if (GLOBAL_META.has(ev.type)) return 1;
-  return 2;
-}
-
-function resolveParts(parsed, selector) {
-  const wanted = Array.isArray(selector) ? selector : [selector];
-  const byId = new Map(parsed.parts.map((p) => [p.id, p]));
-  return wanted.map((item) => {
-    const id = typeof item === 'string' ? item : item?.id;
-    const part = byId.get(id);
-    if (!part) {
-      throw new MidiParseError(
-        `找不到聲部「${id}」；這份檔案有：${parsed.parts.map((p) => p.id).join('、') || '（無）'}`
-      );
-    }
-    return part;
-  });
-}
-
-// 從所有軌收集全域 meta 並去重。去重的比較基準是「tick ＋ 型別 ＋ 內容」——
-// 總譜各軌常常都寫著同一份調號，若不去重，抽出來的分部會拿到好幾份一模一樣的事件。
-function collectGlobalMeta(parsed, warn) {
-  const seenExact = new Set();
-  const seenSlot = new Set();
-  const out = [];
-  for (const track of parsed.tracks) {
-    for (const ev of track.events) {
-      if (ev.kind !== 'meta' || !GLOBAL_META.has(ev.type)) continue;
-      const exact = `${ev.tick}:${ev.type}:${Array.from(ev.data).join(',')}`;
-      if (seenExact.has(exact)) continue;
-      const slot = `${ev.tick}:${ev.type}`;
-      if (seenSlot.has(slot)) {
-        warn(`tick ${ev.tick} 有內容不同的重複全域 meta（型別 0x${ev.type.toString(16)}），切分後兩份都會保留`);
-      }
-      seenExact.add(exact);
-      seenSlot.add(slot);
-      out.push(ev);
-    }
-  }
-  return out;
-}
-
-/**
- * 從總譜抽出指定聲部，產生一份新的、可直接播放的 SMF。
- *
- * 被保留的不只是音符：該 channel 的所有 controller、bank select、pitch bend、
- * program change 都原樣帶走，音色與表情才不會跑掉；同時把全曲共用的速度、拍號、
- * 調號補進來（總譜常常只把它們寫在第一軌），並讓輸出檔的總長度與總譜一致，
- * 這樣各分部單獨播放時仍能彼此對齊。
- *
- * @param {ParsedMidi} parsed  parseMidi 的結果（事件與聲部不會被修改，但同一 tick 有內容
- *        衝突的重複全域 meta 時會往 parsed.warnings 追加一則警告）
- * @param {string[]|object[]} selector  要保留的聲部 id 或 part 物件
- * @param {{name?: string}} [options]  name：覆寫輸出檔第一軌的軌名
- * @returns {Uint8Array} 可直接包成 Blob 播放的 .mid 位元組
- */
-export function extractParts(parsed, selector, options = {}) {
-  const selected = resolveParts(parsed, selector);
-  if (!selected.length) throw new MidiParseError('extractParts 至少要選一個聲部');
-
-  // key 要連 program 一起比對：一個 channel 中途換過音色時，只保留「被選中的那個聲部」
-  // 演奏當下的事件，換到別的音色之後彈的音不該跟著被留下來。
-  const keep = new Set(selected.map((p) => `${p.trackIndex}:${p.channel}:${p.program}`));
-  // 「有音符的 (channel, program)」＝所有聲部。沒出現在這裡的組合只有音色／controller
-  // 設定而不發聲（備用奏法，或換過去後其實沒彈過的音色）。切分的目的是拿掉「別人的聲音」，
-  // 不是拿掉樂器設定，所以純設定的組合一律保留。
-  const soundingChannels = new Set(parsed.parts.map((p) => `${p.trackIndex}:${p.channel}:${p.program}`));
-  const trackIndices = [...new Set(selected.map((p) => p.trackIndex))].sort((a, b) => a - b);
-  const globalMeta = collectGlobalMeta(parsed, makeWarn(parsed.warnings));
-  const endTick = parsed.durationTicks;
-
-  const outTracks = trackIndices.map((trackIndex, outIndex) => {
-    const source = parsed.tracks[trackIndex];
-    const events = [];
-    // 逐 channel 追蹤目前生效的音色，跟 collectNotes()／collectParts() 用同一套邏輯，
-    // 才能正確判斷「這個 controller／pitch bend 事件當下屬於哪個聲部」。
-    const currentProgram = new Array(16).fill(0);
-    for (const ev of source.events) {
-      if (ev.kind === 'meta') {
-        if (ev.type === META.END_OF_TRACK) continue; // 最後統一補在全曲長度處
-        if (GLOBAL_META.has(ev.type)) continue;      // 改由去重後的 globalMeta 統一注入
-        events.push(ev);
-      } else if (ev.kind === 'sysex') {
-        // SysEx 是給裝置的整體設定，無法歸屬到單一 channel，保留在原本那一軌。
-        events.push(ev);
-      } else {
-        if (ev.type === 'programChange') currentProgram[ev.channel] = ev.data1;
-        const key = `${trackIndex}:${ev.channel}:${currentProgram[ev.channel]}`;
-        if (keep.has(key) || !soundingChannels.has(key)) events.push(ev);
-      }
-    }
-    if (outIndex === 0) events.push(...globalMeta);
-
-    if (outIndex === 0 && options.name) {
-      const data = textEncoder.encode(options.name);
-      const at = events.findIndex((ev) => ev.kind === 'meta' && ev.type === META.TRACK_NAME);
-      const renamed = {
-        tick: at >= 0 ? events[at].tick : 0,
-        kind: 'meta',
-        type: META.TRACK_NAME,
-        data,
-        text: options.name,
-      };
-      // 換成新物件而不是改動原事件——parsed 是呼叫端的資料，這裡不能有副作用。
-      if (at >= 0) events[at] = renamed;
-      else events.push(renamed);
-    }
-
-    events.sort((a, b) => a.tick - b.tick || eventRank(a) - eventRank(b));
-    const lastTick = events.length ? events[events.length - 1].tick : 0;
-    events.push({ tick: Math.max(endTick, lastTick), kind: 'meta', type: META.END_OF_TRACK, data: new Uint8Array(0) });
-    return events;
-  });
-
-  return encodeMidi({ format: 1, division: parsed.division, tracks: outTracks });
-}
-
-/**
- * 只含「拍子」的最小 SMF：去重後的全域 meta（速度／拍號／調號／排練記號）＋一個
- * 落在全曲長度的 End of Track，沒有任何音符。給「所有聲部都交給真人、電腦沒有東西
- * 可伴奏」的情況當主時鐘來源——播放器仍能靠它的 currentTime 推進，讓 humanPerformer
- * 依這個時鐘把每個聲部排出來（整首用手勢指揮）。
- * @param {ParsedMidi} parsed  parseMidi 的結果（同 extractParts：事件不會被修改，
- *        但可能往 parsed.warnings 追加警告）
- * @returns {Uint8Array}
- */
-export function extractTempoTrack(parsed) {
-  const globalMeta = collectGlobalMeta(parsed, makeWarn(parsed.warnings));
-  const events = [...globalMeta].sort((a, b) => a.tick - b.tick || eventRank(a) - eventRank(b));
-  const lastTick = events.length ? events[events.length - 1].tick : 0;
-  events.push({
-    tick: Math.max(parsed.durationTicks, lastTick),
-    kind: 'meta',
-    type: META.END_OF_TRACK,
-    data: new Uint8Array(0),
-  });
-  return encodeMidi({ format: 1, division: parsed.division, tracks: [events] });
-}
-
-/**
- * 依「軌」切分：一軌一份檔案，同軌內的多個 channel（同一件樂器的不同奏法）留在一起。
- * 這就是一般記譜軟體「匯出分譜」的粒度。
- * @returns {Array<{trackIndex: number, name: string, partIds: string[], bytes: Uint8Array}>}
- */
-export function splitByTrack(parsed) {
-  const grouped = new Map();
-  for (const part of parsed.parts) {
-    if (!grouped.has(part.trackIndex)) grouped.set(part.trackIndex, []);
-    grouped.get(part.trackIndex).push(part);
-  }
-  return [...grouped.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([trackIndex, parts]) => {
-      const track = parsed.tracks[trackIndex];
-      return {
-        trackIndex,
-        name: track.name || track.instrumentName || `Track ${trackIndex + 1}`,
-        partIds: parts.map((p) => p.id),
-        bytes: extractParts(parsed, parts.map((p) => p.id)),
-      };
-    });
-}
-
-/**
- * 依「聲部」切分：細到 track × channel × program，一個奏法／一件樂器一份檔案。
- * 總譜把多件樂器塞在同一軌（format 0 檔一定是這樣），或同一個 channel 中途換過音色時，
- * 要用這個粒度。
- * @returns {Array<{part: object, name: string, partIds: string[], bytes: Uint8Array}>}
- */
-export function splitByPart(parsed) {
-  return parsed.parts.map((part) => ({
-    part,
-    name: part.name,
-    partIds: [part.id],
-    bytes: extractParts(parsed, [part.id], { name: part.name }),
-  }));
-}
+/* extractParts()／splitByTrack()／splitByPart()／extractTempoTrack()（連同只給它們用的
+   eventRank()／resolveParts()／collectGlobalMeta()）已移除：全專案沒有任何呼叫端，而且
+   逐事件依「事件當下的 currentProgram」判斷去留這套邏輯本身有已知的正確性問題——一顆音
+   跨越 program change 邊界才結束時，它的 Note Off 會被誤判成屬於新音色而丟棄；Control
+   Change 規格也證實 RPN／NRPN 這種「先選參數（CC100/101）、再設值（CC6/38）」的兩段式
+   訊息可能被同一套邏輯拆散。沒人呼叫、又有已知問題，留著只會增加維護面積；`encodeMidi()`
+   本身沒有已知問題，保留給以後真的需要匯出功能時使用。 */
