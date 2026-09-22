@@ -7,11 +7,13 @@
 //  上限 `limitSec`（播放頭不能超過的界線）。
 //
 //  指派聲部：演奏者在目前拍上還有沒播出的音，觸發就在原地把上限推到拍尾（claim）；沒有的
-//  話，把共用拍位直接推到這個聲部「下一個真正有音符的拍」（`_advanceToNextNote()`，可能
-//  一次跨過好幾個沒有音符的空拍——全音符只需要一次觸發，不需要對著空拍反覆揮手），再
-//  claim。跳過的過程中，其他被指派聲部若剛好也有音符落在被跳過的拍上，這一輪沒被自己的
-//  演奏者觸發＝直接靜音丟棄，不會被電腦補（沒有代打），也不會因為共用拍位路過就被誤判成
-//  發聲——這是這個排程器最容易出錯的地方，見 `_advanceToNextNote()` 的註解。
+//  話，把共用拍位固定往前推一拍（`_advanceOneBeat()`，`buildBeatGrid()` 的律動拍，不管這拍
+//  本身有沒有音符——沒有音符的空拍要靠對應次數的觸發才走得過去，不會一次跳過），再 claim。
+//  被路過的那一拍上，其他被指派聲部若剛好也有音符，這一輪沒被自己的演奏者觸發＝直接靜音
+//  丟棄，不會被電腦補（沒有代打），也不會因為共用拍位路過就被誤判成發聲——這是這個排程器
+//  最容易出錯的地方，見 `_advanceOneBeat()` 的註解。長音（例如全音符）中間沒被觸發的那幾
+//  拍不會被自動跳過，演奏者要嘛多揮幾次手把共用拍位走過去、要嘛等其他演奏者的觸發把它帶
+//  過去——這個取捨目前刻意不處理，見 CLAUDE.md「拍子從哪裡來」的 N1。
 //
 //  音符播放速度直接鎖定 SMF 原速：播放頭前進與正在響的音的剩餘時長（`remain`）都用真實
 //  經過秒數 1:1 倒數，不做任何現場拍速估計或縮放（曾經試過依揮手間隔反推拍速、讓播放頭
@@ -324,7 +326,8 @@ export class HumanPerformer {
   }
 
   // 逐一檢查每個指派聲部有沒有新觸發：有的話，這一拍上這個聲部若還有沒播出的音就地
-  // claim；沒有就把共用拍位推到這個聲部下一個真正有音符的拍，再 claim。
+  // claim；沒有就把共用拍位固定推進一拍，再 claim（這一拍若剛好也是這個聲部的下一個音，
+  // 就順便讓它出聲；不是的話這一拍只是被走過，等下一次觸發繼續往前）。
   _handleTriggers(getGestureFor) {
     for (const voice of this._voices.values()) {
       if (voice.kind !== 'human') continue;
@@ -348,7 +351,7 @@ export class HumanPerformer {
       voice.lastSeq = gesture.triggerSeq;
 
       if (this._hasPendingInCurrentBeat(voice)) this._claim(voice);
-      else { this._advanceToNextNote(voice); this._claim(voice); }
+      else { this._advanceOneBeat(voice); this._claim(voice); }
     }
   }
 
@@ -372,21 +375,23 @@ export class HumanPerformer {
     voice.limitSec = Math.max(voice.limitSec, beat.endSeconds);
   }
 
-  // 把共用拍位推到「這個聲部下一個真正有音符的拍」——不是機械化前進一拍，而是直接跳到
-  // voice.notes[voice.cursor] 所在的那一拍，可能一次跨過好幾個沒有音符的空拍（全音符只
-  // 需要一次觸發，不用對著空拍反覆揮手；四分音符連續進行時效果等同一拍一次，因為下一個
-  // 音就在下一拍）。
+  // 把共用拍位固定推進一拍（`buildBeatGrid()` 的律動拍，不管這拍本身有沒有音符）——使用者
+  // 明確要求的「一拍一拍」：一次有效拋物線只走一拍，不會像舊版那樣直接跳到這個聲部下一個
+  // 真正有音符的拍。休止符要靠對應次數的觸發才走得過去；長音（例如全音符）中間沒被觸發的
+  // 那幾拍也不會被自動跳過——這個取捨這次刻意不處理，見 CLAUDE.md 的 N1。這一拍剛好是不是
+  // 這個聲部的下一個音，交給 `_claim()` 之後的 `_emitDueNotes()` 自然判斷（是就出聲，不是
+  // 這一拍就只是被走過，不需要在這裡特別分支）。
   //
   // 這裡不能對「所有」指派聲部都把 playSec／limitSec 推到新拍起點——被路過、但沒被自己的
   // 演奏者觸發的聲部，若音符的 startSeconds 剛好等於新拍起點，會被 _emitDueNotes() 誤判成
   // 到期發聲，等於用另一個名字重新做了一次代打。正確做法：被路過的聲部只丟棄游標（沒接手
   // 的音直接靜音丟棄，不會被之後任何觸發「追討」回來），播放頭與上限完全不動；只有真正
   // 觸發這次前進的那個聲部，才會在這個函式之後緊接著呼叫的 _claim() 裡移動播放頭。
-  _advanceToNextNote(voice) {
+  _advanceOneBeat(voice) {
     const nextNote = voice.notes[voice.cursor];
-    if (!nextNote) { this._enterFinale(); return; }
+    if (!nextNote) { this._enterFinale(); return; } // 這個聲部沒有更多音符了：終局判斷不變
 
-    this._beatIndex = nextNote.beatIndex;
+    this._beatIndex += 1; // 固定推進一拍（舊版是 this._beatIndex = nextNote.beatIndex，跳很多拍）
 
     const beat = this._beats[this._beatIndex];
     for (const other of this._voices.values()) {
