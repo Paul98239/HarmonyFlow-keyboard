@@ -321,7 +321,7 @@ export class HumanPerformer {
     this._lastTickMs = nowMs;
 
     this._handleTriggers(getGestureFor, nowMs);
-    this._advancePlayheads(dt);
+    this._advancePlayheads(dt, nowMs);
     this._emitDueNotes();
   }
 
@@ -334,15 +334,27 @@ export class HumanPerformer {
   // 播放頭該用多快的速度爬，相對原譜速度的比例：原譜這一拍幾秒 ÷ 現場量到的每拍幾秒，
   // 夾在上下限之間。還沒量到現場拍速時回 1（＝照原譜速度播）。這是應用層假設（N2／N4），
   // 不是規格資料。
-  _tempoScale() {
+  //
+  // 超過 TEMPO_MAX_INTERVAL_S 沒有新觸發（沿用估拍速時「這段間隔太長、不拿來估拍速」的
+  // 同一個門檻）也回 1：現場拍速一旦估到、就會被無限期凍結套用在所有還在響的音，直到下次
+  // 觸發才會更新——如果剛好估到一個偏慢的拍速、演奏者之後又完全停手，正在響的音會被這個
+  // 已經過時的估計值拖得很長（TEMPO_SCALE_MIN=0.25 頂多拖到 4 倍原長，對一顆 1~2 秒的音
+  // 就是 4~8 秒），容易被聽成「卡住」。超過這個門檻就不再信任舊估計，這不會提早切斷任何
+  // 音符——音符仍然是靠 remain 自己倒數到 0 才關閉（見 _emitDueNotes()／_releaseDue()），
+  // 這裡只是校正倒數的速度，不是強制收音。
+  _tempoScale(nowMs) {
     if (this._liveSecPerBeat == null) return 1;
+    if (nowMs != null && this._lastAdvanceMs != null
+        && (nowMs - this._lastAdvanceMs) / 1000 > TEMPO_MAX_INTERVAL_S) {
+      return 1;
+    }
     const scale = this._scoreSecPerBeat() / this._liveSecPerBeat;
     return Math.min(TEMPO_SCALE_MAX, Math.max(TEMPO_SCALE_MIN, scale));
   }
 
-  _advancePlayheads(dt) {
+  _advancePlayheads(dt, nowMs) {
     if (dt <= 0) return;
-    const step = dt * this._tempoScale();
+    const step = dt * this._tempoScale(nowMs);
     for (const voice of this._voices.values()) {
       const limit = voice.kind === 'accomp' ? this._frontierSec : voice.limitSec;
       voice.playSec = Math.min(voice.playSec + step, limit);
