@@ -122,12 +122,13 @@ const GM_PROGRAM_NAMES = Object.freeze([
 ]);
 
 // GM1 打擊樂固定使用第 10 個 MIDI channel（索引 9，不是第 10 個 track）上 program 代表的
-// 是鼓組而非旋律樂器。GM2 允許透過 bank 79H(121)+program change 讓 channel 10 變成旋律
-// 通道、或透過 bank 78H(120)+program change 讓其他 channel（含 11）變成節奏通道（A11）——
-// 本模組的 isDrum 判定只看 channel 號碼，不看 bank，這個 GM2 選用功能不受支援。
+// 是鼓組而非旋律樂器。GM2 §2.4／§3.3.1 允許用 Bank Select（CC0 MSB／CC32 LSB）在任何 channel
+// 上切換：bank 79H(121)＝旋律（channel 9 以外的規格預設值）、bank 78H(120)＝節奏（channel 9
+// 的規格預設值）——collectParts() 的 percussionKit 判定依這條規則走（見下方說明），不是只看
+// channel 號碼；isDrum（＝channel 9）另外保留，是下游對應合成器鼓組 channel 用的獨立語意。
 const GM_DRUM_KITS = Object.freeze({
   0: 'Standard Kit', 8: 'Room Kit', 16: 'Power Kit', 24: 'Electronic Kit',
-  25: 'TR-808 Kit', 32: 'Jazz Kit', 40: 'Brush Kit', 48: 'Orchestra Kit', 56: 'Sound FX Kit',
+  25: 'Analog Kit', 32: 'Jazz Kit', 40: 'Brush Kit', 48: 'Orchestra Kit', 56: 'Sound FX Kit',
 });
 const DRUM_CHANNEL = 9;
 
@@ -172,25 +173,28 @@ const GM_PROGRAM_NAMES_ZH = Object.freeze([
 
 const GM_DRUM_KITS_ZH = Object.freeze({
   0: '標準鼓組', 8: '房間鼓組', 16: '強力鼓組', 24: '電子鼓組',
-  25: 'TR-808 鼓組', 32: '爵士鼓組', 40: '刷擊鼓組', 48: '管弦打擊組', 56: '音效鼓組',
+  25: '類比鼓組', 32: '爵士鼓組', 40: '刷擊鼓組', 48: '管弦打擊組', 56: '音效鼓組',
 });
 
 /**
  * GM 音色編號 → 名稱。isDrum 為 true 時查鼓組表（打擊 channel 的 program 意義不同）。
+ * 查不到的鼓組編號回傳 Standard Kit：GM2 §2.6 [recommended] 明訂 Bank 78H/00H 選到未定義的
+ * program 時，音源實際會播放 Program 1（GM1 Drum Set）——名稱要反映音源真正會發出的聲音。
  */
 export function gmProgramName(program, isDrum = false) {
   if (!Number.isInteger(program) || program < 0 || program > 127) return '';
-  if (isDrum) return GM_DRUM_KITS[program] || `Drum Kit ${program}`;
+  if (isDrum) return GM_DRUM_KITS[program] || GM_DRUM_KITS[0];
   return GM_PROGRAM_NAMES[program];
 }
 
 /**
  * GM 音色編號 → 繁體中文名稱。分譜清單的聲部命名一律走這裡（見 GM_PROGRAM_NAMES_ZH
- * 的說明）。查不到（program 超出 0~127）時回傳空字串，由呼叫端決定退路。
+ * 的說明）。查不到（program 超出 0~127）時回傳空字串，由呼叫端決定退路；鼓組編號查不到時
+ * 回傳標準鼓組，理由同 gmProgramName()。
  */
 export function gmProgramNameZh(program, isDrum = false) {
   if (!Number.isInteger(program) || program < 0 || program > 127) return '';
-  if (isDrum) return GM_DRUM_KITS_ZH[program] || `鼓組 ${program}`;
+  if (isDrum) return GM_DRUM_KITS_ZH[program] || GM_DRUM_KITS_ZH[0];
   return GM_PROGRAM_NAMES_ZH[program];
 }
 
@@ -470,6 +474,7 @@ function parseTrack(body, trackIndex, warn) {
   let sawEndOfTrack = false;
   let name = '';
   let instrumentName = '';
+  let deviceName = '';
   let port = null;
 
   while (r.remaining > 0) {
@@ -502,7 +507,19 @@ function parseTrack(body, trackIndex, warn) {
 
         if (type === META.TRACK_NAME && !name) name = ev.text;
         else if (type === META.INSTRUMENT_NAME && !instrumentName) instrumentName = ev.text;
-        else if (type === META.PORT && port === null) port = ev.port ?? null;
+        else if (type === META.DEVICE_NAME) {
+          // RP-019：一軌只能有一個 Device Name（FF 09），用來把整軌鎖定給單一裝置。
+          if (!deviceName) deviceName = ev.text;
+          else warn(`track ${trackIndex} 的 tick ${ev.tick}：出現第二個 Device Name（FF 09），RP-019 規定一軌只能有一個，已忽略`);
+        }
+        else if (type === META.PORT) {
+          if (port === null) port = ev.port ?? null;
+          // RP-019：一軌只能對應一個裝置／埠。中途改變代表這軌違反了那條規則——partIdOf()
+          // 不含 port（A8），這種檔案裡重複的 channel 號碼可能被誤併成同一聲部。
+          else if (ev.port !== port) {
+            warn(`track ${trackIndex} 的 tick ${ev.tick}：MIDI Port（FF 21）中途從 ${port} 改成 ${ev.port}，RP-019 規定一軌只能對應一個裝置，之後重複的 channel 號碼可能被誤併成同一聲部`);
+          }
+        }
         else if (type === META.END_OF_TRACK) {
           sawEndOfTrack = true;
           if (r.remaining > 0) {
@@ -549,6 +566,7 @@ function parseTrack(body, trackIndex, warn) {
     index: trackIndex,
     name,
     instrumentName,
+    deviceName,
     port,
     channels: [...channels].sort((a, b) => a - b),
     events,
@@ -839,11 +857,10 @@ function collectParts(tracks, notes, warn) {
   // 「這一軌目前收到的 bank 值」，只有在 Program Change 那一刻才真正寫進 `banks`，就是這個
   // 生效規則的實作，不需要另外拆 pendingBank／activeBank 兩個欄位。沒有 program change 的
   // channel 就取整軌看到的最後一組（此時 program 是 GM 預設值 0）——這種情況嚴格來說那個
-  // bank 從未真正生效過，這裡是用「最後一組」硬猜，屬已知的邊緣情況（A9）。
-  // GM2 §3.3.1 明訂的預設值：除 channel 10 外預設 79H/00H（MSB=121），channel 10 預設
-  // 78H/00H（MSB=120，節奏 bank）——這裡的 MSB 120 判斷鼓組跟這個規格一致；MSB 121 是
-  // GM2 melodic 的規格預設值，不是「MSB 0 為主、121 也接受」這種說法（A12，只是文件敘述，
-  // 這段程式碼本身沒有寫死任何預設 bank 常數）。其他 MSB 代表檔案選了非 GM 的變體音色。
+  // bank 從未真正生效過，這裡是用「最後一組」硬猜，屬已知的邊緣情況（A9）。這個 map 只收
+  // 「檔案真的送過 Bank Select」的聲部：完全沒送過的聲部在這裡查不到（undefined），刻意跟
+  // 「真的送了 MSB 0」區分開來——GM2 §3.3.1 明訂的規格預設值（channel 9 是 78H/00H，其餘是
+  // 79H/00H）留給 collectParts() 在查不到時才補上，不寫死在這個 map 裡。
   const banks = new Map(); // id → { msb, lsb }
   for (const track of tracks) {
     const running = new Map(); // channel → { msb, lsb }（這一軌目前生效的 bank）
@@ -859,7 +876,8 @@ function collectParts(tracks, notes, warn) {
       if (ev.type !== 'programChange') continue;
       currentProgram[ev.channel] = ev.data1;
       const id = partIdOf(track.index, ev.channel, ev.data1);
-      if (!banks.has(id)) banks.set(id, { ...(running.get(ev.channel) || { msb: 0, lsb: 0 }) });
+      const active = running.get(ev.channel);
+      if (active && !banks.has(id)) banks.set(id, { ...active });
     }
     for (const [ch, b] of running) {
       const id = partIdOf(track.index, ch, currentProgram[ch]);
@@ -873,14 +891,23 @@ function collectParts(tracks, notes, warn) {
     const { pitches, sumDurationTicks, ...statPublic } = stat;
     const track = tracks[stat.trackIndex];
     const program = stat.program;
-    const bank = banks.get(id) || { msb: 0, lsb: 0 };
-    const isDrum = stat.channel === DRUM_CHANNEL;      // 只看 channel 號碼，不看 bank（A11，見 GM_DRUM_KITS 旁的說明）
-    const percussionKit = isDrum || bank.msb === 120;  // GM2 節奏 bank 也是鼓組
+    // GM2 §3.3.1 明訂的規格預設值：channel 9（人類講的「第 10 軌道」）預設 78H(120)／00H
+    // （節奏 bank），其餘 channel 預設 79H(121)／00H（旋律 bank）——檔案完全沒送過 Bank
+    // Select 時，「這個聲部現在生效的 bank」就是這個規格預設值，不是憑空猜的 0。
+    const defaultMsb = stat.channel === DRUM_CHANNEL ? 120 : 121;
+    const bank = banks.get(id) || { msb: defaultMsb, lsb: 0 };
+    const isDrum = stat.channel === DRUM_CHANNEL;    // 只是 channel 號碼本身，給下游對應合成器打擊 channel 用
+    const percussionKit = bank.msb === 120;          // GM2 §2.4：任何 channel 送 Bank 78H 都是節奏通道，不限 channel 9
     // 打擊／鼓組聲部沒有音高譜號的概念，clef／role／medianNote 一律 null（命名退回數字尾碼）
     const medianNote = percussionKit ? null : medianOf(pitches);
     const polyphonyAvg = polyphonyAverage(sumDurationTicks, stat.endTick - stat.startTick);
     const clef = percussionKit ? null : classifyClef(medianNote, stat.lowestNote, stat.highestNote);
     const role = percussionKit ? null : classifyRole(polyphonyAvg, clef);
+    if (percussionKit && !(program in GM_DRUM_KITS)) {
+      // GM2 §2.6 [recommended]：這種情況音源實際會退回播放 Standard Kit（見
+      // gmProgramName() 的說明），這裡記一筆警告，讓使用者知道顯示名稱不是檔案指定的那個。
+      warn(`track ${stat.trackIndex} 的 channel ${stat.channel}：鼓組 program ${program} 不是 GM2 定義的編號，音源會退回播放 Standard Kit`);
+    }
     parts.push({
       id,
       ...statPublic,
@@ -933,6 +960,58 @@ function collectParts(tracks, notes, warn) {
 
   if (!parts.length) warn('這份檔案裡沒有任何音符，切分不出聲部');
   return parts;
+}
+
+/* ═══════════════════════════════════════════
+   RP-001 結構性慣例檢查（只加警告，不影響解析結果或播放）
+   ═══════════════════════════════════════════ */
+
+// RP-001 p.7~9 講的是「應該放在哪裡」的慣例，不是位元組層級的合法性規則——違反不代表檔案
+// 損毀，常見的記譜軟體匯出也不見得完全遵守，只在真的違反時送警告，方便追查來源怪異的檔案。
+function validateStructuralConventions(tracks, format, warn) {
+  const firstTrack = tracks[0];
+  if (firstTrack) {
+    // FF 00 Sequence Number：規格要求在軌首、tick 0、且在任何可送出事件（channel／SysEx）之前。
+    const seqIdx = firstTrack.events.findIndex((ev) => ev.kind === 'meta' && ev.type === META.SEQUENCE_NUMBER);
+    if (seqIdx !== -1) {
+      const ev = firstTrack.events[seqIdx];
+      const precededByTransmittable = firstTrack.events
+        .slice(0, seqIdx)
+        .some((e) => e.kind === 'channel' || e.kind === 'sysex');
+      if (ev.tick !== 0 || precededByTransmittable) {
+        warn(`track 0 的 tick ${ev.tick}：Sequence Number（FF 00）沒有出現在軌首（RP-001 規定必須在 tick 0、且在任何可送出事件之前）`);
+      }
+    }
+    // FF 02 Copyright：規格要求在第一軌、tick 0。只查 tick，不強求是整軌第一個事件——RP-001
+    // 對 Sequence Number 的敘述同樣建議放在最前面，兩者都合規時哪個先寫入沒有規格上的定論。
+    const copyEv = firstTrack.events.find((ev) => ev.kind === 'meta' && ev.type === META.COPYRIGHT);
+    if (copyEv && copyEv.tick !== 0) {
+      warn(`track 0 的 tick ${copyEv.tick}：Copyright Notice（FF 02）沒有出現在 tick 0（RP-001 規定應放在第一軌、tick 0）`);
+    }
+  }
+  // FF 03 Sequence/Track Name：規格要求若有必須出現在 tick 0。
+  for (const track of tracks) {
+    const ev = track.events.find((e) => e.kind === 'meta' && e.type === META.TRACK_NAME);
+    if (ev && ev.tick !== 0) {
+      warn(`track ${track.index} 的 tick ${ev.tick}：Sequence/Track Name（FF 03）沒有出現在 tick 0（RP-001 規定若有必須在 tick 0）`);
+    }
+  }
+  // format 1：tempo map（FF 51／FF 58）與 SMPTE Offset（FF 54）規定要放第一軌，出現在其他軌
+  // RP-001 p.9 明講「沒有意義」（SMPTE Offset）或違反「tempo map 必須放第一軌」的要求。
+  if (format === 1) {
+    for (let i = 1; i < tracks.length; i++) {
+      for (const ev of tracks[i].events) {
+        if (ev.kind !== 'meta') continue;
+        if (ev.type === META.SET_TEMPO) {
+          warn(`track ${i} 的 tick ${ev.tick}：Set Tempo（FF 51）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
+        } else if (ev.type === META.TIME_SIGNATURE) {
+          warn(`track ${i} 的 tick ${ev.tick}：Time Signature（FF 58）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
+        } else if (ev.type === META.SMPTE_OFFSET) {
+          warn(`track ${i} 的 tick ${ev.tick}：SMPTE Offset（FF 54）出現在非第一軌，RP-001 明訂在 format 1 裡這個事件在其他軌沒有意義`);
+        }
+      }
+    }
+  }
 }
 
 /* ═══════════════════════════════════════════
@@ -996,6 +1075,7 @@ function collectParts(tracks, notes, warn) {
  * @property {number} index
  * @property {string} name  FF 03；沒有就空字串
  * @property {string} instrumentName  FF 04；沒有就空字串
+ * @property {string} deviceName  FF 09（RP-019）；沒有就空字串
  * @property {number|null} port  FF 21
  * @property {number[]} channels  這一軌用到的 channel（0~15，遞增）
  * @property {MidiEvent[]} events  依檔案順序，tick 為絕對值
@@ -1046,10 +1126,12 @@ function collectParts(tracks, notes, warn) {
  * @property {string} instrumentName
  * @property {number} program  這個聲部固定使用的音色；沒有明確 program change 就是 GM 預設值 0
  * @property {number[]} programs  相容用的陣列形狀，恆為 [program]（見上）
- * @property {{msb:number, lsb:number}} bank  這個 program change 當下生效的 Bank Select
+ * @property {{msb:number, lsb:number}} bank  這個 program change 當下生效的 Bank Select；
+ *   檔案從未送過就是 GM2 §3.3.1 的規格預設值（channel 9 為 120/0，其餘為 121/0）
  * @property {string} programName  GM 英文名
- * @property {boolean} isDrum  channel 9
- * @property {boolean} percussionKit  channel 9 或 GM2 節奏 bank（MSB 120）
+ * @property {boolean} isDrum  channel 9（只是 channel 號碼，跟 percussionKit 的判定各自獨立）
+ * @property {boolean} percussionKit  這個聲部生效的 Bank Select MSB 是否為 120（GM2 §2.4／
+ *   §3.3.1：沒送過 Bank Select 時採用規格預設值，channel 9 為 120、其餘為 121）
  * @property {number|null} medianNote  鼓組為 null
  * @property {number} polyphonyAvg  作響期間的平均同時發聲數
  * @property {'treble'|'bass'|'mixed'|null} clef
@@ -1136,6 +1218,7 @@ export function parseMidi(input) {
     // 算秒數與重疊音符會得到沒有意義的結果，但檔案本身仍可正確解析，所以只警告。
     warn('這是 format 2 檔案：各軌是彼此獨立的樂句而非同時演奏的聲部，時間軸與聲部切分的結果未必符合預期');
   }
+  validateStructuralConventions(tracks, format, warn);
 
   const tempoMap = buildTempoMap(tracks, division, warn);
   const tickToSeconds = makeTickToSeconds(tempoMap, division);
@@ -1186,7 +1269,8 @@ export function parseMidi(input) {
 
 /**
  * @typedef {{index:number, startTick:number, endTick:number, startSeconds:number,
- *   endSeconds:number, numerator:number, denominator:number, beatTicks:number}} Measure
+ *   endSeconds:number, numerator:number, denominator:number, notatedBeatTicks:number,
+ *   beatTicks:number}} Measure
  */
 
 /**
@@ -1197,12 +1281,27 @@ export function parseMidi(input) {
  * 規格的一部分）。弱起拍（anacrusis）目前不處理，格線一律從 tick 0 起算，檔案若有弱起，
  * 所有小節線與拍位會整體平移（A1）。
  *
- * 「一拍＝拍號分母那個音符」（`beatTicks = tpq*4/denominator`）是這裡唯一的假設（A2）：
- * 6/8 會被切成 6 個八分音符單位，不是實際律動的 2 個附點四分音符——RP-001 自己的 6/8 範例
- * 明講節拍器是每三個八分音符響一次（每小節 2 次），跟這裡的切法是兩件事，複拍子的實際
- * 律動不在這裡推導。`bb`／`thirtySecondNotesPer24Clocks`（FF58 第 4 個位元組）沒有被這條
- * 公式採用（A10）：規格上它容許非 8 的值，但 `bb=8`（一個四分音符＝8 個三十二分音符）是
- * 純算術關係，不是廠商可調的慣例，沒有已知檔案用別的值，列為低優先假設。
+ * FF58 的四個位元組（`nn dd cc bb`）分別餵給兩種不同的「拍長」，都是規格欄位算出來的，
+ * 不是猜的：
+ *
+ * - `notatedBeatTicks`（記譜拍長，算小節長度用）＝一個 `dd`（分母）音符值有幾個 tick。
+ *   `bb`（RP-001 p.10：一個 MIDI 認知的四分音符／24 clocks 等於幾個記譜三十二分音符）
+ *   多數檔案是規格最常見的值 8，這時退化成 `tpq*4/denominator`；非 8 代表這份檔案把
+ *   「MIDI 四分音符」重新記譜成別的音符值（RP-001 原文：「已有多個程式允許使用者指定
+ *   MIDI 認知的四分音符要被記譜成、或對應到別的東西」），公式仍然照規格算：
+ *   `32*tpq/(bb*denominator)`。
+ * - `beatTicks`（律動拍長，演奏者實際要揮的單位）優先採用 `cc`（節拍器每響一次隔幾個
+ *   MIDI clock，24 clocks＝一個四分音符＝`tpq` ticks）換算出的 `pulseTicks = tpq*cc/24`。
+ *   RP-001 自己的 6/8 範例（`FF 58 04 06 03 24 08`）就是 `cc=36`＝附點四分音符＝每小節
+ *   揮 2 下，不是切成 6 個八分音符。
+ *
+ * 採用 `cc` 有三個保險條件，任一不成立就退回 `beatTicks = notatedBeatTicks`（也就是舊版
+ * 「一拍＝拍號分母那個音符」的算法）：`cc !== 24`（24 是 MIDI 的內建預設值，多數編曲軟體
+ * 不論拍號一律照抄，視為「檔案沒有表態」）、`pulseTicks` 是 `notatedBeatTicks` 的正整數倍
+ * （否則不構成一個合理的記譜單位）、`measureTicks % pulseTicks === 0`（否則一小節切不出
+ * 整數次揮手）。這是應用層唯一還留著的假設（取代舊版的 A2／A10）：`cc = 24` 的複拍子檔案
+ * 仍然會切成分母音符單位（例如 6/8 若 `cc` 剛好也是 24，會切成 6 下而不是 2 下），代價是
+ * 保守但不會對音樂上沒有意義的值信以為真。
  *
  * 拍號本身無效（`numerator<=0` 或算出的 `measureTicks<=0`，例如 `denominator` 透過
  * `2**d[1]` 算出離譜的大值）時，會送一則警告並把這段拍號當 4/4 處理再繼續，不會讓迴圈
@@ -1225,18 +1324,35 @@ export function buildMeasureGrid(parsed) {
     const sectionEnd = isLastSection ? pieceEnd : sigs[i + 1].tick;
     let numerator = sig.numerator;
     let denominator = sig.denominator;
-    let measureTicks = Math.round((tpq * 4 * numerator) / denominator);
+    // bb 非正整數（規格外的值）時退回規格最常見的 8（一個四分音符＝8 個三十二分音符，見上）。
+    let bb = Number.isInteger(sig.thirtySecondNotesPer24Clocks) && sig.thirtySecondNotesPer24Clocks > 0
+      ? sig.thirtySecondNotesPer24Clocks : 8;
+    let notatedBeatTicks = Math.round((32 * tpq) / (bb * denominator));
+    let measureTicks = numerator * notatedBeatTicks;
     if (!(measureTicks > 0)) {
-      // 拍號無效（分子 <=0，或分母透過 2**d[1] 算出超大值把 measureTicks 除到趨近 0）：
+      // 拍號無效（分子 <=0，或分母透過 2**d[1] 算出超大值把 notatedBeatTicks 除到趨近 0）：
       // 這裡的 tick 永遠不會前進，下面的 while 迴圈會原地卡死。警告後退回 4/4；連 4/4
       // 都算不出正數（denominator 本身也異常）就整段退回「一拍＝一個四分音符」。
       warn(`拍號 ${sig.numerator}/${sig.denominator}（tick ${sig.tick}）無效，已當作 4/4 處理`);
       numerator = 4;
       denominator = 4;
-      measureTicks = Math.round((tpq * 4 * numerator) / denominator);
-      if (!(measureTicks > 0)) measureTicks = tpq * numerator;
+      bb = 8;
+      notatedBeatTicks = Math.round((32 * tpq) / (bb * denominator));
+      measureTicks = numerator * notatedBeatTicks;
+      if (!(measureTicks > 0)) {
+        notatedBeatTicks = tpq;
+        measureTicks = tpq * numerator;
+      }
     }
-    const beatTicks = Math.round((tpq * 4) / denominator) || tpq;
+
+    let beatTicks = notatedBeatTicks;
+    const cc = sig.clocksPerClick;
+    if (Number.isInteger(cc) && cc > 0 && cc !== 24) {
+      const pulseTicks = Math.round((tpq * cc) / 24);
+      if (pulseTicks > 0 && pulseTicks % notatedBeatTicks === 0 && measureTicks % pulseTicks === 0) {
+        beatTicks = pulseTicks;
+      }
+    }
 
     while (tick < sectionEnd) {
       const full = tick + measureTicks;
@@ -1249,6 +1365,7 @@ export function buildMeasureGrid(parsed) {
         endSeconds: parsed.tickToSeconds(endTick),
         numerator,
         denominator,
+        notatedBeatTicks,
         beatTicks,
       });
       tick = endTick;
@@ -1263,11 +1380,10 @@ export function buildMeasureGrid(parsed) {
  */
 
 /**
- * 把小節格線（`buildMeasureGrid()`）切成拍格線：每小節 `numerator` 拍、每拍 `beatTicks`——
- * 兩者都是檔案真實的 division 與拍號算出來的，不是猜的，拍長本身來自規格保證的格線。但
- * 「一拍在音樂上算不算一個律動單位」是呼叫端的事（見 `buildMeasureGrid()` 的 A2）：6/8
- * 這類複拍子切出來的「拍」不等於實際指揮的律動單位。拍號中途變更造成的截短小節，最後一拍
- * 夾到 `measure.endTick`；長度為 0 就不收。SMPTE division（`buildMeasureGrid()` 回空陣列）
+ * 把小節格線（`buildMeasureGrid()`）切成拍格線：每拍長度是 `m.beatTicks`（律動拍長，見
+ * `buildMeasureGrid()` 的說明），不是固定切成 `numerator` 份——採用 `cc` 時一小節的拍數會
+ * 少於 `numerator`（例如 6/8 的 2 拍）。拍號中途變更造成的截短小節，最後一拍夾到
+ * `measure.endTick`；長度為 0 就不收。SMPTE division（`buildMeasureGrid()` 回空陣列）
  * 這裡也回空陣列。
  * @param {ParsedMidi} parsed  parseMidi() 的結果
  * @returns {Beat[]}
@@ -1275,9 +1391,8 @@ export function buildMeasureGrid(parsed) {
 export function buildBeatGrid(parsed) {
   const beats = [];
   for (const m of buildMeasureGrid(parsed)) {
-    for (let b = 0; b < m.numerator; b++) {
-      const startTick = m.startTick + b * m.beatTicks;
-      if (startTick >= m.endTick) break;
+    let b = 0;
+    for (let startTick = m.startTick; startTick < m.endTick; startTick += m.beatTicks, b++) {
       const endTick = Math.min(startTick + m.beatTicks, m.endTick);
       beats.push({
         index: beats.length,

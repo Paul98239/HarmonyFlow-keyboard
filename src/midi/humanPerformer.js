@@ -64,8 +64,10 @@ function allocateChannels(parts, melodicChannels, drumChannel) {
   const unplaced = [];
   let next = 0;
   for (const p of parts) {
-    const isDrum = p.percussionKit === true || p.channel === drumChannel;
-    if (isDrum) { byPartId.set(p.id, drumChannel); continue; }
+    // percussionKit 已經是 GM2 Bank Select（CC0/32）判定過的結果：channel 9 若明確用
+    // Bank 79H(121) 切成旋律通道，這裡就不會被誤送進打擊 channel（見 midiParser.js 的
+    // collectParts() 說明）。
+    if (p.percussionKit) { byPartId.set(p.id, drumChannel); continue; }
     if (next < melodicChannels.length) { byPartId.set(p.id, melodicChannels[next++]); continue; }
     unplaced.push(p.id);
   }
