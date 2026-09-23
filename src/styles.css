@@ -241,8 +241,11 @@ body, html {
    92vw 上限確實保證不超出視窗左右——改成貼齊 .control-row 左緣的話，置中的觸發鈕會把
    面板往右推移半個 .control-row 的寬度，92vw 就不夠用、面板右緣會被裁到視窗外。
    - 字級跟工作列外部同一套：font-size 直接是 var(--ui-fs)，內部尺寸全是 em，整組一起跟著縮放。
-   - 長高只會延伸底部、被 max-height 夾住，內容超過時 .tl-scroll 內部捲動——觸發鈕與右上角的
-     ✕ 的錨點永遠不變，這是修掉「內容變多、✕被頂掉」那個舊 bug 的關鍵。
+   - 長高只會延伸底部、被 max-height 夾住，內容超過時只有 .score-part-list（分譜清單，見下方
+     該規則的註解）內部捲動——觸發鈕與右上角的 ✕ 的錨點永遠不變，這是修掉「內容變多、✕被頂掉」
+     那個舊 bug 的關鍵。.tl-scroll 本身刻意不設 overflow-y:auto：分譜清單以外的內容（選檔／
+     分類／搜尋／歌曲下拉）理論上不會多到需要自己捲動，讓外層也能捲會在內容夠多時同時冒出
+     兩條捲軸疊在一起，外層那條又剛好跟 ✕ 同一個角落打架。
    - max-height 吃 --popup-max-height（src/ui.js 的 applyPopupMaxHeight() 量測
      #camera-frame 實際底邊算出來的，不是猜 vh）：面板永遠不會超出攝影機外框，不論視窗大小
      或長寬比；720px 只是超大螢幕下的絕對上限，避免面板誇張地高。 */
@@ -264,16 +267,16 @@ body, html {
   box-shadow: var(--shadow-lg);
 }
 
-/* 面板內部真正捲動的那一層（index.html 裡的 .tl-scroll）。
-   min-height: 0 不可省：flex 項目的預設 min-height 是 auto，捲動容器會被內容撐開而不是
-   出現捲軸，面板就會超出 max-height。padding-right 是留給捲軸的位置。 */
+/* 面板內部的排版層（index.html 裡的 .tl-scroll），本身不捲動（overflow:hidden）：真正捲動
+   的是底下的 .score-part-list（見那條規則的註解），這裡只負責在 .tl-popup 的 max-height
+   底下把空間讓給分譜清單。min-height: 0 不可省：flex 項目的預設 min-height 是 auto，這一層
+   會被內容撐開而不肯縮小，底下的分譜清單就永遠擠不出自己的捲動空間。 */
 .tl-scroll {
   display: flex;
   flex-direction: column;
   gap: 1.15em;
-  overflow-y: auto;
+  overflow: hidden;
   min-height: 0;
-  padding-right: 0.15em;
 }
 
 /* 彈出進場：display:none → flex 時 animation 會重新觸發，不需要 JS 額外加 class。
@@ -572,23 +575,29 @@ body, html {
    每一列就是「聲部名（GM 音色的繁體中文名）＋一個下拉（無／演奏者 1~N）」，N ＝ 系統控制 bar
    選的「現場人數」。ID 只是槽位編號的顯示提示，畫面上不額外標示在不在場——不在場只影響
    音訊（見 humanGain），指派本身留著。
-   .score-part-list 的 flex-shrink:0 不可省：在 overflow-y:auto 的 flex column 裡，清單不釘住
-   尺寸會被壓成 0 高度。min-height:0 也不可省：flex 子元素預設 min-height:auto，不會縮小到比
-   自己內容的自然高度更小，沒有這行的話 .score-part-list 的 max-height 不會真正生效，內容會
-   撐開這一層、被 .tl-popup 的 overflow:hidden 從底部裁掉，而不是自己乾淨地捲動。 */
+   這個面板裡唯一真正捲動的地方是 .score-part-list（見下）：#scorePartSection 跟它的
+   min-height:0 都不可省——.tl-scroll 是 overflow:hidden，容不下的高度得靠這條鏈一路把
+   「可以縮小」的權利傳到 .score-part-list，缺一層這條鏈就斷了，內容會直接被 .tl-popup
+   的 overflow:hidden 從底部裁掉，看不見也捲不到。 */
 #scorePartSection {
   display: flex; flex-direction: column; gap: 0.6em;
-  flex-shrink: 0; min-height: 0; width: 100%;
+  min-height: 0; width: 100%;
 }
 .score-info-text {
   font-size: 0.9em; color: var(--text-muted); line-height: 1.5;
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
+/* max-height 是「最多長這麼高」的上限（聲部不多時，清單依內容自然高度、不會硬撐到 15em）；
+   min-height:0 是「可以縮更小」的下限——兩個都要有，才能在面板整體被壓得比 15em 還矮時
+   （小螢幕、或選檔／分類／搜尋這幾欄本身就佔掉大半高度）也讓這裡繼續縮小、只在這一層冒出
+   自己的捲軸，不會把外層 .tl-scroll 一起撐出第二條捲軸（那條會跟右上角的 ✕ 疊在一起）。
+   padding-right 是留給這裡捲軸的位置（原本掛在 .tl-scroll 上，隨捲動責任一起搬過來）。 */
 .score-part-list {
   display: flex; flex-direction: column; gap: 0.45em;
   max-height: 15em; overflow-y: auto;
-  flex-shrink: 0;
+  min-height: 0;
+  padding-right: 0.15em;
 }
 .score-part-row {
   display: flex; align-items: center; gap: 0.6em;
