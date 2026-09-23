@@ -51,9 +51,10 @@
      #camera-frame 實際框線動態覆寫，這裡的 70vh 只是 JS 尚未執行前的靜態退路。 */
   --popup-max-height: 70vh;
 
-  /* 圓角統一成 4 個層級：膠囊（工作列按鈕／pill）、圓形（撥放鈕／把手／spinner）、
-     大容器（彈出面板／舞台提示）、小控制項（表單輸入框／浮動小方塊／清單列）。 */
-  --radius-pill: 999px;
+  /* 圓角統一成 3 個層級：圓形（撥放鈕／把手／spinner）、大容器（彈出面板／舞台提示）、
+     小控制項（工作列按鈕／下拉／表單輸入框／浮動小方塊／清單列）——原本另立的膠囊形
+     （工作列外殼與按鈕）已經併進小控制項這一層，理由跟 .tl-select 同一輪改掉的一樣：
+     原生 <select> 展開後的選項清單是方形，膠囊形收合框跟它反差太大，乾脆全部統一。 */
   --radius-circle: 50%;
   --radius-lg: 0.7em;
   --radius-sm: 0.45em;
@@ -144,9 +145,11 @@ body, html {
    position:relative：這個容器本身是 .tl-popup 定位的參照對象（見下方 .tl-popup 註解），
    不是外層的 #top-center-stack——否則 .tl-popup 的 left:0 會對齊整欄疊層的左緣，而不是
    這一排自己的左緣（疊層裡播放 pill 通常比較寬，兩者置中對齊後左緣不會切齊）。
-   細長樣式：垂直 padding 收到 0.3em、border-radius 拉大到接近膠囊形，跟播放 pill 同一個
-   視覺語彙；但整條的實際高度是被內部按鈕（.tl-text-btn／.tl-trigger／.tl-select）撐出來
-   的，外殼 padding 縮小只是最後一步，真正決定粗細的是下面那幾個內部元素的 padding。 */
+   細長樣式：垂直 padding 收到 0.3em，跟播放 pill 同一個視覺語彙；但整條的實際高度是被
+   內部按鈕（.tl-text-btn／.tl-trigger／.tl-select）撐出來的，外殼 padding 縮小只是最後
+   一步，真正決定粗細的是下面那幾個內部元素的 padding。border-radius 跟內部元件同一個
+   --radius-sm（不再是膠囊形）：原生 <select> 展開後的選項清單是方形，膠囊形外殼跟它反差
+   太大，這一層跟著內部元件一起改，不要有內外兩種圓角語彙。 */
 .control-row {
   position: relative;
   display: flex;
@@ -160,7 +163,7 @@ body, html {
   padding: 0.3em 0.6em;
   background: var(--panel-bg);
   border: var(--line) solid var(--border);
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-sm);
   box-shadow: var(--shadow-md);
 }
 
@@ -191,7 +194,7 @@ body, html {
   flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
   padding: 0.3em 0.65em;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-sm);
   font-size: var(--ui-fs);
 }
 /* 重置骨架 ID：點一下閃黃色代表「剛重置過」，不是常駐狀態（跟鏡頭開關那種持續中的狀態不同）。
@@ -202,10 +205,9 @@ body, html {
   to   { background: var(--btn-bg); border-color: var(--border-light); color: var(--text); }
 }
 .tl-text-btn.just-reset { animation: reset-flash 0.5s ease forwards; }
-/* border-radius 刻意跟同一排的 .tl-text-btn／.tl-trigger（膠囊形）不同、改用跟選歌面板裡
-   .player-input 一致的 --radius-sm：<select> 收合時的框可以用 CSS 做成任何形狀，但展開後
-   的原生選項清單是作業系統畫的方形，CSS 管不到——收合框本身越接近膠囊形，跟展開清單的落差
-   就越明顯。純按鈕沒有「展開」這個狀態，不受影響，維持原本的膠囊形。 */
+/* border-radius 跟同一排的 .tl-text-btn／.tl-trigger、選歌面板裡的 .player-input 都是同一個
+   --radius-sm：<select> 收合時的框可以用 CSS 做成任何形狀，但展開後的原生選項清單是作業
+   系統畫的方形，CSS 管不到，全部統一成小圓角才不會跟展開清單反差太大。 */
 .tl-select {
   flex-shrink: 0;
   font-size: var(--ui-fs); font-weight: 700; font-family: inherit;
@@ -228,10 +230,10 @@ body, html {
 }
 .tl-note.is-error { color: var(--danger); border-color: var(--danger-border); }
 
-/* 選歌的觸發鈕，跟系統控制 bar 同一套外觀語彙。細長樣式：膠囊形，字級不變（保護可讀性）。 */
+/* 選歌的觸發鈕，跟系統控制 bar 同一套外觀語彙。細長樣式：字級不變（保護可讀性）。 */
 .tl-trigger {
   font-size: var(--ui-fs);
-  padding: 0.35em 0.85em; border-radius: var(--radius-pill);
+  padding: 0.35em 0.85em; border-radius: var(--radius-sm);
   box-shadow: var(--shadow-sm);
 }
 
@@ -323,7 +325,8 @@ body, html {
    跟下面的控制列（.control-row）不會互相遮蔽是結構保證的：兩者是同一個 flex 直欄裡的兩個
    區塊、垂直分層、水平都置中，不像先前「小面板在左上角、pill 置中」那樣左右搶寬度，所以
    max-width 不需要再依「控制列裡有沒有面板展開」動態收緊，單純給一個合理上限即可。
-   細長樣式：垂直 padding 收到 0.3em、border-radius 拉大到接近膠囊形。 */
+   細長樣式：垂直 padding 收到 0.3em；border-radius 跟下面控制列與其內部元件同一個
+   --radius-sm，整個 #top-center-stack 只用一種圓角語彙。 */
 .toolbar-playback {
   font-size: var(--ui-fs);
   display: flex;
@@ -334,7 +337,7 @@ body, html {
   padding: 0.3em 0.9em;
   background: var(--panel-bg);
   border: var(--line) solid var(--border);
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-sm);
   box-shadow: var(--shadow-md);
 }
 
