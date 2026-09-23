@@ -603,11 +603,11 @@ body, html {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   flex: 1 1 auto; min-width: 0;
 }
-/* 指派下拉：沿用 .player-input 的外觀，但不撐滿整列——內容自然寬、靠右。 */
+/* 指派下拉：沿用 .player-input 的外觀（含 padding，跟同一個面板裡的分類／歌曲下拉文字
+   對齊），只有寬度不同——不撐滿整列，內容自然寬、靠右。 */
 .score-part-id {
   flex-shrink: 0;
   width: auto; min-width: 7em;
-  padding: 0.35em 0.5em; font-size: 1em;
 }
 .score-part-row.is-mine .score-part-id { border-color: var(--accent); color: var(--accent); }
 
