@@ -202,10 +202,14 @@ body, html {
   to   { background: var(--btn-bg); border-color: var(--border-light); color: var(--text); }
 }
 .tl-text-btn.just-reset { animation: reset-flash 0.5s ease forwards; }
+/* border-radius 刻意跟同一排的 .tl-text-btn／.tl-trigger（膠囊形）不同、改用跟選歌面板裡
+   .player-input 一致的 --radius-sm：<select> 收合時的框可以用 CSS 做成任何形狀，但展開後
+   的原生選項清單是作業系統畫的方形，CSS 管不到——收合框本身越接近膠囊形，跟展開清單的落差
+   就越明顯。純按鈕沒有「展開」這個狀態，不受影響，維持原本的膠囊形。 */
 .tl-select {
   flex-shrink: 0;
   font-size: var(--ui-fs); font-weight: 700; font-family: inherit;
-  padding: 0.3em 0.4em; border-radius: var(--radius-pill);
+  padding: 0.3em 0.4em; border-radius: var(--radius-sm);
   border: var(--line) solid var(--border-light); background: var(--bg);
   color: var(--text); outline: none;
 }
