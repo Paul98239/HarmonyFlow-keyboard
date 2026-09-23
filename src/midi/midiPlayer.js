@@ -486,8 +486,13 @@ function scheduleSearch() {
 
 const libraryFields = {
   'category': (el) => {
-    // 換分類時關鍵字清空（跟原本的行為一致），直接重搜不等去抖。
-    setLibrary({ category: el.value, query: '' });
+    // 換分類時關鍵字與已選歌曲都清空，直接重搜不等去抖。selectedId 一定要在這裡歸零：
+    // 新類別的歌曲清單不含舊選擇，若留著舊值，renderLibraryPicker() 把它寫回
+    // songSelectEl.value 時會因為新清單裡沒有這個 value 而讓瀏覽器把下拉判成「沒有任何
+    // 選項被選取」（selectedIndex = -1，整個框顯示空白，不會自動退回 placeholder）；
+    // 切回原類別時又會因為舊值重新出現在清單裡而悄悄復原成上次選過的歌，兩者都不是
+    // 原生 <select> 換選項清單時該有的樣子。
+    setLibrary({ category: el.value, query: '', selectedId: '' });
     lastQueryStr = null;
     search();
   },
