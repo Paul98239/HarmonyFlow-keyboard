@@ -42,7 +42,9 @@
   --shadow-lg: 0 16px 40px rgba(0, 0, 0, .7);
   --dur-fast: .15s;          /* 按鈕 hover／狀態切換 */
   --dur-base: .2s;           /* 頂端浮動 UI 的淡化 */
-  --idle-opacity: .22;       /* 頂端浮動 UI 沒碰到時的透明度 */
+  --idle-opacity: .35;       /* 頂端浮動 UI 沒碰到時的透明度：這個 app 靠手勢對鏡頭演奏，
+                                 播放中手不會碰滑鼠，UI 幾乎永遠停在這個淡度，要保留淡出感
+                                 但不能太淡看不清楚 */
 
   /* 浮動 UI 的基準字級。實際值由 src/ui.js 的 applyUiFontSize() 在執行期動態覆寫，
      這裡的 16px 只是 JS 尚未執行前的靜態退路。 */
