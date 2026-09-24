@@ -13,6 +13,10 @@
 //  自己的演奏者觸發＝直接靜音丟棄，不會被電腦補（沒有代打），也不會因為共用拍位路過就被
 //  誤判成發聲——這是這個排程器最容易出錯的地方，見 `_advanceToNextNote()` 的註解。
 //
+//  但這一切要先過一道閘門：這個聲部現在還有沒有音在響（`voice.sounding`）。有的話，這次
+//  觸發不會立刻生效，只記成「排隊中」（`voice.pendingTrigger`），等舊音自然響完才自動補上，
+//  見下面「正在響的音」那段的說明——這是為了不讓新舊音重疊。
+//
 //  音符播放速度直接鎖定 SMF 原速：播放頭前進與正在響的音的剩餘時長（`remain`）都用真實
 //  經過秒數 1:1 倒數，不做任何現場拍速估計或縮放（曾經試過依揮手間隔反推拍速、讓播放頭
 //  跟音長跟著揮手快慢縮放的版本，使用者實測後認為「手不動時音符被拖長」不可接受，見專案
@@ -29,11 +33,15 @@
 //  等同整份照真實經過時間連續自動播放。
 //
 //  正在響的音各自倒數自己的原譜時長，完全獨立於播放頭的跳躍：跳拍不會把它提前掐斷，也不會
-//  被它擋住不能出下一個音——新觸發永遠立即出聲，舊音一律照它自己完整的原譜秒數播到底，不會
-//  被提早收掉。如果演奏者揮得比原譜快，舊音會跟新音疊在一起響一段時間（疊多久＝超前了多少，
-//  這是「新音 0 delay」與「舊音不被提早收掉」兩個都要時，數學上必然的取捨）；跟上或慢於
-//  原譜速度則完全不會重疊。velocity 一律用樂譜原值，不套用手勢公式；不重播 CC／pitch-bend，
-//  音色只在 load() 時套用一次。
+//  被還沒放完的長音本身的計時邏輯卡住。但「新觸發什麼時候真正生效」會先看同一個聲部現在
+//  還有沒有音在響：沒有就立即生效；有的話，觸發先排隊（`voice.pendingTrigger`，只記
+//  「有沒有」，不記次數——排隊期間多揮幾次也只補一次），舊音繼續完整響到底，一響完
+//  （`sounding` 變空）就自動處理排隊中的那次觸發，不用使用者再揮一次。這樣新舊音保證不會
+//  重疊，取捨是新音不再保證 0 delay：如果演奏者揮得比原譜快，新音要等舊音放完才出聲，會感覺
+//  比揮手慢半拍；跟上或慢於原譜速度則完全感覺不到延遲。這裡刻意不去估計任何「現場拍速」拿來
+//  縮放舊音的剩餘時長、逼它提早結束（那是已經因為「手不動時音符被拖長」出過包、拿掉的機制，
+//  見專案的 git 歷史）——排隊只是離散事件的先後順序調整，不涉及任何連續數值的估計或縮放。
+//  velocity 一律用樂譜原值，不套用手勢公式；不重播 CC／pitch-bend，音色只在 load() 時套用一次。
 // ============================================================
 
 import { buildBeatGrid } from './midiParser.js';
@@ -91,6 +99,7 @@ function makeVoice(partId, slot, notes, kind, channel) {
     claimed: false,         // 指派聲部是否曾經被自己的演奏者接手過（見 _emitDueNotes 的用法）
     lastSeq: null,          // 上次觀察到的手勢 triggerSeq，null＝還沒對過基準
     lastSlot: undefined,    // 上次觀察到的指派槽位，與現在不同就重新對齊基準（見 _handleTriggers）
+    pendingTrigger: false,  // 觸發時這個聲部還有音在響，先排隊，見 _handleTriggers／_releaseDue
   };
 }
 
@@ -268,6 +277,7 @@ export class HumanPerformer {
       voice.claimed = false;
       voice.lastSeq = null;
       voice.lastSlot = undefined;
+      voice.pendingTrigger = false;
     }
     this._beatIndex = this._startBeatIndex;
   }
@@ -351,14 +361,24 @@ export class HumanPerformer {
       if (gesture.triggerSeq === voice.lastSeq) continue;
       voice.lastSeq = gesture.triggerSeq;
 
-      if (this._hasPendingInCurrentBeat(voice)) this._claim(voice);
-      else { this._advanceToNextNote(voice); this._claim(voice); }
+      // 這個聲部現在還有音在響：不立刻生效，排隊，等 _releaseDue() 發現音響完了再補上
+      // （見檔頭「正在響的音」的說明）——不會重疊，代價是這次觸發不是 0 delay。
+      if (voice.sounding.size > 0) { voice.pendingTrigger = true; continue; }
+      this._claimOrAdvance(voice);
     }
   }
 
   _hasPendingInCurrentBeat(voice) {
     const n = voice.notes[voice.cursor];
     return !!n && n.beatIndex === this._beatIndex;
+  }
+
+  // 觸發真正生效時要做的事：這一拍上這個聲部若還有沒播出的音就地 claim；沒有就把共用拍位
+  // 推到這個聲部下一個真正有音符的拍，再 claim。_handleTriggers() 觸發當下沒有音在響時
+  // 直接呼叫；音還在響時由 _releaseDue() 在音響完的那一刻補呼叫，兩處共用同一份邏輯。
+  _claimOrAdvance(voice) {
+    if (this._hasPendingInCurrentBeat(voice)) this._claim(voice);
+    else { this._advanceToNextNote(voice); this._claim(voice); }
   }
 
   // claim：只動「這一個」被觸發的聲部——播放頭夾到這一拍起點、上限推到這一拍結束。
@@ -445,12 +465,20 @@ export class HumanPerformer {
   // 關掉這個聲部裡「剩餘時長真的倒數到 0」的音——remain 由 _advancePlayheads() 每個 tick
   // 依真實經過秒數扣減，完全獨立於播放頭的跳躍：不會因為共用拍位的跳躍被提前掐斷，也不會
   // 被還沒放完的長音擋住下一個音出不來。
+  //
+  // 收完之後如果這個聲部完全沒有音在響了、又有一次觸發正在排隊（見 _handleTriggers()），
+  // 立刻補做那次觸發該做的事——這正是「不重疊」的另一半：舊音自然響完的這一刻，就是
+  // 排隊中的新音可以出聲的最早時機，不用使用者再揮一次。
   _releaseDue(voice) {
     const synth = voice.kind === 'human' ? this.humanSynth : this.accompSynth;
     for (const [note, sounding] of [...voice.sounding]) {
       if (sounding.remain > 0) continue;
       try { synth?.noteOff(voice.channel, note); } catch (err) {}
       voice.sounding.delete(note);
+    }
+    if (voice.pendingTrigger && voice.sounding.size === 0) {
+      voice.pendingTrigger = false;
+      this._claimOrAdvance(voice);
     }
   }
 }
