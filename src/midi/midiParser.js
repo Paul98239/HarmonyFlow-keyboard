@@ -517,10 +517,15 @@ function parseTrack(body, trackIndex, warn) {
         }
         else if (type === META.PORT) {
           if (port === null) port = ev.port ?? null;
-          // RP-019：一軌只能對應一個裝置／埠。中途改變代表這軌違反了那條規則——partIdOf()
-          // 不含 port（A8），這種檔案裡重複的 channel 號碼可能被誤併成同一聲部。
+          // FF 21（Port／Cable 編號）其實不在 RP-001 正式定義的 meta event 清單裡（該清單只到
+          // FF 00/01-0F/03/04/05/06/07/20/2F/51/54/58/59/7F），是業界（Cakewalk、Cubase 等）
+          // 常見但沒有被正式標準化的慣例欄位。RP-019 定義的是 FF 09 Device Name，該文件把
+          // Device Name 描述成「取代 cable number（也就是這裡的 FF 21）的更好做法」，隱含同一個
+          // 「一軌對應一個裝置」的假設，但這是慣例上的推論，不是 RP-019 對 FF 21 本身的規定
+          // ——中途改變代表這軌違反了這個推論出來的慣例，partIdOf() 不含 port（A8），這種
+          // 檔案裡重複的 channel 號碼可能被誤併成同一聲部。
           else if (ev.port !== port) {
-            warn(`track ${trackIndex} 的 tick ${ev.tick}：MIDI Port（FF 21）中途從 ${port} 改成 ${ev.port}，RP-019 規定一軌只能對應一個裝置，之後重複的 channel 號碼可能被誤併成同一聲部`);
+            warn(`track ${trackIndex} 的 tick ${ev.tick}：MIDI Port（FF 21，業界慣例欄位，非 RP-001 正式定義）中途從 ${port} 改成 ${ev.port}，違反「一軌對應一個裝置」的慣例，之後重複的 channel 號碼可能被誤併成同一聲部`);
           }
         }
         else if (type === META.END_OF_TRACK) {

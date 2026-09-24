@@ -83,7 +83,7 @@ SMF 規格保證的是「格線」：`division`／`FF 51`（速度）／`FF 58`�
 | A5 | SMPTE division 沒有拍格線，`buildMeasureGrid()` 回空陣列 |
 | A6 | 高低音譜／旋律・伴奏（`clef`／`role`）是啟發式門檻，不是規格欄位 |
 | A7 | 強弱與 swing 完全不推導，每一拍等長、無輕重之分 |
-| A8 | 聲部識別（`partId`）不含 port（FF21）：同軌內中途切換 port 本身違反 RP-019（一軌只能對應一個裝置），`parseTrack()` 會偵測並警告這種檔案，但 partId 不會因此自動修正，重複的 channel 號碼仍可能被誤併成同一聲部 |
+| A8 | 聲部識別（`partId`）不含 port（`FF21`——這個欄位其實不在 RP-001 正式定義的 meta event 清單裡，是業界常見但未被正式標準化的慣例欄位；RP-019 定義的是 `FF09` Device Name，並把它描述成「取代 cable number（即 `FF21`）的更好做法」，隱含同一軌對應一個裝置的假設，但這是慣例推論、不是 RP-019 對 `FF21` 本身的規定）：同軌內中途切換 port 違反這個慣例，`parseTrack()` 會偵測並警告這種檔案，但 partId 不會因此自動修正，重複的 channel 號碼仍可能被誤併成同一聲部 |
 | A9 | 聲部識別不含 bank（CC0/32），同 channel＋program 但中途換過 bank 視為同一聲部；Bank Select 本身要等 Program Change 才生效（GM2 §3.3.1），送了 bank select 卻整軌沒有 program change 的邊緣情況會用最後一組 bank 硬猜 |
 | A13 | `buildMeasureGrid()` 的律動拍長優先採用 `cc` 換算，但 `cc = 24`（MIDI 的內建預設值，多數編曲軟體不論拍號一律照抄）一律視為「檔案沒有表態」而退回拍號分母音符——複拍子（如 6/8）若真的把 `cc` 寫成 24，仍會切成分母音符的拍數，不是實際律動單位 |
 | N1 | 一次有效拋物線＝共用拍位推到觸發者自己下一個真正有音符的拍（`buildBeatGrid()` 的律動拍，可能一次跨過好幾個空拍）；已經有音符在目前拍等待播出時，觸發直接原地 claim、不額外前進 |
