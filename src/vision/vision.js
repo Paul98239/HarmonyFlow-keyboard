@@ -26,14 +26,8 @@ const CONFIG = {
   maxUsers: 4, // 最多鎖定並顯示的目標人數
 };
 
-// 三種 pose 模型：lite 最快但抖動較明顯，full／heavy 較穩但推論成本高。目前預設 lite；
-// 抽成表格＋ loadPoseModel()／setPoseModel()，讓日後切換只需要接一個下拉選單。
-const POSE_MODELS = {
-  lite: "./src/assets/pose_landmarker_lite.task",
-  full: "./src/assets/pose_landmarker_full.task",
-  heavy: "./src/assets/pose_landmarker_heavy.task",
-};
-const DEFAULT_POSE_MODEL = "lite";
+// 只用 lite 模型（最快、抖動也最明顯，但足夠用）。
+const POSE_MODEL_PATH = "./src/assets/pose_landmarker_lite.task";
 
 // MediaPipe 的 numPoses（同時追幾個人）。這個數字決定 MediaPipe 的工作模式：「追到的人數 ≥
 // numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
@@ -174,15 +168,14 @@ let glTexture = null;      // video texture
 let glProgram = null;      // shader program
 let consecutiveFrameErrors = 0; // 連續幀處理失敗計數，超過 FRAME_ERROR_THRESHOLD 才視為持續性錯誤
 let lastProcessedVideoTime = -1; // 上一次真的送去推論的 video.currentTime（rAF 降級路徑用來跳過重複幀）
-let visionFileset = null; // FilesetResolver 的結果，切換模型時重用，不必重新載入 WASM
-let currentModelVariant = DEFAULT_POSE_MODEL;
+let visionFileset = null; // FilesetResolver 的結果，換人數重建 landmarker 時重用，不必重新載入 WASM
 let currentPoseCount = 0; // 目前使用中的 landmarker 的 numPoses；0 ＝ 還沒建過任何一份
 let chosenPoseCount = 0;  // 系統控制 bar 選的「現場人數」；0 ＝ 還沒選 ＝ 不推論
-// 唯一一個「在飛」的建置：{ variant, numPoses, promise }。同一組 config 重複要求共用同一顆
-// promise；換成別組 config 時舊的直接作廢（MediaPipe 沒有取消 API，只能在它 resolve 時
+// 唯一一個「在飛」的建置：{ numPoses, promise }。同一個 numPoses 重複要求共用同一顆
+// promise；換成別的 numPoses 時舊的直接作廢（MediaPipe 沒有取消 API，只能在它 resolve 時
 // close 掉，見 requestLandmarker()）。取代 landmarkerPool／poolGeneration／
 // latestRequestedPoseCount：只有一份在飛，用物件識別（pendingBuild !== build）就完全取代
-// 世代號，不會有「舊變體被當成新變體快取」的情形。
+// 世代號。
 let pendingBuild = null;
 
 // ── 幀迴圈 ──
@@ -847,15 +840,12 @@ function refreshStageHint() {
    🧠 Pose 模型載入（單一實例，懶惰載入）
    ═══════════════════════════════════════════ */
 // 純粹建置，不動任何模組層狀態。
-async function loadPoseModel(variant, numPoses) {
-  const modelAssetPath = POSE_MODELS[variant];
-  if (!modelAssetPath) throw new Error(`未知的 pose 模型：${variant}`);
-
+async function loadPoseModel(numPoses) {
   return PoseLandmarker.createFromOptions(visionFileset, {
     // 不設 baseOptions.canvas：GPU delegate 官方文件說「GPU 處理時要綁」，但那是指把畫面
     // 交給 MediaPipe 用 GPU texture 處理的情境；我們只吃 landmark 座標，畫面渲染是自己另外
     // 管理的 WebGL context（見檔案開頭），兩邊搶同一個 canvas 反而會衝突，所以刻意不設。
-    baseOptions: { modelAssetPath, delegate: "GPU" },
+    baseOptions: { modelAssetPath: POSE_MODEL_PATH, delegate: "GPU" },
     runningMode: "VIDEO",
     numPoses,
     minPoseDetectionConfidence: 0.5,
@@ -867,20 +857,20 @@ async function loadPoseModel(variant, numPoses) {
 
 // 唯一的建置入口。回傳：建好的 landmarker，或 null ＝「等待期間被更新的請求取代，這次不算
 // 數」（不是錯誤，呼叫端不該顯示錯誤訊息）。
-// 合併：同一組 (variant, numPoses) 在飛時直接共用同一顆 promise，不會建第二份。
-// 取代：不同組 config 進來時，舊的那個建置沒有人「要」了——但 MediaPipe 沒有取消 API，
+// 合併：同一個 numPoses 在飛時直接共用同一顆 promise，不會建第二份。
+// 取代：不同 numPoses 進來時，舊的那個建置沒有人「要」了——但 MediaPipe 沒有取消 API，
 // 底層的 loadPoseModel() 仍會實際跑完，只是結果一出來就發現自己已經被取代、直接 close 丟棄；
 // 這代表使用者連續改變心意時（例如 2→3 選了之後 debounce 才剛觸發建置，建置中途又選 4），
 // 短暫幾秒內可能有兩個 loadPoseModel() 的 WASM／GPU 建置真的同時在跑——不是嚴格意義上的
 // 「同時只有一個 in-flight」，只是同一時間只有一個結果會被採用，另一個一建好就丟棄。這個
 // 重疊窗口短暫且會自我修正，跟拿掉常駐 4 份實例池的目標（降低穩定狀態的記憶體用量）不衝突。
-function requestLandmarker(variant, numPoses) {
-  if (pendingBuild && pendingBuild.variant === variant && pendingBuild.numPoses === numPoses) {
+function requestLandmarker(numPoses) {
+  if (pendingBuild && pendingBuild.numPoses === numPoses) {
     return pendingBuild.promise;
   }
   abandonPendingBuild();
-  const build = { variant, numPoses, promise: null };
-  build.promise = loadPoseModel(variant, numPoses).then(
+  const build = { numPoses, promise: null };
+  build.promise = loadPoseModel(numPoses).then(
     (landmarker) => {
       if (pendingBuild !== build) { landmarker.close(); return null; } // 已被取代：建好就直接丟
       pendingBuild = null;
@@ -955,41 +945,6 @@ export function setPerformanceStateListener(fn) {
   performanceStateListener = typeof fn === "function" ? fn : null;
 }
 
-// 目前使用中的 pose 模型變體（"lite" / "full" / "heavy"）
-export function getPoseModelVariant() {
-  return currentModelVariant;
-}
-
-// 執行期切換 pose 模型。lite 抖動明顯時可切到 full／heavy 換取穩定度，代價是推論較慢。
-// 目前只有 lite 在用、UI 沒有曝露這個功能，機制保留給日後接下拉選單。
-export async function setPoseModel(variant) {
-  if (!POSE_MODELS[variant]) throw new Error(`未知的 pose 模型：${variant}`);
-  if (!visionFileset || variant === currentModelVariant) return;
-
-  // 還沒建過任何一份（使用者還沒選人數）：只要改記錄，第一次真的要建時自然就用新變體。
-  // 已知限制（目前 UI 未曝露變體切換，不影響現況）：如果這個分支命中時剛好有一個
-  // pendingBuild 正在飛（使用者選了人數、還沒建完），那個建置仍然用「舊」變體跑完，
-  // 這次的變體變更不會套用到它身上，要等下一次 setPoseCount 才會用新變體重建。
-  if (!poseLandmarker) { currentModelVariant = variant; return; }
-
-  const targetCount = currentPoseCount;
-  let landmarker;
-  try {
-    landmarker = await requestLandmarker(variant, targetCount);
-  } catch (err) {
-    // 復原不需要做任何事：currentModelVariant 與 poseLandmarker 從頭到尾都沒被動過，
-    // 等待期間畫面一直用舊的那一份正常推論，行為等同「這次切換沒發生過」。
-    console.error(`❌ 切換 pose 模型失敗（${variant}），維持 ${currentModelVariant}`, err);
-    throw err;
-  }
-  if (!landmarker) return; // 等待期間被更新的請求取代（例如使用者改了人數）
-
-  const stale = poseLandmarker;
-  poseLandmarker = landmarker;   // 換手；賦值是同步的，下一幀起就是新的
-  currentModelVariant = variant;
-  stale.close();                 // processFrame 是同步的、不跨 await，不可能有哪一幀手上還拿著它
-}
-
 // 「現場人數」確定之後的監聽者（main.js 把它接到播放器的 setPlayerCount：分譜的「指派演奏者」
 // 下拉跟著列到 n）。跟 setCameraStateListener 同一種寫法。
 let poseCountListener = null;
@@ -1015,7 +970,7 @@ export async function setPoseCount(count) {
   // 已經是這個 numPoses（重選同一個值／失敗後重試）：不重建，只要把偵測武裝起來。
   if (poseLandmarker && currentPoseCount === count) { applyPoseCount(count); return true; }
 
-  const landmarker = await requestLandmarker(currentModelVariant, count);
+  const landmarker = await requestLandmarker(count);
   if (!landmarker) return false; // 被更新的請求取代，這次不算數（不是錯誤）
 
   const stale = poseLandmarker;
