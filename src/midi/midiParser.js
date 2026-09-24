@@ -126,9 +126,12 @@ const GM_PROGRAM_NAMES = Object.freeze([
 // 上切換：bank 79H(121)＝旋律（channel 9 以外的規格預設值）、bank 78H(120)＝節奏（channel 9
 // 的規格預設值）——collectParts() 的 percussionKit 判定依這條規則走（見下方說明），不是只看
 // channel 號碼；isDrum（＝channel 9）另外保留，是下游對應合成器鼓組 channel 用的獨立語意。
+// 拼法對齊 GM2 規格文件附錄 B「General MIDI 2 Percussion Sound Set」表格標題（PC#1 STANDARD Set、
+// PC#9 ROOM Set…）：全部是「XXX Set」，不是「XXX Kit」；56 號那組官方寫的是縮寫「SFX Set」，
+// 不是「Sound FX」。
 const GM_DRUM_KITS = Object.freeze({
-  0: 'Standard Kit', 8: 'Room Kit', 16: 'Power Kit', 24: 'Electronic Kit',
-  25: 'Analog Kit', 32: 'Jazz Kit', 40: 'Brush Kit', 48: 'Orchestra Kit', 56: 'Sound FX Kit',
+  0: 'Standard Set', 8: 'Room Set', 16: 'Power Set', 24: 'Electronic Set',
+  25: 'Analog Set', 32: 'Jazz Set', 40: 'Brush Set', 48: 'Orchestra Set', 56: 'SFX Set',
 });
 const DRUM_CHANNEL = 9;
 
