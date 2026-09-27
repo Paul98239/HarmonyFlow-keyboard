@@ -69,8 +69,21 @@ const CHANNELS_PER_PORT = 16;
    代打（autopilot）常數——應用層行為，不是規格
    ═══════════════════════════════════════════ */
 const AUTOPILOT_IDLE_MS = 800;  // 距這個聲部最近一次真實觸發超過這麼久 → 視同它自己剛觸發了一次
-const AUTOPILOT_VOLUME_CC = 64; // 代打時這個聲部的 CC7（GM 預設 100，約 −6dB），方便用耳朵分辨
-                                 // 目前是代打還是真人在演奏；只調音量，不動 note-on velocity
+// 代打時這個聲部的 CC7（Channel Volume）：目標是校正到約等於伴奏的音量基準（伴奏沒有掛
+// synth.js 的 HUMAN_EMPHASIS_GAIN，等於基準 1.0），真正的「凸顯」完全交給真人觸發時的
+// HUMAN_EMPHASIS_GAIN，代打本身不做額外凸顯或壓低。CC7 對音量不是線性關係——已查證 GM2 官方
+// 規格 §3.3.6（docs/midi-official-doc/General_MIDI_Level_2_07-2-6_1.2a.txt）明講 Channel
+// Volume／Expression 這組音量「數值的平方才正比於音量」，這個專案實際用的 spessasynth_core
+// 原始碼（GitHub spessasus/spessasynth_core 的 src/midi/midi_tools/midi_utils.ts）處理
+// Master Volume 時也是同一套平方關係（註解明講「it corresponds to CC volume, so volume is
+// squared」）。反推公式：HUMAN_EMPHASIS_GAIN × (CC7/100)² = 1.0 → CC7 = 100×√(1/1.4) ≈ 85。
+// 這個數字只用來對照 synth.js 的 HUMAN_EMPHASIS_GAIN，改動任一邊都要重算另一邊——兩個檔案
+// 之間無法用 import 連動（humanPerformer.js 不能反過來 import synth.js，會形成循環），跟這個
+// 專案裡 vision.js 的 EMIT_HEARTBEAT_MS 與 midiPlayer.js 的 GATE_STALE_MS 互相對照的既有寫法
+// 一致，只能靠註解手動同步。只調 CC7（音量），不動 note-on velocity（觸鍵力度）——這是兩種
+// 不同的 MIDI 概念，velocity 只在 note-on 當下決定一次，CC7 是疊加在已經送出的音符之上的
+// 獨立音量調整。
+const AUTOPILOT_VOLUME_CC = 85;
 
 /* ═══════════════════════════════════════════
    輸出 channel 分配
@@ -120,6 +133,8 @@ function makeVoice(partId, slot, notes, kind, channel) {
     lastSeq: null,          // 上次觀察到的手勢 triggerSeq，null＝還沒對過基準
     lastSlot: undefined,    // 上次觀察到的指派槽位，與現在不同就重新對齊基準（見 _handleTriggers）
     pendingTrigger: false,  // 觸發時這個聲部還有音在響，先排隊，見 _handleTriggers／_releaseDue
+    pendingIsAutopilot: false, // 排隊中的觸發是代打還是真人來源；_releaseDue() 交還時靠這個
+                               // 欄位正確標記 isAutopilot，見 _handleTriggers 的真實觸發分支
     lastRealTriggerMs: null, // 這個聲部最近一次「真實」觸發的時刻；null＝還沒發生過任何真實觸發，
                               // 代打不會啟動（見 _handleTriggers）
     autopilotDueMs: null,    // 下一次代打該發生的時刻；null＝目前不在代打倒數中
@@ -310,6 +325,7 @@ export class HumanPerformer {
       voice.lastSeq = null;
       voice.lastSlot = undefined;
       voice.pendingTrigger = false;
+      voice.pendingIsAutopilot = false;
       voice.lastRealTriggerMs = null;
       voice.autopilotDueMs = null;
       voice.isAutopilot = false;
@@ -415,10 +431,11 @@ export class HumanPerformer {
       voice.autopilotDueMs = nowMs + AUTOPILOT_IDLE_MS; // 每次真實觸發都重新武裝代打倒數
 
       // 這個聲部現在還有音在響：不立刻生效，排隊，等 _releaseDue() 發現音響完了再補上
-      // （見檔頭「正在響的音」的說明）——不會重疊，代價是這次觸發不是 0 delay。這裡刻意不動
-      // voice.isAutopilot：若排隊中的音正好是代打觸發的，交還時的音量標記暫時會沿用代打的
-      // 舊值（已知的暫時限制，之後會補上排隊來源標記來修正）。
-      if (voice.sounding.size > 0) { voice.pendingTrigger = true; continue; }
+      // （見檔頭「正在響的音」的說明）——不會重疊，代價是這次觸發不是 0 delay。真實觸發永遠
+      // 把排隊來源覆蓋成 pendingIsAutopilot=false：即使排隊中的觸發原本是代打，真人一觸發就
+      // 直接升級成人為來源，這是「即時介入」在排隊情境下的具體實作——不打斷正在響的音，但
+      // 確保它放完後接手的音量是真人身分，不會停留在代打的音量。
+      if (voice.sounding.size > 0) { voice.pendingTrigger = true; voice.pendingIsAutopilot = false; continue; }
       voice.isAutopilot = false;
       this._claimOrAdvance(voice);
       this._syncVolume(voice);
@@ -545,6 +562,7 @@ export class HumanPerformer {
     }
     if (voice.pendingTrigger && voice.sounding.size === 0) {
       voice.pendingTrigger = false;
+      voice.isAutopilot = voice.pendingIsAutopilot; // 排隊當下記錄的來源，交還時才正確標記
       this._claimOrAdvance(voice);
       this._syncVolume(voice);
     }

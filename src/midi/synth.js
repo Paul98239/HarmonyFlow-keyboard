@@ -1,12 +1,15 @@
 // ============================================================
-//  synth.js — spessasynth 合成器：兩個合成器（伴奏 synth／真人聲部 synthHuman）、humanGain 閘門。
-//  純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
+//  synth.js — spessasynth 合成器：兩個合成器（伴奏 synth／真人聲部 synthHuman）、humanGain
+//  閘門＋音量凸顯。純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
 //
 //  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（拍級事件驅動排程器）送來的個別
 //  noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。
 //
-//  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值，沒被自己的演奏者
-//  接手就是靜音（沒有代打）；沒被指派的聲部固定走 synth，不受任何人觸發影響，反應式播放。
+//  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值；沒被自己的演奏者
+//  觸發過、也沒有代打銜接的聲部就是靜音（見 humanPerformer.js 的代打說明）。沒被指派的聲部
+//  固定走 synth，不受任何人觸發影響，反應式播放。humanGain 開啟時的目標值刻意設在 1.0 以上
+//  （`HUMAN_EMPHASIS_GAIN`），讓使用者控制的聲部整體比電腦伴奏更突出；伴奏那一軌固定不掛
+//  額外 gain，是這個音量對比的基準，不會跟著被調小聲。
 // ============================================================
 
 import { HumanPerformer } from './humanPerformer.js';
@@ -36,6 +39,11 @@ const CHANNELS_PER_PORT = 16;
 const DRUM_CHANNEL_OFFSET = 9;
 
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
+const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（伴奏固定是 1.0 基準，沒有額外
+                                  // gain）：使用者控制的聲部整體調大聲，凸顯真人正在演奏的部分；
+                                  // 實測後可能還要繼續調整。改這個值時，humanPerformer.js 的
+                                  // AUTOPILOT_VOLUME_CC 要重算（該檔案的常數註解有完整公式）——
+                                  // 兩個檔案不能互相 import 形成循環，只能靠這兩則註解手動同步。
 
 /* ═══════════════════════════════════════════
    引擎狀態
@@ -91,8 +99,8 @@ export async function initEngine() {
       // 刻意不傳：兩個合成器都用標準 Web Audio API 節點（沒用 standardized-audio-context
       // 之類的包裝），也沒有監聽 spessasynth 內建的事件系統，全部吃函式庫預設值即可。
       synth = new WorkletSynthesizer(audioCtx);
-      // 真人聲部的第二個合成器。走 humanGain（預設靜音）→ 同一個 compressor，
-      // 跟伴奏經過同樣的動態處理、每單位 velocity 的響度也一致。
+      // 真人聲部的第二個合成器。走 humanGain（預設靜音，開啟時刻意比伴奏大聲，見
+      // HUMAN_EMPHASIS_GAIN）→ 同一個 compressor，跟伴奏共用同一段動態處理。
       synthHuman = new WorkletSynthesizer(audioCtx);
       humanPerformer.setSynths(synth, synthHuman);
       const compressor = audioCtx.createDynamicsCompressor();
@@ -191,11 +199,12 @@ export function isLoaded() { return isSongLoaded; }
 export function isPaused() { return !isSongLoaded || !humanPerformer.isPlaying(); }
 export function isFinished() { return isSongLoaded && humanPerformer.isFinished(); }
 
-// humanGain 只是總開關：播放器算好「該不該開」（播放中、沒播完、真的有指派），這裡
-// 只負責平滑地切上去／切下來；target 去重，同一個值不重複送。
+// humanGain 是總開關兼音量凸顯：播放器算好「該不該開」（播放中、沒播完、真的有指派），這裡
+// 只負責平滑地切上去（到 HUMAN_EMPHASIS_GAIN，比伴奏的固定基準大聲）／切下來（到 0）；
+// target 去重，同一個值不重複送。
 export function setHumanGate(on) {
   if (!audioCtx || !humanGain) return;
-  const target = on ? 1 : 0;
+  const target = on ? HUMAN_EMPHASIS_GAIN : 0;
   if (target === lastGateTarget) return;
   lastGateTarget = target;
   try { humanGain.gain.setTargetAtTime(target, audioCtx.currentTime, GATE_RAMP_TC); } catch (e) {}
