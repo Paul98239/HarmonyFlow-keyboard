@@ -2,6 +2,8 @@
 Thumbs.db
 desktop.ini
 *.log
+# 開發／測試用工具（Playwright），app 本身不依賴 node_modules，不進 git
+node_modules/
 # 個人參考用文件，只在本機看，不進 git／不備份
 docs/
 # .vscode 只納入 settings.json／extensions.json（Live Server 的專案設定），其餘個人設定不進 git

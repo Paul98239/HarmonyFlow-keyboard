@@ -1,28 +1,41 @@
 // ============================================================
 //  humanPerformer.js — 事件驅動排程器（純邏輯，無 DOM／CDN）
 //
-//  沒有背景時鐘：共用拍位只在「有效觸發」發生的那一刻才前進，其他時間完全靜止，沒有觸發
-//  就不會自己往前走（曾經試過拍速估計器＋電腦代打的版本，因為沒人揮手曲子也會自己前進而
-//  被拿掉，見專案的 git 歷史）。每個聲部有自己的播放頭 `playSec`（真實時間 1:1 前進）與
-//  上限 `limitSec`（播放頭不能超過的界線）。
+//  共用拍位只在「有效觸發」發生的那一刻才前進，其他時間完全靜止。「有效觸發」除了真人揮手，
+//  也包含代打（autopilot，見下）：一個聲部只要曾經被真人觸發過一次，之後只要靜止超過
+//  `AUTOPILOT_IDLE_MS` 就視同它自己剛觸發了一次，讓音樂繼續往前走；從未被真人觸發過的聲部
+//  完全不受影響，維持原地不動（見 `_handleTriggers()` 的說明）。每個聲部有自己的播放頭
+//  `playSec`（真實時間 1:1 前進）與上限 `limitSec`（播放頭不能超過的界線）。
 //
-//  指派聲部：演奏者在目前拍上還有沒播出的音，觸發就在原地把上限推到拍尾（claim）；沒有的
-//  話，把共用拍位直接推到這個聲部自己下一個真正有音符的拍（`_advanceToNextNote()`，可能
-//  一次跨過好幾個沒有音符的空拍——全音符或連續休止只需要一次觸發，不需要對著空拍反覆揮
-//  手），再 claim。跳過的過程中，其他被指派聲部若剛好也有音符落在被跳過的拍上，這一輪沒被
-//  自己的演奏者觸發＝直接靜音丟棄，不會被電腦補（沒有代打），也不會因為共用拍位路過就被
-//  誤判成發聲——這是這個排程器最容易出錯的地方，見 `_advanceToNextNote()` 的註解。
+//  指派聲部：演奏者（或代打）在目前拍上還有沒播出的音，觸發就在原地把上限推到拍尾（claim）；
+//  沒有的話，把共用拍位直接推到這個聲部自己下一個真正有音符的拍（`_advanceToNextNote()`，
+//  可能一次跨過好幾個沒有音符的空拍——全音符或連續休止只需要一次觸發，不需要對著空拍反覆
+//  揮手），再 claim。跳過的過程中，其他被指派聲部若剛好也有音符落在被跳過的拍上，這一輪沒被
+//  自己的演奏者（或代打）觸發＝直接靜音丟棄，不會因為共用拍位路過就被誤判成發聲——這是這個
+//  排程器最容易出錯的地方，見 `_advanceToNextNote()` 的註解。
 //
 //  但這一切要先過一道閘門：這個聲部現在還有沒有音在響（`voice.sounding`）。有的話，這次
 //  觸發不會立刻生效，只記成「排隊中」（`voice.pendingTrigger`），等舊音自然響完才自動補上，
-//  見下面「正在響的音」那段的說明——這是為了不讓新舊音重疊。
+//  見下面「正在響的音」那段的說明——這是為了不讓新舊音重疊，真人觸發跟代打觸發共用同一套
+//  排隊機制。
+//
+//  代打（`_handleTriggers()` 裡沒有偵測到新的真實觸發時的分支）：只讓「已經觸發過的那個
+//  聲部自己」在靜止時繼續前進，不是重新引入一個驅動全體的背景時鐘——共用拍位 `_beatIndex`
+//  能不能動，永遠只看有沒有聲部（不論真人還是代打）觸發，跟舊版被拿掉的「電腦代打＋拍速
+//  估計器」模型不同：那個版本是所有聲部預設由電腦代打、真人揮手才接手，沒人揮手曲子也會
+//  自己前進，讓人覺得不受控（見專案的 git 歷史）；這裡反過來，代打只是「同一個聲部自己的
+//  觸發」的延伸，沒被真人觸發過的聲部代打不會啟動。代打的推進間隔目前固定＝目前拍的樂譜
+//  原始拍長（之後會改成依這個聲部演奏者剛剛的揮手節奏估計，屆時只會影響「排程下一次代打
+//  的時間點」這一件事，不會動到下面「音符播放速度」這段講的 1:1 真實時間倒數）。代打與
+//  真人觸發在音量上刻意不同（`_syncVolume()` 把 CC7 調低），方便用耳朵分辨目前是誰在演奏；
+//  note-on velocity 完全不受影響，兩者都用樂譜原值。
 //
 //  音符播放速度直接鎖定 SMF 原速：播放頭前進與正在響的音的剩餘時長（`remain`）都用真實
-//  經過秒數 1:1 倒數，不做任何現場拍速估計或縮放（曾經試過依揮手間隔反推拍速、讓播放頭
-//  跟音長跟著揮手快慢縮放的版本，使用者實測後認為「手不動時音符被拖長」不可接受，見專案
-//  的 git 歷史；改回這個更簡單的模型）。哪一拍在原譜上是幾秒來自 `buildBeatGrid()`，是
-//  SMF 規格保證的確定性計算；「一次揮手該推進到哪」才是應用層的假設，不是規格——這是這個
-//  排程器裡唯一的假設，其餘全部照規格算出來的數字為準。
+//  經過秒數 1:1 倒數，不做任何縮放（曾經試過依揮手間隔反推拍速、讓播放頭跟音長跟著揮手
+//  快慢縮放的版本，使用者實測後認為「手不動時音符被拖長」不可接受，見專案的 git 歷史；
+//  改回這個更簡單的模型——這條規則不受代打影響，代打只決定「何時該視同一次新觸發」，
+//  不縮放任何已經在倒數的 `remain`）。哪一拍在原譜上是幾秒來自 `buildBeatGrid()`，是
+//  SMF 規格保證的確定性計算；「一次觸發該推進到哪」才是應用層的假設，不是規格。
 //
 //  未指派聲部（真正的電腦伴奏）：上限永遠等於 `_frontierSec`（全域值＝目前所有指派演奏者
 //  推進最遠的那一位），完全不受自己有沒有觸發影響，任何一次觸發把拍位往前推，伴奏的播放頭
@@ -51,6 +64,13 @@ export const DEFAULT_PERFORMER_CONFIG = Object.freeze({
 });
 
 const CHANNELS_PER_PORT = 16;
+
+/* ═══════════════════════════════════════════
+   代打（autopilot）常數——應用層行為，不是規格
+   ═══════════════════════════════════════════ */
+const AUTOPILOT_IDLE_MS = 800;  // 距這個聲部最近一次真實觸發超過這麼久 → 視同它自己剛觸發了一次
+const AUTOPILOT_VOLUME_CC = 64; // 代打時這個聲部的 CC7（GM 預設 100，約 −6dB），方便用耳朵分辨
+                                 // 目前是代打還是真人在演奏；只調音量，不動 note-on velocity
 
 /* ═══════════════════════════════════════════
    輸出 channel 分配
@@ -100,6 +120,11 @@ function makeVoice(partId, slot, notes, kind, channel) {
     lastSeq: null,          // 上次觀察到的手勢 triggerSeq，null＝還沒對過基準
     lastSlot: undefined,    // 上次觀察到的指派槽位，與現在不同就重新對齊基準（見 _handleTriggers）
     pendingTrigger: false,  // 觸發時這個聲部還有音在響，先排隊，見 _handleTriggers／_releaseDue
+    lastRealTriggerMs: null, // 這個聲部最近一次「真實」觸發的時刻；null＝還沒發生過任何真實觸發，
+                              // 代打不會啟動（見 _handleTriggers）
+    autopilotDueMs: null,    // 下一次代打該發生的時刻；null＝目前不在代打倒數中
+    isAutopilot: false,      // 最近一次 claim 是代打還是真人觸發，驅動 _syncVolume() 的 CC7 切換
+    _lastSentCc7: 100,       // 上次送出的 CC7 值，避免重送同一個值
   };
 }
 
@@ -247,6 +272,13 @@ export class HumanPerformer {
   play() {
     this._playing = true;
     this._lastTickMs = null; // 避免暫停期間累積的時間被當成一次巨大的 dt，把播放頭瞬間推老遠
+    // 同理，暫停期間經過的真實時間不該被算成「這個聲部靜止了這麼久」，否則一恢復播放就會對
+    // 已經觸發過的聲部誤判成早該代打；只重置「已經觸發過」的聲部，還沒被真實觸發過的維持
+    // null（代打不啟動，見 _handleTriggers）。
+    const nowMs = performance.now();
+    for (const voice of this._voices.values()) {
+      if (voice.lastRealTriggerMs != null) voice.lastRealTriggerMs = nowMs;
+    }
   }
 
   // 暫停：收掉還在響的音，播放頭與拍位都保留（下次播放從原處繼續）。
@@ -278,6 +310,10 @@ export class HumanPerformer {
       voice.lastSeq = null;
       voice.lastSlot = undefined;
       voice.pendingTrigger = false;
+      voice.lastRealTriggerMs = null;
+      voice.autopilotDueMs = null;
+      voice.isAutopilot = false;
+      voice._lastSentCc7 = 100;
     }
     this._beatIndex = this._startBeatIndex;
   }
@@ -322,7 +358,7 @@ export class HumanPerformer {
     const dt = this._lastTickMs == null ? 0 : (nowMs - this._lastTickMs) / 1000;
     this._lastTickMs = nowMs;
 
-    this._handleTriggers(getGestureFor);
+    this._handleTriggers(nowMs, getGestureFor);
     this._advancePlayheads(dt);
     this._emitDueNotes();
   }
@@ -336,10 +372,11 @@ export class HumanPerformer {
     }
   }
 
-  // 逐一檢查每個指派聲部有沒有新觸發：有的話，這一拍上這個聲部若還有沒播出的音就地
+  // 逐一檢查每個指派聲部有沒有新的真實觸發：有的話，這一拍上這個聲部若還有沒播出的音就地
   // claim；沒有就把共用拍位固定推進一拍，再 claim（這一拍若剛好也是這個聲部的下一個音，
-  // 就順便讓它出聲；不是的話這一拍只是被走過，等下一次觸發繼續往前）。
-  _handleTriggers(getGestureFor) {
+  // 就順便讓它出聲；不是的話這一拍只是被走過，等下一次觸發繼續往前）。沒有新的真實觸發時，
+  // 改檢查這個聲部該不該視同代打（見檔頭「代打」段落）。
+  _handleTriggers(nowMs, getGestureFor) {
     for (const voice of this._voices.values()) {
       if (voice.kind !== 'human') continue;
       const gesture = getGestureFor(voice.partId);
@@ -353,19 +390,49 @@ export class HumanPerformer {
       if (gesture.slot !== voice.lastSlot) {
         // 指派的槽位變了（改指派到別的演奏者、或人數變小被動清掉指派）：別的槽位的觸發
         // 計數是另一條獨立的累加序列，直接拿來比會被誤判成一次憑空冒出來的觸發，讓這個
-        // 聲部無端前進一步。重新對齊基準，這一刻不算觸發。
+        // 聲部無端前進一步。重新對齊基準，這一刻不算觸發；lastRealTriggerMs 不動——這個
+        // 聲部先前有沒有被真實觸發過，跟指派給哪個槽位是兩件事。
         voice.lastSlot = gesture.slot;
         voice.lastSeq = gesture.triggerSeq;
         continue;
       }
-      if (gesture.triggerSeq === voice.lastSeq) continue;
+
+      if (gesture.triggerSeq === voice.lastSeq) {
+        // 沒有新的真實觸發：檢查這個聲部該不該視同自己剛觸發了一次（代打）。
+        if (voice.lastRealTriggerMs == null) continue;       // 從沒被真實觸發過，代打不啟動
+        if (voice.cursor >= voice.notes.length) continue;     // 沒有更多音符可代打
+        if (voice.sounding.size > 0) continue;                // 有音在響，交給 _releaseDue() 處理
+        if (voice.autopilotDueMs == null || nowMs < voice.autopilotDueMs) continue;
+        const beat = this._beats[this._beatIndex];
+        voice.autopilotDueMs = nowMs + (beat.endSeconds - beat.startSeconds) * 1000; // 目前固定樂譜原速
+        voice.isAutopilot = true;
+        this._claimOrAdvance(voice);
+        this._syncVolume(voice);
+        continue;
+      }
       voice.lastSeq = gesture.triggerSeq;
+      voice.lastRealTriggerMs = nowMs;
+      voice.autopilotDueMs = nowMs + AUTOPILOT_IDLE_MS; // 每次真實觸發都重新武裝代打倒數
 
       // 這個聲部現在還有音在響：不立刻生效，排隊，等 _releaseDue() 發現音響完了再補上
-      // （見檔頭「正在響的音」的說明）——不會重疊，代價是這次觸發不是 0 delay。
+      // （見檔頭「正在響的音」的說明）——不會重疊，代價是這次觸發不是 0 delay。這裡刻意不動
+      // voice.isAutopilot：若排隊中的音正好是代打觸發的，交還時的音量標記暫時會沿用代打的
+      // 舊值（已知的暫時限制，之後會補上排隊來源標記來修正）。
       if (voice.sounding.size > 0) { voice.pendingTrigger = true; continue; }
+      voice.isAutopilot = false;
       this._claimOrAdvance(voice);
+      this._syncVolume(voice);
     }
+  }
+
+  // 代打與真人觸發共用的音量對比：代打時 CC7 調低，真人觸發時恢復 GM 預設 100，只影響音量、
+  // 不影響 note-on velocity（樂譜原值不變）。voice._lastSentCc7 去重，同一個值不重複送。
+  _syncVolume(voice) {
+    const cc = voice.isAutopilot ? AUTOPILOT_VOLUME_CC : 100;
+    if (voice._lastSentCc7 === cc) return;
+    voice._lastSentCc7 = cc;
+    const synth = voice.kind === 'human' ? this.humanSynth : this.accompSynth;
+    try { synth?.controllerChange(voice.channel, 7, cc); } catch (err) {}
   }
 
   _hasPendingInCurrentBeat(voice) {
@@ -479,6 +546,7 @@ export class HumanPerformer {
     if (voice.pendingTrigger && voice.sounding.size === 0) {
       voice.pendingTrigger = false;
       this._claimOrAdvance(voice);
+      this._syncVolume(voice);
     }
   }
 }
