@@ -18,7 +18,8 @@ app 執行不需要任何本機安裝，clone 下來直接用 Live Server 開就
 
 - **VS Code Live Server**：用 VS Code 開啟專案根目錄當工作區，「Go Live」→ `http://127.0.0.1:5500/`（`.vscode/settings.json` 已設 port 與忽略清單）。ES module 與 `getUserMedia` 需要 `http(s)://`，不能用 `file://`；換其他靜態伺服器要對 `.wasm` 回 `application/wasm`。部署＝把資料夾原樣 serve 出去，本地跑起來看到的就是部署後的樣子。
 - **第三方套件**：`@mediapipe/tasks-vision`（`src/vision/vision.js`）、`spessasynth_lib`（`src/midi/synth.js`）都直接寫死完整 jsDelivr CDN 網址匯入，沒有 import map、沒有本地副本，執行期需要網路。兩個套件都綁 `@latest`，不手動維護版本號，代價是 jsDelivr 對 `@latest` 有快取（瀏覽器端 7 天／邊緣節點 12 小時），版本可能在快取到期後無預警改變、且不同使用者吃到新版的時間點不一致；`spessasynth_lib` 對 `spessasynth_core`（core 對 `stb-vorbis`）宣告的相依版本本來就是 `latest`，管不到那一層，現在外層也主動浮動，兩層都是刻意選擇。
-- 沒有格式化工具、沒有測試；寫新程式照同一個檔案既有的風格。修改後在瀏覽器開頁面檢查 console 與攝影機輸出。
+- 沒有格式化工具；寫新程式照同一個檔案既有的風格。修改後在瀏覽器開頁面檢查 console 與攝影機輸出。
+- **自動化測試**：`test/browser/smoke-test.mjs` 是唯一的自動化測試，`node test/browser/smoke-test.mjs` 執行（`playwright` 是 `package.json` 的 devDependency，先 `npm install`；只服務 `test/` 底下的腳本，不影響 app 本身零建置、直接從 CDN 匯入相依套件的部署方式）。用 Playwright 開真的 Chromium＋假攝影機輸入，跑過選人數／載入本地樣本樂譜／指派聲部／按播放整條流程，檢查過程中有沒有非預期的 console error／warning／pageerror。**這個測試看不到 `spessasynth_processor.min.js`（AudioWorkletProcessor，音訊渲染執行緒）丟出的例外**：已實測確認，即使刻意讓 worklet 端丟出 Uncaught TypeError，`page.on('console')`／`page.on('pageerror')` 都收不到任何訊號，測試照樣回報「沒有問題」。牽涉 spessasynth worklet 內部狀態的 bug（例如 channel 配置、bank／program 是否真的送達）不能只靠這個測試「沒有報錯」判斷有沒有解決，要用直接印值驗證（`console.log` 搭配 `setTimeout` 讓非同步的 worklet 訊息先處理完再讀取狀態）或對 `humanPerformer.js`／`midiParser.js` 這類純邏輯模組直接寫 Node 腳本驗證。
 - 只有一個進入點：`index.html` → `src/main.js`。
 
 ## 部署狀態（會變動，動手前用 `gh api repos/Paul98239/HarmonyFlow` 與 `git ls-remote` 重查）

@@ -70,9 +70,17 @@ export const humanPerformer = new HumanPerformer();
 /* ═══════════════════════════════════════════
    MIDI 引擎核心
    ═══════════════════════════════════════════ */
+// 不能讀 s.midiChannels.length 決定實際 channel 數：已查證 spessasynth_lib 原始碼
+// （GitHub spessasus/spessasynth_lib 的 basic_synthesizer.ts）確認 addNewChannel() 會
+// 同時（1）在主執行緒本地立刻 push 一筆到這個陣列，（2）worklet 端真的建好 channel 後，又
+// 透過內部的 channelAdded 事件非同步回呼同一段程式碼、再 push 一次——每呼叫一次
+// addNewChannel()，這個陣列的 length 最終會多算成兩筆，跟 worklet 端真正建立的 channel 數
+// 對不上（實測：呼叫 48 次後 length 變成 112，不是 64；對只存在 64 個的 worklet 端送出
+// channel ≥64 的 controllerChange 會讓 worklet 丟出 Uncaught TypeError，因為它自己的
+// channel 陣列裡那個索引是 undefined）。兩個合成器一律固定補到 TOTAL_CHANNELS，這裡直接
+// 回傳這個數字即可，不必也不能信任 s.midiChannels.length。
 function channelCountOf(s) {
-  return (s && Array.isArray(s.midiChannels) && s.midiChannels.length > 0)
-    ? s.midiChannels.length : CHANNELS_PER_PORT;
+  return s ? TOTAL_CHANNELS : CHANNELS_PER_PORT;
 }
 function isDrumChannelIndex(ch) {
   return ch % CHANNELS_PER_PORT === DRUM_CHANNEL_OFFSET;
@@ -107,11 +115,6 @@ export async function initEngine() {
       // 真人聲部的第二個合成器。走 humanGain（預設靜音，開啟時刻意比伴奏大聲，見
       // HUMAN_EMPHASIS_GAIN）→ 同一個 compressor，跟伴奏共用同一段動態處理。
       synthHuman = new WorkletSynthesizer(audioCtx);
-      // 兩個合成器都補到 TOTAL_CHANNELS，見上方常數註解；humanPerformer.js 的
-      // allocateChannels() 依 synth.midiChannels.length 分配，補完之後兩邊自然一致。
-      for (const s of [synth, synthHuman]) {
-        while (s.midiChannels.length < TOTAL_CHANNELS) s.addNewChannel();
-      }
       humanPerformer.setSynths(synth, synthHuman);
       const compressor = audioCtx.createDynamicsCompressor();
       compressor.threshold.value = -18;
@@ -141,6 +144,22 @@ export async function initEngine() {
       await synthHuman.soundBankManager.addSoundBank(sfBufHuman, 'main');
       if (synth.isReady) await synth.isReady;
       if (synthHuman.isReady) await synthHuman.isReady;
+
+      // 兩個合成器都補到 TOTAL_CHANNELS，見上方常數註解＋channelCountOf() 的註解（呼叫過
+      // addNewChannel() 之後，s.midiChannels.length 已查證不可信任，所以這裡固定呼叫
+      // TOTAL_CHANNELS - CHANNELS_PER_PORT 次，不去讀那個 length）。刻意放在 soundBank 載入
+      // 完成之後才呼叫：spessasynth_core 對每個動態新增的 channel 會自動先設成打擊 channel
+      // 並立刻查一次預設音色（見 createMIDIChannel() 原始碼），這個查詢在 soundBank 還沒
+      // 載入時一定查不到，會在 console 噴「No preset found for DRUM:0! Did you forget to
+      // add a sound bank?」的警告——已查證 spessasynth_core 原始碼（GitHub
+      // spessasus/spessasynth_core 的 src/synthesizer/processor.ts）確認這正是這串警告字面
+      // 唯一的來源：找不到音色時呼叫的預設 onMissingPreset handler，只要 program change 當下
+      // 還沒有任何 soundBank 就一定會觸發。這則警告本身不影響功能（每個聲部實際的音色仍然是
+      // _applyInitialPatch() 之後另外送的 bank／program 決定），純粹是時機問題，把
+      // addNewChannel() 挪到 soundBank 載入完成之後即可避開。
+      for (const s of [synth, synthHuman]) {
+        for (let i = CHANNELS_PER_PORT; i < TOTAL_CHANNELS; i++) s.addNewChannel();
+      }
 
       isReady = true;
       return true;

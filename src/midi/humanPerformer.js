@@ -74,6 +74,12 @@ export const DEFAULT_PERFORMER_CONFIG = Object.freeze({
 });
 
 const CHANNELS_PER_PORT = 16;
+// synth.js 固定把兩個合成器都補到這個數字（見該檔案 channelCountOf() 的註解：呼叫
+// addNewChannel() 之後，synth 物件自己回報的 midiChannels.length 已查證不可信任，兩個檔案
+// 因此都改成直接用這個寫死的數字，不去讀 synth.midiChannels.length）。humanPerformer.js
+// 不能反過來 import synth.js（見檔頭 import 方向，會形成循環），只能靠註解手動同步，跟
+// AUTOPILOT_VOLUME_CC／HUMAN_EMPHASIS_GAIN 的既有做法一致。
+const TOTAL_CHANNELS = CHANNELS_PER_PORT * 4;
 
 /* ═══════════════════════════════════════════
    代打（autopilot）常數——應用層行為，不是規格
@@ -104,8 +110,7 @@ const AUTOPILOT_VOLUME_CC = 85;
 
 // 這個合成器上可用的旋律輸出 channel＝跳過每個 port 的打擊槽（ch % 16 === drumChannel）。
 function melodicChannelsFor(synth, drumChannel) {
-  const chans = synth?.midiChannels;
-  const total = Array.isArray(chans) && chans.length > 0 ? chans.length : CHANNELS_PER_PORT;
+  const total = synth ? TOTAL_CHANNELS : CHANNELS_PER_PORT;
   const out = [];
   for (let ch = 0; ch < total; ch++) {
     if (ch % CHANNELS_PER_PORT !== drumChannel) out.push(ch);
