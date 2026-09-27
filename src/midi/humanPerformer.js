@@ -24,11 +24,13 @@
 //  能不能動，永遠只看有沒有聲部（不論真人還是代打）觸發，跟舊版被拿掉的「電腦代打＋拍速
 //  估計器」模型不同：那個版本是所有聲部預設由電腦代打、真人揮手才接手，沒人揮手曲子也會
 //  自己前進，讓人覺得不受控（見專案的 git 歷史）；這裡反過來，代打只是「同一個聲部自己的
-//  觸發」的延伸，沒被真人觸發過的聲部代打不會啟動。代打的推進間隔目前固定＝目前拍的樂譜
-//  原始拍長（之後會改成依這個聲部演奏者剛剛的揮手節奏估計，屆時只會影響「排程下一次代打
-//  的時間點」這一件事，不會動到下面「音符播放速度」這段講的 1:1 真實時間倒數）。代打與
-//  真人觸發在音量上刻意不同（`_syncVolume()` 把 CC7 調低），方便用耳朵分辨目前是誰在演奏；
-//  note-on velocity 完全不受影響，兩者都用樂譜原值。
+//  觸發」的延伸，沒被真人觸發過的聲部代打不會啟動。代打的推進間隔沿用這個聲部演奏者剛剛的
+//  揮手節奏估計（真實觸發間隔的指數平滑，見 `AUTOPILOT_SMOOTHING`／`AUTOPILOT_RATIO_MIN`／
+//  `AUTOPILOT_RATIO_MAX`；樣本不足就退回目前拍的原譜拍長）——這個估計值只用來決定「排程下
+//  一次代打的時間點」，完全不會動到下面「音符播放速度」這段講的 1:1 真實時間倒數，這正是
+//  避開舊版拍速估計器 bug 的關鍵邊界。代打與真人觸發在音量上刻意不同（`_syncVolume()` 讓
+//  代打的 CC7 貼齊伴奏基準、真人觸發時整體再被 `HUMAN_EMPHASIS_GAIN` 凸顯，見 `synth.js`），
+//  方便用耳朵分辨目前是誰在演奏；note-on velocity 完全不受影響，兩者都用樂譜原值。
 //
 //  音符播放速度直接鎖定 SMF 原速：播放頭前進與正在響的音的剩餘時長（`remain`）都用真實
 //  經過秒數 1:1 倒數，不做任何縮放（曾經試過依揮手間隔反推拍速、讓播放頭跟音長跟著揮手
@@ -84,6 +86,12 @@ const AUTOPILOT_IDLE_MS = 800;  // 距這個聲部最近一次真實觸發超過
 // 不同的 MIDI 概念，velocity 只在 note-on 當下決定一次，CC7 是疊加在已經送出的音符之上的
 // 獨立音量調整。
 const AUTOPILOT_VOLUME_CC = 85;
+const AUTOPILOT_SMOOTHING = 0.5;  // 每個新量到的真實觸發間隔，佔更新後估計值的比例
+const AUTOPILOT_RATIO_MIN = 0.25; // 估計間隔相對「目前拍的原譜拍長」的下限
+const AUTOPILOT_RATIO_MAX = 4;    // 上限——單次異常觸發間隔（例如換氣停頓恰好被算進去）不會把
+                                   // 代打節奏甩到離譜的快或慢；跟舊版拍速估計器的 TEMPO_SCALE_
+                                   // MIN/MAX 用同一組已驗證過的比例，這裡只用來排程代打時機，
+                                   // 不會像舊機制那樣拿去縮放正在響的音（見檔頭「代打」段落）
 
 /* ═══════════════════════════════════════════
    輸出 channel 分配
@@ -138,6 +146,8 @@ function makeVoice(partId, slot, notes, kind, channel) {
     lastRealTriggerMs: null, // 這個聲部最近一次「真實」觸發的時刻；null＝還沒發生過任何真實觸發，
                               // 代打不會啟動（見 _handleTriggers）
     autopilotDueMs: null,    // 下一次代打該發生的時刻；null＝目前不在代打倒數中
+    intervalEstimateSec: null, // 依真實觸發間隔估計出的代打節奏；null＝樣本不足，退回目前拍的
+                                // 原譜拍長（見 _handleTriggers 的真實觸發分支）
     isAutopilot: false,      // 最近一次 claim 是代打還是真人觸發，驅動 _syncVolume() 的 CC7 切換
     _lastSentCc7: 100,       // 上次送出的 CC7 值，避免重送同一個值
   };
@@ -328,6 +338,7 @@ export class HumanPerformer {
       voice.pendingIsAutopilot = false;
       voice.lastRealTriggerMs = null;
       voice.autopilotDueMs = null;
+      voice.intervalEstimateSec = null;
       voice.isAutopilot = false;
       voice._lastSentCc7 = 100;
     }
@@ -420,13 +431,30 @@ export class HumanPerformer {
         if (voice.sounding.size > 0) continue;                // 有音在響，交給 _releaseDue() 處理
         if (voice.autopilotDueMs == null || nowMs < voice.autopilotDueMs) continue;
         const beat = this._beats[this._beatIndex];
-        voice.autopilotDueMs = nowMs + (beat.endSeconds - beat.startSeconds) * 1000; // 目前固定樂譜原速
+        // 樣本不足（這個聲部還沒被真實觸發超過一次、量不出間隔）就退回目前拍的原譜拍長；
+        // 有估計值就沿用它——這裡只決定「下一次代打排在多久之後」這一個時間點，不會拿去
+        // 縮放任何正在響的音的 remain（見檔頭「代打」段落與 AUTOPILOT_RATIO_MIN/MAX 的註解）。
+        const intervalSec = voice.intervalEstimateSec ?? (beat.endSeconds - beat.startSeconds);
+        voice.autopilotDueMs = nowMs + intervalSec * 1000;
         voice.isAutopilot = true;
         this._claimOrAdvance(voice);
         this._syncVolume(voice);
         continue;
       }
       voice.lastSeq = gesture.triggerSeq;
+      // 用這次跟上次真實觸發的間隔更新代打節奏估計——只在已經有過上一次真實觸發時才量得出
+      // 間隔，且要在覆蓋 lastRealTriggerMs 之前算，不然舊值就沒了。夾在
+      // [AUTOPILOT_RATIO_MIN, AUTOPILOT_RATIO_MAX] 乘上目前拍的原譜拍長之間，單次異常間隔
+      // （例如換氣停頓）不會讓估計值一次跳到離譜的數字；指數平滑（AUTOPILOT_SMOOTHING）讓它
+      // 跟著最近幾次觸發慢慢收斂，不是只看最後一次。
+      if (voice.lastRealTriggerMs != null) {
+        const rawGapSec = (nowMs - voice.lastRealTriggerMs) / 1000;
+        const beatLen = this._beats[this._beatIndex].endSeconds - this._beats[this._beatIndex].startSeconds;
+        const clamped = Math.max(AUTOPILOT_RATIO_MIN * beatLen, Math.min(AUTOPILOT_RATIO_MAX * beatLen, rawGapSec));
+        voice.intervalEstimateSec = voice.intervalEstimateSec == null
+          ? clamped
+          : voice.intervalEstimateSec * (1 - AUTOPILOT_SMOOTHING) + clamped * AUTOPILOT_SMOOTHING;
+      }
       voice.lastRealTriggerMs = nowMs;
       voice.autopilotDueMs = nowMs + AUTOPILOT_IDLE_MS; // 每次真實觸發都重新武裝代打倒數
 
