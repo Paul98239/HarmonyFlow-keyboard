@@ -371,8 +371,7 @@ body, html {
 .top-progress-bar::-moz-progress-bar { background: var(--accent); }
 
 /* 播放 pill 與控制列各自獨立淡化，純 CSS :hover／:has()／:focus-within，沒有 JS 計時器、
-   沒有延遲：碰到（或鍵盤焦點進去）就顯示，沒碰到立刻淡化。工作列碰到時歌曲條也跟著顯示（可以順便看到現在播的是哪首），
-   但碰到歌曲條不會連帶顯示工作列——這是刻意的不對稱，不是遺漏。
+   沒有延遲：碰到（或鍵盤焦點進去）就顯示，沒碰到立刻淡化，兩者互不牽動。
    還沒有能播放的歌曲之前（#btnPlayPause 是 disabled），工作列常駐不淡出——這時候它是唯一的
    操作入口，年長使用者要先看得到「選歌」按鈕在哪裡；一旦選好歌（可播放或播放中），工作列
    回到原本 hover 才顯示的淡出邏輯，換成歌曲條常駐不淡出，把畫面重心讓給攝影機與正在播放的
@@ -397,11 +396,6 @@ body, html {
   transition: opacity var(--dur-base) ease, width var(--dur-base) ease;
 }
 #toolbar-playback:hover { opacity: 1; }
-#top-center-stack:has(.control-row:hover) #toolbar-playback,
-#top-center-stack:has(.control-row:focus-within) #toolbar-playback,
-#top-center-stack:has(.tl-popup:not([hidden])) #toolbar-playback {
-  opacity: 1;
-}
 #toolbar-playback:has(#btnPlayPause:not(:disabled)) {
   opacity: 1;
 }

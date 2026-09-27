@@ -711,15 +711,19 @@ function makeNote(trackIndex, onEvent, endTick, offVelocity, tickToSeconds, prog
 
 function collectNotes(tracks, tickToSeconds, warn) {
   const notes = [];
+  // 逐 channel 追蹤目前生效的音色，用來把每顆音歸到「它響起當下實際在吹奏的樂器」；
+  // 沒有明確 program change 時 GM 規格預設就是 0（Acoustic Grand Piano）。這是分聲部
+  // 除了 track×channel 之外還要看 program 的原因：一個 channel 中途換過音色，
+  // 換過去之後彈的音不該跟換之前混成同一個聲部（見 partIdOf 的說明）。
+  // 宣告在逐軌迴圈外面、所有軌共用同一份：Program Change 在 MIDI 規格裡是 channel 的狀態，
+  // 不是 track 的狀態，同一個 channel 可能被拆到好幾軌（一軌設定音色、音符寫在別軌）；
+  // 每進一軌就重設成 0 會讓沒有 program change 事件的那些軌全部誤判成鋼琴。partId 仍然
+  // 依 partIdOf(track, channel, program) 各自獨立，不受影響——這裡只修正 program 的值本身。
+  const currentProgram = new Array(16).fill(0);
   for (const track of tracks) {
     // key = channel * 128 + 音高。同一 key 可能同時有多顆未收尾的音（同音重疊），
     // 以先進先出配對：先響的音先被關掉，這是最貼近演奏直覺的解讀。
     const pending = new Map();
-    // 逐 channel 追蹤目前生效的音色，用來把每顆音歸到「它響起當下實際在吹奏的樂器」；
-    // 沒有明確 program change 時 GM 規格預設就是 0（Acoustic Grand Piano）。這是分聲部
-    // 除了 track×channel 之外還要看 program 的原因：一個 channel 中途換過音色，
-    // 換過去之後彈的音不該跟換之前混成同一個聲部（見 partIdOf 的說明）。
-    const currentProgram = new Array(16).fill(0);
     for (const ev of track.events) {
       if (ev.kind !== 'channel') continue;
       if (ev.type === 'programChange') { currentProgram[ev.channel] = ev.data1; continue; }
@@ -870,9 +874,11 @@ function collectParts(tracks, notes, warn) {
   // 「真的送了 MSB 0」區分開來——GM2 §3.3.1 明訂的規格預設值（channel 9 是 78H/00H，其餘是
   // 79H/00H）留給 collectParts() 在查不到時才補上，不寫死在這個 map 裡。
   const banks = new Map(); // id → { msb, lsb }
+  // 跟 collectNotes() 同樣的道理：Program Change 是 channel 的狀態、跨軌共用，宣告在迴圈外面，
+  // 避免一軌只送 Bank Select、真正的 Program Change 在別軌時，被這裡的預設值 0 誤蓋掉。
+  const currentProgram = new Array(16).fill(0);
   for (const track of tracks) {
     const running = new Map(); // channel → { msb, lsb }（這一軌目前生效的 bank）
-    const currentProgram = new Array(16).fill(0);
     for (const ev of track.events) {
       if (ev.kind !== 'channel') continue;
       if (ev.type === 'controlChange' && (ev.data1 === 0 || ev.data1 === 32)) {

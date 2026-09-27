@@ -168,8 +168,10 @@ function loadScore(arrayBuffer, label) {
     }
     playerStore.set({ score, parts: score.parts });
   } catch (err) {
-    // 自己的解析器讀不懂的檔案，spessasynth 不一定也讀不懂——分譜解析失敗不擋播放。
-    console.warn(`⚠️ ${label} 分譜解析失敗，將以整份播放`, err);
+    // score 保持 clearScore() 設的 null／[]：humanPerformer.load(null, ...) 會直接回傳、
+    // 不建立任何聲部——分譜解析失敗不會擋住「播放」這個動作本身，但也沒有整份自動播放這條
+    // 退路可用（synth.js 已經不用 spessasynth 的 Sequencer，見該檔案頭），實際結果是靜音。
+    console.warn(`⚠️ ${label} 分譜解析失敗，無法播放`, err);
   }
 }
 

@@ -37,6 +37,11 @@ const CC_RESET_ALL_CONTROLLERS = 121;
 const CC_ALL_NOTES_OFF = 123;
 const CHANNELS_PER_PORT = 16;
 const DRUM_CHANNEL_OFFSET = 9;
+// WorkletSynthesizer 預設只建 16 個 channel（1 個 MIDI port）；總譜聲部數超過這個數字時，
+// 多出來的聲部會完全分不到輸出 channel、整段靜音（已用國旗歌 24 個旋律聲部實測重現）。
+// spessasynth_lib 支援用 addNewChannel() 動態加開，對應 MIDI 多 port 的慣例——這裡固定
+// 補到 4 個 port 份（64 個 channel），對真實總譜的複雜度留足夠的餘裕，不用依每首歌動態調整。
+const TOTAL_CHANNELS = CHANNELS_PER_PORT * 4;
 
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
 const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（伴奏固定是 1.0 基準，沒有額外
@@ -102,6 +107,11 @@ export async function initEngine() {
       // 真人聲部的第二個合成器。走 humanGain（預設靜音，開啟時刻意比伴奏大聲，見
       // HUMAN_EMPHASIS_GAIN）→ 同一個 compressor，跟伴奏共用同一段動態處理。
       synthHuman = new WorkletSynthesizer(audioCtx);
+      // 兩個合成器都補到 TOTAL_CHANNELS，見上方常數註解；humanPerformer.js 的
+      // allocateChannels() 依 synth.midiChannels.length 分配，補完之後兩邊自然一致。
+      for (const s of [synth, synthHuman]) {
+        while (s.midiChannels.length < TOTAL_CHANNELS) s.addNewChannel();
+      }
       humanPerformer.setSynths(synth, synthHuman);
       const compressor = audioCtx.createDynamicsCompressor();
       compressor.threshold.value = -18;
