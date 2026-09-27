@@ -420,11 +420,16 @@ function renderTransportPill({ player }) {
   }
 }
 
-// 頂端進度條：跟 renderTransportPill 平行、互不依賴。沒有分譜資訊（score 為 null 或
-// durationSeconds 為 0）就整條收起來，不顯示沒有意義的 0% 進度。
+// 頂端進度條：跟 renderTransportPill 平行、互不依賴。第一次有分譜資訊（score 非 null 且
+// durationSeconds > 0）之前整條收起來，不顯示沒有意義的 0% 進度；顯示過一次之後就不再因為
+// 換歌時 score 短暫變 null（見 loadScore() 開頭的 clearScore()）而重新收起，避免每次換歌
+// 都跳出一次「重新載入」的閃爍——value 在那個空窗期只是暫時停在舊值，等新歌算出比例才跳
+// 過去，「沒人觸發時停住不動」的既有原則不變。
+let hasShownProgress = false;
 function renderTopProgress({ player }) {
   const total = player.score?.durationSeconds || 0;
-  topProgressBar.hidden = !(total > 0);
+  if (total > 0) hasShownProgress = true;
+  topProgressBar.hidden = !hasShownProgress;
   if (total > 0) {
     const ratio = Math.min(1, player.positionSeconds / total);
     if (topProgressBar.value !== ratio) topProgressBar.value = ratio;

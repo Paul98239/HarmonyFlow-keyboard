@@ -190,14 +190,16 @@ body, html {
 .btn:hover:not(:disabled) { background: var(--btn-bg-hover); }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-/* 攝影機開關／重置：純文字按鈕，依文字內容自然變寬——內距刻意收得比 .tl-trigger 更緊一點，
-   這兩顆本來就是系統控制群組裡的次要動作。字級沒有跟著縮小（還是 var(--ui-fs)），只收內距。 */
+/* 攝影機開關／重置：純文字按鈕，依文字內容自然變寬。padding／box-shadow 跟同一排的
+   .tl-select／.tl-trigger 共用同一組數值，整排工作列（鏡頭、人數、重置、選歌）看起來是
+   同一個系列，不再分「主要／次要動作」兩種粗細。 */
 .tl-text-btn {
   flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
   padding: 0.3em 0.65em;
   border-radius: var(--radius-sm);
   font-size: var(--ui-fs);
+  box-shadow: var(--shadow-sm);
 }
 /* 重置骨架 ID：點一下閃黃色代表「剛重置過」，不是常駐狀態（跟鏡頭開關那種持續中的狀態不同）。
    動畫時長跟退場都交給 CSS；JS（src/ui.js）只負責加 class，用強制 reflow 讓連續點擊
@@ -213,9 +215,10 @@ body, html {
 .tl-select {
   flex-shrink: 0;
   font-size: var(--ui-fs); font-weight: 700; font-family: inherit;
-  padding: 0.3em 0.4em; border-radius: var(--radius-sm);
+  padding: 0.3em 0.65em; border-radius: var(--radius-sm);
   border: var(--line) solid var(--border-light); background: var(--bg);
   color: var(--text); outline: none;
+  box-shadow: var(--shadow-sm);
 }
 .tl-select:focus { border-color: var(--accent); }
 
@@ -235,7 +238,7 @@ body, html {
 /* 選歌的觸發鈕，跟系統控制 bar 同一套外觀語彙。細長樣式：字級不變（保護可讀性）。 */
 .tl-trigger {
   font-size: var(--ui-fs);
-  padding: 0.35em 0.85em; border-radius: var(--radius-sm);
+  padding: 0.3em 0.65em; border-radius: var(--radius-sm);
   box-shadow: var(--shadow-sm);
 }
 
@@ -370,6 +373,10 @@ body, html {
 /* 播放 pill 與控制列各自獨立淡化，純 CSS :hover／:has()／:focus-within，沒有 JS 計時器、
    沒有延遲：碰到（或鍵盤焦點進去）就顯示，沒碰到立刻淡化。工作列碰到時歌曲條也跟著顯示（可以順便看到現在播的是哪首），
    但碰到歌曲條不會連帶顯示工作列——這是刻意的不對稱，不是遺漏。
+   還沒有能播放的歌曲之前（#btnPlayPause 是 disabled），工作列常駐不淡出——這時候它是唯一的
+   操作入口，年長使用者要先看得到「選歌」按鈕在哪裡；一旦選好歌（可播放或播放中），工作列
+   回到原本 hover 才顯示的淡出邏輯，換成歌曲條常駐不淡出，把畫面重心讓給攝影機與正在播放的
+   資訊。兩條規則共用同一個「有沒有歌可播」判斷，條件互斥。
    觸控裝置沒有 hover，states 層的 @media (hover: none) 讓兩者固定顯示。 */
 .control-row {
   opacity: var(--idle-opacity);
@@ -380,14 +387,22 @@ body, html {
 .control-row:has(.tl-popup:not([hidden])) {
   opacity: 1;
 }
+#top-center-stack:has(#btnPlayPause:disabled) .control-row {
+  opacity: 1;
+}
 #toolbar-playback {
   opacity: var(--idle-opacity);
-  transition: opacity var(--dur-base) ease;
+  /* width 也跟著淡化一起過渡：pill 是 width:max-content，歌名長度一變（換歌）寬度就跳一格，
+     置中的疊層又會跟著整條橫移，沒有這個過渡看起來像瞬間重排。 */
+  transition: opacity var(--dur-base) ease, width var(--dur-base) ease;
 }
 #toolbar-playback:hover { opacity: 1; }
 #top-center-stack:has(.control-row:hover) #toolbar-playback,
 #top-center-stack:has(.control-row:focus-within) #toolbar-playback,
 #top-center-stack:has(.tl-popup:not([hidden])) #toolbar-playback {
+  opacity: 1;
+}
+#toolbar-playback:has(#btnPlayPause:not(:disabled)) {
   opacity: 1;
 }
 
