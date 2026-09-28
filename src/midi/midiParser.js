@@ -474,6 +474,11 @@ function parseTrack(body, trackIndex, warn) {
   const channels = new Set();
   let tick = 0;
   let runningStatus = 0;
+  // 目前的 runningStatus 中間有沒有被至少一個 meta／SysEx 事件穿過——只有這種情況下真的
+  // 被沿用才值得警告（見下方 status 判斷分支），channel message 之間的正常沿用（絕大多數
+  // 檔案的常態）不算，不能每次沿用都警告，會洗版。
+  let runningStatusSurvivedMeta = false;
+  let warnedRunningStatusAfterMeta = false; // 每軌只警告一次
   let sawEndOfTrack = false;
   let name = '';
   let instrumentName = '';
@@ -490,9 +495,22 @@ function parseTrack(body, trackIndex, warn) {
       let status = r.bytes[r.pos];
       if (status & 0x80) {
         r.pos++;
-        // 規格：SysEx 與 meta 事件會清掉 running status，只有 channel message 能被延用。
-        runningStatus = status < 0xf0 ? status : 0;
+        if (status < 0xf0) {
+          // channel message：更新 running status，重新開始追蹤有沒有被 meta／SysEx 穿過。
+          runningStatus = status;
+          runningStatusSurvivedMeta = false;
+        } else if (runningStatus) {
+          // meta／SysEx：規格對「寫檔端」的建議是應該送出完整狀態位元組，但這不是「讀檔端」
+          // 該拿來拒絕檔案的理由——不清掉 runningStatus，只記下「中間穿過了一個 meta／
+          // SysEx」，供下面偵測到延用時判斷值不值得警告。已查證 FluidSynth、spessasynth、
+          // `midi-file`、`mido` 四個成熟解析器讀取時都不會因此清掉 running status。
+          runningStatusSurvivedMeta = true;
+        }
       } else if (runningStatus) {
+        if (runningStatusSurvivedMeta && !warnedRunningStatusAfterMeta) {
+          warnedRunningStatusAfterMeta = true;
+          warn(`track ${trackIndex} 在 offset ${r.pos}：running status 沿用跨過了 meta／SysEx 事件（規格對「寫檔端」的建議是 meta／SysEx 之後應送出完整狀態位元組，這裡照常延用讀取，不影響解析結果）`);
+        }
         status = runningStatus;
       } else {
         throw new MidiParseError(
@@ -675,6 +693,51 @@ function partIdOf(trackIndex, channel, program) {
   return `t${trackIndex}c${channel}p${program}`;
 }
 
+// Program Change 是 channel 的狀態、跨軌共用，但「跨軌共用」不代表可以照檔案裡的軌道排列
+// 順序處理——一顆音該用哪個 program，要看「這個時間點」該 channel 實際生效的值，不是「前面
+// 處理過的軌道留下的值」。這裡建一份查詢器：優先用同一軌自己在這個時間點之前最後一次送過的
+// Program Change；這軌自己從沒送過時，才查全曲所有軌、同 channel、時間點更早（同 tick 依
+// 軌序決定）的最後一次 Program Change；兩者都沒有就回傳規格預設值 0。
+// 呼叫端必須依「事件在檔案裡出現的順序」使用：換軌時呼叫 resetTrack()，逐一遇到 Program
+// Change 事件時呼叫 noteProgramChange()，查詢在這之間穿插進行——collectNotes()／
+// collectParts() 本來就是這樣逐軌逐事件處理，不需要額外排序。
+function buildProgramResolver(tracks) {
+  const globalByChannel = new Map(); // channel → [{tick, trackIndex, program}]（依 tick、軌序排序）
+  for (const track of tracks) {
+    for (const ev of track.events) {
+      if (ev.kind !== 'channel' || ev.type !== 'programChange') continue;
+      let list = globalByChannel.get(ev.channel);
+      if (!list) globalByChannel.set(ev.channel, (list = []));
+      list.push({ tick: ev.tick, trackIndex: track.index, program: ev.data1 });
+    }
+  }
+  for (const list of globalByChannel.values()) {
+    list.sort((a, b) => a.tick - b.tick || a.trackIndex - b.trackIndex);
+  }
+
+  function globalLookup(channel, tick) {
+    const list = globalByChannel.get(channel);
+    if (!list || !list.length) return null;
+    let lo = 0, hi = list.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid].tick <= tick) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return ans === -1 ? null : list[ans].program;
+  }
+
+  let localProgram = new Map(); // 目前這一軌自己已知的 program，channel → program
+  return {
+    resetTrack() { localProgram = new Map(); },
+    noteProgramChange(channel, program) { localProgram.set(channel, program); },
+    programAt(channel, tick) {
+      if (localProgram.has(channel)) return localProgram.get(channel);
+      const global = globalLookup(channel, tick);
+      return global != null ? global : 0;
+    },
+  };
+}
+
 /**
  * @param {number} trackIndex
  * @param {MidiChannelEvent} onEvent
@@ -709,24 +772,25 @@ function makeNote(trackIndex, onEvent, endTick, offVelocity, tickToSeconds, prog
   };
 }
 
-function collectNotes(tracks, tickToSeconds, warn) {
+function collectNotes(tracks, tickToSeconds, warn, programResolver) {
   const notes = [];
   // 逐 channel 追蹤目前生效的音色，用來把每顆音歸到「它響起當下實際在吹奏的樂器」；
   // 沒有明確 program change 時 GM 規格預設就是 0（Acoustic Grand Piano）。這是分聲部
   // 除了 track×channel 之外還要看 program 的原因：一個 channel 中途換過音色，
   // 換過去之後彈的音不該跟換之前混成同一個聲部（見 partIdOf 的說明）。
-  // 宣告在逐軌迴圈外面、所有軌共用同一份：Program Change 在 MIDI 規格裡是 channel 的狀態，
-  // 不是 track 的狀態，同一個 channel 可能被拆到好幾軌（一軌設定音色、音符寫在別軌）；
-  // 每進一軌就重設成 0 會讓沒有 program change 事件的那些軌全部誤判成鋼琴。partId 仍然
-  // 依 partIdOf(track, channel, program) 各自獨立，不受影響——這裡只修正 program 的值本身。
-  const currentProgram = new Array(16).fill(0);
+  // program 查詢交給 buildProgramResolver()：Program Change 是 channel 的狀態、跨軌共用，
+  // 同一個 channel 可能被拆到好幾軌（一軌設定音色、音符寫在別軌），但「跨軌共用」不代表
+  // 可以照軌道處理順序決定值——要看這顆音那個時間點該 channel 實際生效的值，優先用同一軌
+  // 自己的紀錄，沒有才查全曲時間軸（見 buildProgramResolver() 的說明）。partId 仍然依
+  // partIdOf(track, channel, program) 各自獨立，不受影響——這裡只修正 program 的值本身。
   for (const track of tracks) {
+    programResolver.resetTrack();
     // key = channel * 128 + 音高。同一 key 可能同時有多顆未收尾的音（同音重疊），
     // 以先進先出配對：先響的音先被關掉，這是最貼近演奏直覺的解讀。
     const pending = new Map();
     for (const ev of track.events) {
       if (ev.kind !== 'channel') continue;
-      if (ev.type === 'programChange') { currentProgram[ev.channel] = ev.data1; continue; }
+      if (ev.type === 'programChange') { programResolver.noteProgramChange(ev.channel, ev.data1); continue; }
       const isNoteOn = ev.type === 'noteOn' && ev.data2 > 0;
       // 規格允許用「力度 0 的 note on」代替 note off（可讓整段音符共用 running status），
       // 實務上絕大多數檔案都這樣寫。
@@ -739,7 +803,7 @@ function collectNotes(tracks, tickToSeconds, warn) {
         if (!queue) pending.set(key, (queue = []));
         // 記下 note-on 那一刻生效的音色，不是 note-off 那一刻的——決定「這是哪個樂器彈的」
         // 應該看音符開始的當下，中途換音色不該回頭影響已經在響的音符。
-        queue.push({ ev, program: currentProgram[ev.channel] });
+        queue.push({ ev, program: programResolver.programAt(ev.channel, ev.tick) });
         continue;
       }
       const queue = pending.get(key);
@@ -836,7 +900,7 @@ function partDescriptor(part) {
  * @param {(msg:string) => void} warn
  * @returns {MidiPart[]}
  */
-function collectParts(tracks, notes, warn) {
+function collectParts(tracks, notes, warn, programResolver) {
   const stats = new Map();
   for (const note of notes) {
     let stat = stats.get(note.partId);
@@ -874,10 +938,11 @@ function collectParts(tracks, notes, warn) {
   // 「真的送了 MSB 0」區分開來——GM2 §3.3.1 明訂的規格預設值（channel 9 是 78H/00H，其餘是
   // 79H/00H）留給 collectParts() 在查不到時才補上，不寫死在這個 map 裡。
   const banks = new Map(); // id → { msb, lsb }
-  // 跟 collectNotes() 同樣的道理：Program Change 是 channel 的狀態、跨軌共用，宣告在迴圈外面，
-  // 避免一軌只送 Bank Select、真正的 Program Change 在別軌時，被這裡的預設值 0 誤蓋掉。
-  const currentProgram = new Array(16).fill(0);
+  // program 查詢交給 buildProgramResolver()（跟 collectNotes() 共用同一份，見該函式呼叫端），
+  // 理由相同：一軌只送 Bank Select、真正的 Program Change 在別軌（或在更早的時間點）時，
+  // 不能被「檔案裡軌道排列順序」誤導。
   for (const track of tracks) {
+    programResolver.resetTrack();
     const running = new Map(); // channel → { msb, lsb }（這一軌目前生效的 bank）
     for (const ev of track.events) {
       if (ev.kind !== 'channel') continue;
@@ -888,13 +953,17 @@ function collectParts(tracks, notes, warn) {
         continue;
       }
       if (ev.type !== 'programChange') continue;
-      currentProgram[ev.channel] = ev.data1;
+      programResolver.noteProgramChange(ev.channel, ev.data1);
       const id = partIdOf(track.index, ev.channel, ev.data1);
       const active = running.get(ev.channel);
       if (active && !banks.has(id)) banks.set(id, { ...active });
     }
     for (const [ch, b] of running) {
-      const id = partIdOf(track.index, ch, currentProgram[ch]);
+      // 這一軌收到 Bank Select 卻始終沒收到 Program Change 的 channel：用這一軌結束時
+      // 該 channel 實際生效的 program（自己軌優先、沒有才查全曲時間軸）決定要掛到哪個
+      // partId 上——這仍然是硬猜（A9 既有的已知邊緣情況），但依時間軸查詢至少比「檔案裡
+      // 軌道排列順序」準確。
+      const id = partIdOf(track.index, ch, programResolver.programAt(ch, track.endTick));
       if (!banks.has(id)) banks.set(id, { ...b });
     }
   }
@@ -918,9 +987,12 @@ function collectParts(tracks, notes, warn) {
     const clef = percussionKit ? null : classifyClef(medianNote, stat.lowestNote, stat.highestNote);
     const role = percussionKit ? null : classifyRole(polyphonyAvg, clef);
     if (percussionKit && !(program in GM_DRUM_KITS)) {
-      // GM2 §2.6 [recommended]：這種情況音源實際會退回播放 Standard Kit（見
-      // gmProgramName() 的說明），這裡記一筆警告，讓使用者知道顯示名稱不是檔案指定的那個。
-      warn(`track ${stat.trackIndex} 的 channel ${stat.channel}：鼓組 program ${program} 不是 GM2 定義的編號，音源會退回播放 Standard Kit`);
+      // 這裡只確定「不是 GM2 規格附錄 B 定義的編號」，顯示名稱因此只能退回用「標準鼓組」代替
+      // （見 gmProgramName() 的說明）——但實際播放時會不會也退回標準鼓組，取決於載入的
+      // SoundFont 有沒有另外提供這個編號的鼓組（查證過 GeneralUserGS.sf3 就額外提供了
+      // program 1/2/26/127 這幾組，不會真的退回標準鼓組），這裡不能斷言一定會退回，只能
+      // 提醒顯示名稱不準確。
+      warn(`track ${stat.trackIndex} 的 channel ${stat.channel}：鼓組 program ${program} 不是 GM2 規格附錄 B 定義的編號，顯示名稱只能用「標準鼓組」代替，實際會播放哪一組鼓聲取決於載入的 SoundFont 有沒有提供這個編號`);
     }
     parts.push({
       id,
@@ -967,8 +1039,13 @@ function collectParts(tracks, notes, warn) {
     if (group.length === 1) { group[0].name = base; continue; }
     const descriptors = group.map(partDescriptor);
     const allDistinct = descriptors.every((d) => d) && new Set(descriptors).size === group.length;
+    // GM 中文表裡有些基底名稱本身就以數字結尾（「弦樂合奏 1」「擊弦貝斯 1」之類），退回數字
+    // 尾碼區分時如果直接疊加空格＋數字，會變成「弦樂合奏 1 1」這種容易誤讀的雙重編號——改用
+    // 括號＋序號，不會跟基底名稱本來就有的數字混在一起。
+    const baseEndsWithDigit = /\d$/.test(base);
     group.forEach((part, i) => {
-      part.name = allDistinct ? `${base}（${descriptors[i]}）` : `${base} ${i + 1}`;
+      if (allDistinct) { part.name = `${base}（${descriptors[i]}）`; return; }
+      part.name = baseEndsWithDigit ? `${base}（${i + 1}）` : `${base} ${i + 1}`;
     });
   }
 
@@ -1255,8 +1332,11 @@ export function parseMidi(input) {
     { sharpsFlats: 0, minor: false }
   );
 
-  const notes = collectNotes(tracks, tickToSeconds, warn);
-  const parts = collectParts(tracks, notes, warn);
+  // 兩邊都需要「program 依時間軸查詢」的邏輯，共用同一份 resolver 的全曲時間軸（不用各自
+  // 重掃一次全曲的 Program Change 事件），見 buildProgramResolver() 的說明。
+  const programResolver = buildProgramResolver(tracks);
+  const notes = collectNotes(tracks, tickToSeconds, warn, programResolver);
+  const parts = collectParts(tracks, notes, warn, programResolver);
   const durationTicks = tracks.reduce((max, t) => Math.max(max, t.endTick), 0);
 
   return {

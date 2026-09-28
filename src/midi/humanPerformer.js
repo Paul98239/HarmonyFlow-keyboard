@@ -8,11 +8,11 @@
 //  `playSec`（真實時間 1:1 前進）與上限 `limitSec`（播放頭不能超過的界線）。
 //
 //  指派聲部：演奏者（或代打）在目前拍上還有沒播出的音，觸發就在原地把上限推到拍尾（claim）；
-//  沒有的話，把共用拍位直接推到這個聲部自己下一個真正有音符的拍（`_advanceToNextNote()`，
-//  可能一次跨過好幾個沒有音符的空拍——全音符或連續休止只需要一次觸發，不需要對著空拍反覆
-//  揮手），再 claim。跳過的過程中，其他被指派聲部若剛好也有音符落在被跳過的拍上，這一輪沒被
-//  自己的演奏者（或代打）觸發＝直接靜音丟棄，不會因為共用拍位路過就被誤判成發聲——這是這個
-//  排程器最容易出錯的地方，見 `_advanceToNextNote()` 的註解。
+//  沒有的話，把共用拍位往前走恰好一拍（`_advanceOneBeat()`，不管這一拍本身有沒有音符），
+//  再 claim——這是使用者明確拍板的目標：每一拍（包含空拍）都需要真人自己揮一次手才能往前走，
+//  4/4 一個小節就是要揮 4 次，不會一次跳過好幾拍。走過的過程中，其他被指派聲部若剛好也有
+//  音符落在被走過的拍上，這一輪沒被自己的演奏者（或代打）觸發＝直接靜音丟棄，不會因為共用
+//  拍位路過就被誤判成發聲——這是這個排程器最容易出錯的地方，見 `_advanceOneBeat()` 的註解。
 //
 //  但這一切要先過一道閘門：這個聲部現在還有沒有音在響（`voice.sounding`）。有的話，這次
 //  觸發不會立刻生效，只記成「排隊中」（`voice.pendingTrigger`），等舊音自然響完才自動補上，
@@ -24,21 +24,21 @@
 //  能不能動，永遠只看有沒有聲部（不論真人還是代打）觸發，跟舊版被拿掉的「電腦代打＋拍速
 //  估計器」模型不同：那個版本是所有聲部預設由電腦代打、真人揮手才接手，沒人揮手曲子也會
 //  自己前進，讓人覺得不受控（見專案的 git 歷史）；這裡反過來，代打只是「同一個聲部自己的
-//  觸發」的延伸，沒被真人觸發過的聲部代打不會啟動。
-//
-//  代打該等多久才視同觸發，讀 `_nextRestSec()` 算出來的「這個聲部下一顆音在原譜上還要多久
-//  才輪到」（`buildBeatGrid()` 的確定性秒數，不是估計值）再加上 `AUTOPILOT_IDLE_MS` 這段
-//  固定緩衝（吸收揮手動作本身需要的時間與手勢偵測延遲）。這條規則保證只要演奏者跟上原譜
-//  自己的休止正常演奏，代打永遠不會搶在他準時的下一次觸發之前生效——等待時間精確等於原譜
-//  休止本身再加緩衝，不會更短；只有真的停手超過這個時間，代打才會介入。**這裡曾經試過改用
-//  「揮手節奏的指數平滑估計」（也就是從演奏者過去的觸發間隔反推），實測發現正常演奏遇到
-//  合法的長休止時，代打會在休止途中提早觸發，等演奏者準時觸發時那次觸發又被排隊、補一次，
-//  等於同一段音樂被算兩次（棘輪效應，多聲部合奏下會讓其他聲部大量丟音），改回讀拍格線的
-//  確定性做法才解決。** 代打的等待時間只用來決定「排程下一次代打的時間點」，完全不會動到
-//  下面「音符播放速度」這段講的 1:1 真實時間倒數。代打與真人觸發在音量上刻意不同
-//  （`_syncVolume()` 讓代打的 CC7 貼齊伴奏基準、真人觸發時整體再被 `HUMAN_EMPHASIS_GAIN`
-//  凸顯，見 `synth.js`），方便用耳朵分辨目前是誰在演奏；note-on velocity 完全不受影響，
-//  兩者都用樂譜原值。
+//  觸發」的延伸，沒被真人觸發過的聲部代打不會啟動。**代打只負責填空拍，絕不會幫使用者
+//  觸發任何真的有音符的拍**：`_rearmAutopilot()` 每次 claim 之後都會檢查「下一拍對這個
+//  聲部而言是不是空拍」（`_nextUnclaimedNote()`），只有確定是空拍才會武裝代打倒數，等
+//  `AUTOPILOT_IDLE_MS` 之後視同觸發一次、往前走一拍（跟真人觸發共用同一條 `_claimOrAdvance()`
+//  路徑，只是來源標記不同）；下一拍已經有這個聲部自己的音時完全不武裝，一定要真人真的觸發。
+//  這個等待時間只用來決定「下一次該不該視同觸發」這一個排程時間點，完全不會動到下面「音符
+//  播放速度」這段講的 1:1 真實時間倒數。代打與真人觸發在音量上刻意不同（`_syncVolume()`
+//  讓代打的 CC7 貼齊伴奏基準、真人觸發時整體再被 `HUMAN_EMPHASIS_GAIN` 凸顯，見
+//  `synth.js`），方便用耳朵分辨目前是誰在演奏；note-on velocity 完全不受影響，兩者都用
+//  樂譜原值。**這裡曾經試過「一次觸發跳到下一個真正有音符的拍」（`_beatIndex` 直接跳過空拍，
+//  不是固定走一拍），也曾經試過代打改用揮手節奏的指數平滑估計去猜一整段休止該等多久；前者
+//  在使用者實際使用後被要求改回「每一拍都要真人自己觸發」，後者則是因為正常演奏遇到合法長
+//  休止時，代打會在休止途中提早觸發、等演奏者準時觸發時那次觸發又被排隊補一次，等於同一段
+//  音樂被算兩次（棘輪效應，多聲部合奏下會讓其他聲部大量丟音），見專案的 git 歷史，改回這裡
+//  描述的「固定一拍、代打只填空拍」模型才解決。**
 //
 //  音符播放速度直接鎖定 SMF 原速：播放頭前進與正在響的音的剩餘時長（`remain`）都用真實
 //  經過秒數 1:1 倒數，不做任何縮放（曾經試過依揮手間隔反推拍速、讓播放頭跟音長跟著揮手
@@ -84,9 +84,9 @@ const TOTAL_CHANNELS = CHANNELS_PER_PORT * 4;
 /* ═══════════════════════════════════════════
    代打（autopilot）常數——應用層行為，不是規格
    ═══════════════════════════════════════════ */
-// 代打視同觸發的時機＝這個聲部下一顆音原譜上該等的休止（`_nextRestSec()`）過了之後，再加這段
-// 固定緩衝——不是唯一判準，是「休止時間之外再留的餘裕」，吸收揮手動作本身需要的時間與手勢
-// 偵測延遲。
+// 代打視同觸發的等待時間：只有在確認下一拍對這個聲部是空拍時才會武裝（見 _rearmAutopilot()），
+// 停手超過這段時間就視同觸發一次、往前走一拍——這是吸收揮手動作本身需要的時間與手勢偵測延遲
+// 用的緩衝，不是在等某段休止的確切長度（一次一拍模型下每走一拍都要重新等這段緩衝一次）。
 const AUTOPILOT_IDLE_MS = 800;
 // 代打時這個聲部的 CC7（Channel Volume）：目標是校正到約等於伴奏的音量基準（伴奏沒有掛
 // synth.js 的 HUMAN_EMPHASIS_GAIN，等於基準 1.0），真正的「凸顯」完全交給真人觸發時的
@@ -153,6 +153,9 @@ function makeVoice(partId, slot, notes, kind, channel) {
     pendingTrigger: false,  // 觸發時這個聲部還有音在響，先排隊，見 _handleTriggers／_releaseDue
     pendingIsAutopilot: false, // 排隊中的觸發是代打還是真人來源；_releaseDue() 交還時靠這個
                                // 欄位正確標記 isAutopilot，見 _handleTriggers 的真實觸發分支
+    pendingSinceMs: null,   // 排隊開始的時刻；_releaseDue() 解除排隊時用來算「等了多久」，
+                             // 把這段真實時間補回播放頭（見該函式的說明），null＝目前沒在排隊
+
     lastRealTriggerMs: null, // 這個聲部最近一次「真實」觸發的時刻；null＝還沒發生過任何真實觸發，
                               // 代打不會啟動（見 _handleTriggers）
     autopilotDueMs: null,    // 下一次代打該發生的時刻；null＝目前不在代打倒數中
@@ -344,6 +347,7 @@ export class HumanPerformer {
       voice.lastSlot = undefined;
       voice.pendingTrigger = false;
       voice.pendingIsAutopilot = false;
+      voice.pendingSinceMs = null;
       voice.lastRealTriggerMs = null;
       voice.autopilotDueMs = null;
       voice.isAutopilot = false;
@@ -453,7 +457,12 @@ export class HumanPerformer {
       // 確保它放完後接手的音量是真人身分，不會停留在代打的音量。刻意不在這裡重新武裝
       // autopilotDueMs：要等 claim 真正發生（見 _releaseDue()）才知道正確的下一顆音位置，
       // 現在武裝的話會讀到 claim 之前的舊 cursor／limitSec，算出錯的休止秒數。
-      if (voice.sounding.size > 0) { voice.pendingTrigger = true; voice.pendingIsAutopilot = false; continue; }
+      if (voice.sounding.size > 0) {
+        voice.pendingTrigger = true;
+        voice.pendingIsAutopilot = false;
+        voice.pendingSinceMs = nowMs; // 排隊等了多久，_releaseDue() 解除時要補回播放頭
+        continue;
+      }
       voice.isAutopilot = false;
       this._claimOrAdvance(voice);
       this._syncVolume(voice);
@@ -461,26 +470,30 @@ export class HumanPerformer {
     }
   }
 
-  // 這個聲部「目前這次 claim 涵蓋範圍之後」的下一顆音，原譜上還要等多久（秒）——確定性讀
-  // buildBeatGrid() 算出來的秒數，不是估計值。刻意不是直接看 voice.notes[voice.cursor]：
-  // 這個方法在 _claimOrAdvance() 剛執行完、_emitDueNotes() 這個 tick 還沒機會把 cursor
-  // 推過剛接手的那顆音之前就會被呼叫（見 _rearmAutopilot 的呼叫點），這時候 cursor 還停在
-  // 「剛被接手的音」本身，不能直接拿它的 startSeconds 算休止，否則永遠算出接近 0——要往後
-  // 掃到第一顆「還沒被目前這次 claim 涵蓋」（startSeconds >= voice.limitSec）的音才對。
-  // 一次 claim 通常只涵蓋一拍份的音符，這個迴圈的實際跑動次數很小。沒有下一顆音了就回傳
-  // Infinity（代打不會再有機會啟動，交給呼叫端既有的 cursor >= notes.length 判斷擋掉）。
-  _nextRestSec(voice) {
+  // 這個聲部「目前這次 claim 涵蓋範圍之後」的下一顆音——刻意不是直接看
+  // voice.notes[voice.cursor]：這個方法在 _claimOrAdvance() 剛執行完、_emitDueNotes()
+  // 這個 tick 還沒機會把 cursor 推過剛接手的那顆音之前就會被呼叫（見 _rearmAutopilot 的
+  // 呼叫點），這時候 cursor 還停在「剛被接手的音」本身，要往後掃到第一顆「還沒被目前這次
+  // claim 涵蓋」（startSeconds >= voice.limitSec）的音才對。一次 claim 通常只涵蓋一拍份的
+  // 音符，這個迴圈的實際跑動次數很小。沒有下一顆音了就回傳 null。
+  _nextUnclaimedNote(voice) {
     let i = voice.cursor;
     while (i < voice.notes.length && voice.notes[i].startSeconds < voice.limitSec) i++;
-    const next = voice.notes[i];
-    if (!next) return Infinity;
-    return Math.max(0, next.startSeconds - voice.limitSec);
+    return voice.notes[i] || null;
   }
 
-  // 每次這個聲部真的被 claim 過（真人或代打，來源不分）之後呼叫，重新武裝代打倒數：原譜規定
-  // 的休止時間再加 AUTOPILOT_IDLE_MS 這段固定緩衝（見檔頭「代打」段落與該常數的註解）。
+  // 每次這個聲部真的被 claim 過（真人或代打，來源不分）之後呼叫，決定代打下一次該不該武裝：
+  // 只有「下一拍（this._beatIndex + 1）對這個聲部而言是空拍」時才武裝，等 AUTOPILOT_IDLE_MS
+  // 之後視同觸發一次、只走一拍（見檔頭「代打」段落）；下一拍已經有這個聲部自己的音時完全
+  // 不武裝，一定要真人真的觸發，代打不會幫忙推進到有音符的拍——這是使用者明確要求的「每個
+  // 音符都要真人自己觸發」，代打只負責填空拍。
   _rearmAutopilot(voice, nowMs) {
-    voice.autopilotDueMs = nowMs + this._nextRestSec(voice) * 1000 + AUTOPILOT_IDLE_MS;
+    const next = this._nextUnclaimedNote(voice);
+    if (next && next.beatIndex === this._beatIndex + 1) {
+      voice.autopilotDueMs = null; // 下一拍就有音符，代打不啟動，等真人
+      return;
+    }
+    voice.autopilotDueMs = nowMs + AUTOPILOT_IDLE_MS;
   }
 
   // 代打與真人觸發共用的音量對比：代打時 CC7 調低，真人觸發時恢復 GM 預設 100，只影響音量、
@@ -499,11 +512,20 @@ export class HumanPerformer {
   }
 
   // 觸發真正生效時要做的事：這一拍上這個聲部若還有沒播出的音就地 claim；沒有就把共用拍位
-  // 推到這個聲部下一個真正有音符的拍，再 claim。_handleTriggers() 觸發當下沒有音在響時
-  // 直接呼叫；音還在響時由 _releaseDue() 在音響完的那一刻補呼叫，兩處共用同一份邏輯。
+  // 往前走一拍，再 claim（就算走到的那一拍對這個聲部來說是空拍，也照樣 claim——claim 只是
+  // 「把我的播放範圍延伸到這一拍」，這一拍沒有音符就是沒有音符可以發聲，不會憑空冒出聲音；
+  // 使用者明確要求每一拍都要真人自己揮手才能往前走，所以這裡不能像舊版那樣直接跳到這個聲部
+  // 下一個真正有音符的拍）。_handleTriggers() 觸發當下沒有音在響時直接呼叫；音還在響時由
+  // _releaseDue() 在音響完的那一刻補呼叫，兩處共用同一份邏輯；代打也走同一條路徑，差別只在
+  // _rearmAutopilot() 保證代打武裝的當下已經確認下一拍是空拍，不會誤觸發真的有音符的拍。
   _claimOrAdvance(voice) {
     if (this._hasPendingInCurrentBeat(voice)) this._claim(voice);
-    else { this._advanceToNextNote(voice); this._claim(voice); }
+    else { this._advanceOneBeat(voice); this._claim(voice); }
+    // 未指派聲部的上限＝目前推進最遠的拍尾；用 Math.max 而不是直接指定，這樣「就地 claim」
+    // （沒有經過 _advanceOneBeat()，例如演奏者剛入場的第一次接手）也會一併推進，不會漏掉
+    // ——這是先前查出的既有 bug（第一次 claim 不會推進 frontier，造成入場當下伴奏也跟著
+    // 卡住一拍）；用 Math.max 也能保證不會蓋掉 _enterFinale() 已經設成的 Infinity。
+    this._frontierSec = Math.max(this._frontierSec, this._beats[this._beatIndex].endSeconds);
   }
 
   // claim：只動「這一個」被觸發的聲部——播放頭夾到這一拍起點、上限推到這一拍結束。
@@ -521,10 +543,10 @@ export class HumanPerformer {
     voice.limitSec = Math.max(voice.limitSec, beat.endSeconds);
   }
 
-  // 把共用拍位推到「觸發這次前進的聲部」自己下一個真正有音符的拍——不是機械化前進一拍，
-  // 而是直接跳到 voice.notes[voice.cursor] 所在的那一拍，可能一次跨過好幾個沒有音符的空拍
-  // （全音符或連續休止只需要一次觸發，不用對著空拍反覆揮手；四分音符連續進行時效果等同一
-  // 拍一次，因為下一個音就在下一拍）。
+  // 把共用拍位往前走恰好一拍（使用者明確拍板的目標：每一拍都需要真人自己揮一次手，包含
+  // 空拍——4/4 一個小節就是要揮 4 次，不會像舊版那樣一次跳到這個聲部下一個真正有音符的拍）。
+  // 這一拍剛好是不是觸發這次前進的聲部自己的下一個音，交給 _claim() 之後的 _emitDueNotes()
+  // 自然判斷；不是的話這一拍對這個聲部而言就只是被走過，不需要在這裡特別分支。
   //
   // 這裡不能對「所有」指派聲部都把 playSec／limitSec 推到新拍起點——被路過、但沒被自己的
   // 演奏者觸發的聲部，若音符的 startSeconds 剛好等於新拍起點，會被 _emitDueNotes() 誤判成
@@ -535,19 +557,14 @@ export class HumanPerformer {
   // 一律丟棄，已合法接手的音也被誤丟）。只有真正觸發這次前進的那個聲部，才會在這個函式之後
   // 緊接著呼叫的 _claim() 裡移動播放頭。
   //
-  // 已知的邊界案例：上面這個保留機制理論上可能讓 this._beatIndex 在極窄的時間差內短暫倒退
-  // ——如果聲部 A 剛接手一顆「起點不在拍首」的音（_emitDueNotes 還沒機會把 A 的 cursor 推過
-  // 這顆音），這時聲部 B 觸發把共用拍位推遠，A 的 cursor 因為上面的保留機制沒被丟棄；如果
-  // 這之後、A 自己的音還沒被吐出前，A 又被觸發一次，_hasPendingInCurrentBeat() 會判定不在
-  // 目前拍、改呼叫這個函式，把 this._beatIndex 設回 A 那顆（較早的）音所在的拍。這個情境
-  // 需要兩個聲部的觸發精準地卡進同一個 12ms tick 附近才會發生，後果也只是暫時性的（伴奏
-  // frontier 短暫停止成長，下一次任何觸發就會把它推回正確位置），沒有嘗試進一步修正——更嚴謹
-  // 的修法需要重新設計「保留」與「這個函式本身找拍位」的互動方式，超出這次要修的範圍。
-  _advanceToNextNote(voice) {
+  // 改成「只走一拍」之後，舊版曾經記錄過的一個邊界案例（this._beatIndex 可能因為「保留已
+  // 接手音的游標」這個機制短暫倒退）已經不會發生：_beatIndex 現在永遠只用 += 1 往前挪，
+  // 不會再有「直接跳到某個目標拍」的動作，也就不存在「目標拍剛好比目前位置更早」這種可能。
+  _advanceOneBeat(voice) {
     const nextNote = voice.notes[voice.cursor];
     if (!nextNote) { this._enterFinale(); return; } // 這個聲部沒有更多音符了：終局判斷不變
 
-    this._beatIndex = nextNote.beatIndex;
+    this._beatIndex += 1;
 
     const beat = this._beats[this._beatIndex];
     for (const other of this._voices.values()) {
@@ -568,7 +585,6 @@ export class HumanPerformer {
         }
       }
     }
-    this._frontierSec = beat.endSeconds; // 未指派聲部的上限＝目前推進最遠的那一位
   }
 
   // 曲末：沒有下一個音符了，把所有聲部的上限放到無限，讓尾音／尾奏自然播完。
@@ -590,7 +606,18 @@ export class HumanPerformer {
       this._releaseDue(voice, nowMs);
       if (voice.kind === 'human' && !voice.claimed) continue;
       const synth = voice.kind === 'human' ? this.humanSynth : this.accompSynth;
-      while (voice.cursor < voice.notes.length && voice.notes[voice.cursor].startSeconds <= voice.playSec) {
+      // 指派聲部（human）額外要求 startSeconds < voice.limitSec：voice.playSec 會被
+      // _advancePlayheads() 依真實時間自然爬升、夾在 voice.limitSec（＝目前已經 claim 到的
+      // 拍尾）；beat.endSeconds 精確等於下一拍的 beat.startSeconds，如果只比對
+      // startSeconds <= playSec，一旦真實時間單純流逝到 playSec 追上這個邊界，下一拍第一顆
+      // 音會在完全沒有被 claim 的情況下「自己」發聲——一次一拍模型下每一次 claim 的範圍剛好
+      // 卡在下一拍起點，這個邊界問題因此變得每拍都會撞到，不能沿用舊版「只在特定情況才明顯」
+      // 的判斷。伴奏（accomp）沒有這條額外限制：它本來就該在 _frontierSec 範圍內反應式
+      // 連續播放，不需要逐拍觸發。
+      const limit = voice.kind === 'human' ? voice.limitSec : Infinity;
+      while (voice.cursor < voice.notes.length
+             && voice.notes[voice.cursor].startSeconds <= voice.playSec
+             && voice.notes[voice.cursor].startSeconds < limit) {
         const n = voice.notes[voice.cursor];
         try { synth?.noteOn(voice.channel, n.note, n.velocity); } catch (err) {}
         voice.sounding.set(n.note, { remain: n.durationSeconds });
@@ -616,7 +643,19 @@ export class HumanPerformer {
     if (voice.pendingTrigger && voice.sounding.size === 0) {
       voice.pendingTrigger = false;
       voice.isAutopilot = voice.pendingIsAutopilot; // 排隊當下記錄的來源，交還時才正確標記
+      // 手勢發生到排隊解除之間流逝的真實時間，_claim() 的 Math.max() 只保證播放頭不倒退，
+      // 不會自動補回來——不補的話，這一拍的時間軸要等到「排隊解除的這一刻」才開始算，會讓
+      // 這個聲部從此永遠落後一拍。這裡把等掉的時間補回播放頭，但夾在「這一拍第一顆還沒發聲
+      // 的音」的起點以內（voice.cursor 這時候還沒被這次 tick 的 _emitDueNotes 動過，正好是
+      // 「還沒發聲」的那一顆），避免補過頭讓還沒到時間的音提早出聲。
+      const waitedSec = voice.pendingSinceMs != null ? Math.max(0, (nowMs - voice.pendingSinceMs) / 1000) : 0;
+      voice.pendingSinceMs = null;
       this._claimOrAdvance(voice);
+      if (waitedSec > 0) {
+        const nextNote = voice.notes[voice.cursor];
+        const ceiling = nextNote ? nextNote.startSeconds : voice.limitSec;
+        voice.playSec = Math.min(voice.playSec + waitedSec, ceiling);
+      }
       this._syncVolume(voice);
       this._rearmAutopilot(voice, nowMs);
     }
