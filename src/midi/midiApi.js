@@ -37,6 +37,9 @@ export async function downloadMidiFile(id) {
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
+    // 開發者要拿這個連結把曲庫的 MIDI 下載下來、用 MuseScore 開啟檢查：CLAUDE.md「console 只在
+    // 真的出問題時輸出」規則允許的兩個確認性 log 之一（另一個是現場人數切換成功）。
+    console.log(`[雲端下載] ID: ${id} | URL: ${downloadUrl}`);
     const response = await fetch(downloadUrl, { signal: controller.signal });
     if (!response.ok) throw new Error("下載失敗：" + response.status);
     const arrayBuffer = await response.arrayBuffer();
