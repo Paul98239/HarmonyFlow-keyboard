@@ -80,9 +80,50 @@ function startStaticServer(root, port) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
-// 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → 把第一個聲部指派給演奏者 1 → 按播放。
-// 跟真實使用者操作路徑一致（見 index.html 的 data-field／data-action），不繞過 UI 直接呼叫內部函式。
-async function driveAppToPlaying(page) {
+// 播放列三顆鈕（▶ 播放／❚❚ 暫停／↻ 重播）的狀態，對照 CLAUDE.md 的狀態表：能按＝沒有 disabled，
+// current＝目前狀態那顆（accent 黃底），empty＝pill 的 is-empty（沒歌可播，淡化條件靠它）。
+const TRANSPORT_STATES = {
+  idle:     { play: false, pause: false, replay: false, current: [], empty: true },
+  loading:  { play: false, pause: false, replay: false, current: [], empty: true },
+  ready:    { play: true,  pause: false, replay: false, current: [], empty: false },
+  playing:  { play: false, pause: true,  replay: false, current: ['btnPause'], empty: false },
+  paused:   { play: true,  pause: false, replay: true,  current: [], empty: false },
+  finished: { play: true,  pause: false, replay: true,  current: [], empty: false },
+};
+async function expectTransport(page, name, problems) {
+  const got = await page.evaluate(() => ({
+    play: !document.getElementById('btnPlay').disabled,
+    pause: !document.getElementById('btnPause').disabled,
+    replay: !document.getElementById('btnReplay').disabled,
+    current: [...document.querySelectorAll('#transport-group .is-current')].map((el) => el.id),
+    empty: document.getElementById('toolbar-playback').classList.contains('is-empty'),
+  }));
+  const ok = JSON.stringify(got) === JSON.stringify(TRANSPORT_STATES[name]);
+  console.log(`  ${ok ? '✓' : '✗'} 按鈕狀態「${name}」`);
+  if (!ok) problems.push(`按鈕狀態「${name}」不符：預期 ${JSON.stringify(TRANSPORT_STATES[name])}，實際 ${JSON.stringify(got)}`);
+}
+// 動態 import 同一個 module 實例（同 URL），直接讀寫 store／排程器。「載入中」「播完」很難在 8 秒內自然
+// 走到，直接改 store 驗證畫面照狀態表；播放位置則讀排程器的真實值。
+const setStore = (page, patch) => page.evaluate(async (p) => {
+  (await import('/src/midi/midiPlayer.js')).playerStore.set(p);
+}, patch).then(() => page.waitForTimeout(80));
+const positionSeconds = (page) => page.evaluate(async () =>
+  (await import('/src/midi/synth.js')).humanPerformer.getPositionSeconds());
+// 在頁面內同一個 JS task 裡按下按鈕並立刻讀排程器位置：click 事件與排程器的重設都是同步做的，讀到的
+// 就是「剛重設」的值，不受 Playwright 往返延遲影響（無頭瀏覽器同時跑 MediaPipe 時，往返動輒一秒，
+// 進度在讀取前又走了一段）。
+const clickAndReadPosition = (page, buttonId) => page.evaluate(async (id) => {
+  const { humanPerformer } = await import('/src/midi/synth.js');
+  document.getElementById(id).click();
+  return humanPerformer.getPositionSeconds();
+}, buttonId);
+
+// 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → 把第一個聲部指派給演奏者 1 → 按播放
+// → 暫停 → 重播，沿途逐一斷言三顆鈕的狀態。跟真實使用者操作路徑一致（見 index.html 的
+// data-field／data-action），不繞過 UI 直接呼叫內部函式（只有上面兩種難以自然走到的狀態例外）。
+async function driveAppToPlaying(page, problems) {
+  await expectTransport(page, 'idle', problems);
+
   console.log('▶ 選現場人數＝1…');
   await page.selectOption('#poseCountSelect', '1');
 
@@ -92,14 +133,42 @@ async function driveAppToPlaying(page) {
 
   console.log('▶ 等待分譜列出來…');
   await page.waitForSelector('.score-part-id', { timeout: 10000 });
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 10000 });
+  await expectTransport(page, 'ready', problems);
 
   console.log('▶ 把第一個聲部指派給演奏者 1…');
   await page.locator('.score-part-id').first().selectOption('1');
 
   console.log('▶ 按下播放…');
-  await page.click('#btnPlayPause');
-  await page.waitForSelector('#btnPlayPause.is-playing, #btnPlayPause[class*="playing"]', { timeout: 10000 })
-    .catch(() => console.log('  （沒抓到明確的播放中 class，繼續往下——用 console 有沒有錯誤當主要判斷依據）'));
+  await page.click('#btnPlay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+  await expectTransport(page, 'playing', problems);
+
+  await page.waitForTimeout(2500); // 電腦輔助的聲部照實時播前奏，進度會往前走
+  const before = await positionSeconds(page);
+
+  console.log('▶ 暫停、再按重播…');
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+  await expectTransport(page, 'paused', problems);
+  const after = await clickAndReadPosition(page, 'btnReplay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+  const posOk = before > 1 && after < 0.1;
+  console.log(`  ${posOk ? '✓' : '✗'} 重播後進度回到開頭（重播前 ${before.toFixed(2)}s → 重播後 ${after.toFixed(2)}s）`);
+  if (!posOk) problems.push(`重播後進度沒有回到開頭：重播前 ${before.toFixed(2)}s、重播後 ${after.toFixed(2)}s`);
+
+  console.log('▶ 驗證「載入中」「播完」兩種狀態的畫面…');
+  await setStore(page, { transport: 'loading' });
+  await expectTransport(page, 'loading', problems);
+  await setStore(page, { transport: 'paused', finished: true });
+  await expectTransport(page, 'finished', problems);
+  await page.waitForTimeout(1500);
+  const beforeFinishedPlay = await positionSeconds(page);
+  const afterFinishedPlay = await clickAndReadPosition(page, 'btnPlay'); // 播完後按 ▶＝從頭播
+  await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+  const finOk = beforeFinishedPlay > 1 && afterFinishedPlay < 0.1;
+  console.log(`  ${finOk ? '✓' : '✗'} 播完後按 ▶ 從頭播（${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s）`);
+  if (!finOk) problems.push(`播完後按 ▶ 沒有從頭播：${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s`);
 }
 
 async function main() {
@@ -141,7 +210,7 @@ async function main() {
     await page.waitForFunction(() => !document.getElementById('app-shell')?.inert, { timeout: 20000 });
     console.log('▶ 載入完成，app 已可互動');
 
-    await driveAppToPlaying(page);
+    await driveAppToPlaying(page, problems);
 
     console.log(`▶ 靜置觀察 ${args.duration}ms，收集 console 訊息…`);
     await page.waitForTimeout(args.duration);

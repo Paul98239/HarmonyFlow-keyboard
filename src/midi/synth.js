@@ -1,5 +1,5 @@
 // ============================================================
-//  synth.js — spessasynth 合成器：兩個合成器（伴奏 synth／真人聲部 synthHuman）、humanGain
+//  synth.js — spessasynth 合成器：兩個合成器（電腦輔助聲部 synth／真人聲部 synthHuman）、humanGain
 //  閘門＋音量凸顯。純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
 //
 //  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（拍級事件驅動排程器）送來的個別
@@ -8,8 +8,8 @@
 //  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值；沒被自己的演奏者
 //  觸發過、也沒有代打銜接的聲部就是靜音（見 humanPerformer.js 的代打說明）。沒被指派的聲部
 //  固定走 synth，不受任何人觸發影響，反應式播放。humanGain 開啟時的目標值刻意設在 1.0 以上
-//  （`HUMAN_EMPHASIS_GAIN`），讓使用者控制的聲部整體比電腦伴奏更突出；伴奏那一軌固定不掛
-//  額外 gain，是這個音量對比的基準，不會跟著被調小聲。
+//  （`HUMAN_EMPHASIS_GAIN`），讓使用者控制的聲部整體比電腦輔助的聲部更突出；電腦輔助那一軌
+//  固定不掛額外 gain，是這個音量對比的基準，不會跟著被調小聲。
 // ============================================================
 
 import { HumanPerformer } from './humanPerformer.js';
@@ -44,7 +44,7 @@ const DRUM_CHANNEL_OFFSET = 9;
 const TOTAL_CHANNELS = CHANNELS_PER_PORT * 4;
 
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
-const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（伴奏固定是 1.0 基準，沒有額外
+const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（電腦輔助軌固定是 1.0 基準，沒有額外
                                   // gain）：使用者控制的聲部整體調大聲，凸顯真人正在演奏的部分；
                                   // 實測後可能還要繼續調整。改這個值時，humanPerformer.js 的
                                   // AUTOPILOT_VOLUME_CC 要重算（該檔案的常數註解有完整公式）——
@@ -112,8 +112,8 @@ export async function initEngine() {
       // 刻意不傳：兩個合成器都用標準 Web Audio API 節點（沒用 standardized-audio-context
       // 之類的包裝），也沒有監聽 spessasynth 內建的事件系統，全部吃函式庫預設值即可。
       synth = new WorkletSynthesizer(audioCtx);
-      // 真人聲部的第二個合成器。走 humanGain（預設靜音，開啟時刻意比伴奏大聲，見
-      // HUMAN_EMPHASIS_GAIN）→ 同一個 compressor，跟伴奏共用同一段動態處理。
+      // 真人聲部的第二個合成器。走 humanGain（預設靜音，開啟時刻意比電腦輔助軌大聲，見
+      // HUMAN_EMPHASIS_GAIN）→ 同一個 compressor，跟電腦輔助軌共用同一段動態處理。
       synthHuman = new WorkletSynthesizer(audioCtx);
       humanPerformer.setSynths(synth, synthHuman);
       const compressor = audioCtx.createDynamicsCompressor();
@@ -127,7 +127,7 @@ export async function initEngine() {
       masterGain.gain.value = 2.0;
       humanGain = audioCtx.createGain();
       humanGain.gain.value = 0; // 預設靜音，播放中且有指派才由 updateHumanGain 拉起來
-      // 伴奏那一軌不掛額外的 gain：它是「我的聲部」音量的比較基準，必須固定不動。
+      // 電腦輔助的那一軌不掛額外的 gain：它是「我的聲部」音量的比較基準，必須固定不動。
       synth.connect(compressor);
       synthHuman.connect(humanGain);
       humanGain.connect(compressor);
@@ -221,6 +221,16 @@ export async function play() {
     humanPerformer.play();
   } finally { isProcessingPlay = false; }
 }
+// 從頭重播（重播鍵、播完後按 ▶）：跟 play() 一樣先確保 AudioContext 已恢復（使用者手勢），
+// 再交給排程器重設並接著播——重設的內容見 humanPerformer.js 的 _resetPlayback()。
+export async function restart() {
+  if (isProcessingPlay || !isSongLoaded) return;
+  isProcessingPlay = true;
+  try {
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    humanPerformer.restart();
+  } finally { isProcessingPlay = false; }
+}
 export function pause() {
   humanPerformer.pause(); // 收掉所有正在響的音；每個聲部的播放進度都保留，下次播放從原處繼續
 }
@@ -229,7 +239,7 @@ export function isPaused() { return !isSongLoaded || !humanPerformer.isPlaying()
 export function isFinished() { return isSongLoaded && humanPerformer.isFinished(); }
 
 // humanGain 是總開關兼音量凸顯：播放器算好「該不該開」（播放中、沒播完、真的有指派），這裡
-// 只負責平滑地切上去（到 HUMAN_EMPHASIS_GAIN，比伴奏的固定基準大聲）／切下來（到 0）；
+// 只負責平滑地切上去（到 HUMAN_EMPHASIS_GAIN，比電腦輔助軌的固定基準大聲）／切下來（到 0）；
 // target 去重，同一個值不重複送。
 export function setHumanGate(on) {
   if (!audioCtx || !humanGain) return;

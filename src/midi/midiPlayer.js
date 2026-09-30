@@ -12,14 +12,15 @@
 //  選歌＝載入，播放鍵才是播放：選取本地檔案或雲端曲目之後，會立刻解析＋更新狀態
 //  （歌名／分譜清單），但不會啟動音源引擎；使用者按下播放鍵才會真的發出聲音。
 //  分譜的互動是「指派演奏者」：每個聲部一個下拉，選「演奏者 1~N」＝那個聲部交給那個追蹤 ID
-//  的真人，其餘沒指派的聲部電腦伴奏。改下拉只更新指派、不觸發任何播放——它會改動
+//  的真人，其餘沒指派的聲部由電腦輔助播放。改下拉只更新指派、不觸發任何播放——它會改動
 //  selectionSignature，下一次按頂端播放鍵時 playCurrentSource() 才用新的指派重新載入。
 //  指派是持久設定，不隨追蹤雜訊變動：下拉列「無／演奏者 1~N」，N ＝ 系統控制 bar 選的「現場人數」
 //  （playerCount，還沒選是 0 → 只有「無」），不因當下偵測到幾人而增減。
 //  指派聲部的實際演奏＝拍級事件驅動（見 humanPerformer.js）：沒有背景時鐘，全體指派演奏者
 //  共用同一個拍位，只在有人做出有效拋物線手勢的那一刻才前進；輪到但沒被自己演奏者接手的拍
-//  就是靜音，不會被電腦補（沒有代打）。沒被指派的聲部完全不受影響，反應式跟著推進最遠的
-//  進度持續播放；完全沒有人指派時整份照真實經過時間連續自動播放。
+//  就是靜音，不會被別的聲部補；只有「曾被自己的演奏者真實觸發過」的聲部，停手超過短暫門檻後
+//  才由代打暫時接續、只填空拍（見 humanPerformer.js）。沒被指派的電腦輔助聲部完全不受影響，
+//  反應式跟著推進最遠的進度持續播放；完全沒有人指派時整份照真實經過時間連續自動播放。
 // ============================================================
 
 import { Store, rafThrottle } from '../ui.js';
@@ -60,6 +61,9 @@ const LOADING_INDICATOR_DELAY_MS = 120; // 按播放後延遲這麼久才顯示 
  * @property {string} songTitle          來源名；空字串時頂端顯示「等待選擇歌曲...」
  * @property {string | null} notice      覆蓋歌名的訊息（暖機失敗／播放失敗／雲端下載失敗／檔案格式不支援）
  * @property {'idle' | 'loading' | 'paused' | 'playing'} transport
+ * @property {boolean} started           這首載入後播過了沒（播放列三顆鈕的狀態表用：還沒播過時不能重播）
+ * @property {boolean} finished          播完了（＝模組變數 endHandled 的鏡射；此時 ▶ 從頭播）
+ * @property {boolean} busy              載入／續播／重播處理中（＝isSongLoading；三顆鈕立刻全灰）
  * @property {object | null} score       parseMidi() 的結果；null ＝ 沒有分譜資訊（單軌或解析失敗）
  * @property {object[]} parts            score.parts；長度 > 1 才顯示分譜區塊
  * @property {Map<string, number>} assignments partId → 演奏者 ID；改動時換新 Map
@@ -73,6 +77,9 @@ export const playerStore = new Store(/** @type {PlayerState} */ ({
   songTitle: '',
   notice: null,
   transport: 'idle',
+  started: false,
+  finished: false,
+  busy: false,
   score: null,
   parts: [],
   assignments: new Map(),
@@ -102,7 +109,7 @@ function sourceIdentity(source) {
     : `cloud:${source.id}`;
 }
 
-// 分譜狀態的簽章：沒有分譜資訊、或沒有任何指派 → 固定值 'ALL'（整份當伴奏自動播放）；
+// 分譜狀態的簽章：沒有分譜資訊、或沒有任何指派 → 固定值 'ALL'（整份當電腦輔助聲部自動播放）；
 // 有指派就用排序後的「聲部=演奏者ID」對組成簽章，任一項不同都要重新 synth.load()。
 function selectionSignature(score, assignments) {
   if (!score || score.parts.length <= 1 || assignments.size === 0) return 'ALL';
@@ -182,7 +189,7 @@ function loadScore(arrayBuffer, label) {
 function beginSourceChange() {
   synth.flushPreviousSong();
   lastPlayedSignature = null;
-  playerStore.set({ transport: 'idle', notice: null });
+  playerStore.set({ transport: 'idle', notice: null, started: false, finished: false });
   return ++sourceLoadToken;
 }
 const isStale = (token) => token !== sourceLoadToken;
@@ -242,38 +249,41 @@ function clearSource() {
 const buildPlaybackSignature = (source) =>
   `${sourceIdentity(source)}::${selectionSignature(playerStore.state.score, playerStore.state.assignments)}`;
 
-// 頂端 pill 的播放鈕走到這裡（本地／雲端共用）。
-async function playCurrentSource() {
+// 頂端 pill 的 ▶／↻ 走到這裡（本地／雲端共用）。fromStart＝重播鍵：不管播到哪都從頭來。
+async function playCurrentSource({ fromStart = false } = {}) {
   const s = playerStore.state;
   if (!s.source) return;
   // 重入防護：transport 是延遲 120ms 才切成 'loading' 的，在那之前連按第二下會再跑一次這裡，
-  // 簽章就會記錄一份根本沒進引擎的組合。
+  // 簽章就會記錄一份根本沒進引擎的組合。續播／重播這條路徑也是 async（AudioContext.resume），
+  // 一樣要擋；busy 讓三顆鈕立刻全灰，不用等 120ms。
   if (isSongLoading) return;
   // 重播一首已經播完的歌時 endHandled 還停在 true，不先清掉真人聲部第一顆音會沒聲。
   endHandled = false;
-
-  const signature = buildPlaybackSignature(s.source);
-  if (signature === lastPlayedSignature) {
-    await synth.play();
-    playerStore.set({ transport: 'playing', notice: null });
-    updateHumanGate();
-    return;
-  }
-
-  // 「處理中」只由切換鈕的 ⋯ 表達，不改寫歌名。本地檔案幾乎瞬間就好，延遲 120ms 再顯示 ⋯。
   isSongLoading = true;
-  const loadingIndicatorTimer = setTimeout(() => playerStore.set({ transport: 'loading' }), LOADING_INDICATOR_DELAY_MS);
+  playerStore.set({ busy: true });
+
+  let loadingIndicatorTimer = null;
   try {
-    // 傳快照（[partId, slot][]），不要傳活的 Map——humanPerformer.js 的 buildVoices() 需要
-    // partId → 演奏者槽位的對應才能知道每個指派聲部要問哪個 ID 的手勢狀態。
-    await synth.load(s.score, [...s.assignments]);
-    if (synth.humanPerformer.unplacedPartIds.length) {
-      console.warn('⚠️ 分譜聲部超過合成器可用的輸出 channel，以下聲部這一輪不會出聲：',
-        synth.humanPerformer.unplacedPartIds.join('、'));
+    const signature = buildPlaybackSignature(s.source);
+    if (signature === lastPlayedSignature) {
+      // 引擎裡就是這份組合：重播鍵、或播完後按 ▶ 從頭來（排程器重設，見 humanPerformer.js 的
+      // restart()），其餘只是續播。
+      await (fromStart || s.finished ? synth.restart() : synth.play());
+    } else {
+      // 簽章不同（換歌或改過指派）：完整重新載入，本來就從頭播。
+      // 「處理中」只由 ▶ 的 ⋯ 表達，不改寫歌名。本地檔案幾乎瞬間就好，延遲 120ms 再顯示 ⋯。
+      loadingIndicatorTimer = setTimeout(() => playerStore.set({ transport: 'loading' }), LOADING_INDICATOR_DELAY_MS);
+      // 傳快照（[partId, slot][]），不要傳活的 Map——humanPerformer.js 的 buildVoices() 需要
+      // partId → 演奏者槽位的對應才能知道每個指派聲部要問哪個 ID 的手勢狀態。
+      await synth.load(s.score, [...s.assignments]);
+      if (synth.humanPerformer.unplacedPartIds.length) {
+        console.warn('⚠️ 分譜聲部超過合成器可用的輸出 channel，以下聲部這一輪不會出聲：',
+          synth.humanPerformer.unplacedPartIds.join('、'));
+      }
+      await synth.play();
+      lastPlayedSignature = signature;
     }
-    await synth.play();
-    lastPlayedSignature = signature;
-    playerStore.set({ transport: 'playing', notice: null });
+    playerStore.set({ transport: 'playing', notice: null, started: true, finished: false });
     updateHumanGate();
   } catch (err) {
     console.error(err);
@@ -281,20 +291,16 @@ async function playCurrentSource() {
   } finally {
     clearTimeout(loadingIndicatorTimer);
     isSongLoading = false;
+    playerStore.set({ busy: false });
   }
 }
 
-// 單一切換鈕：播放中→按了就暫停；其餘（可播放／已暫停）→按了就播放／續播。
-function togglePlayPause() {
-  const { transport } = playerStore.state;
-  if (transport === 'idle' || transport === 'loading') return;
-  if (transport === 'playing') {
-    synth.pause();
-    playerStore.set({ transport: 'paused', notice: null });
-    updateHumanGate();
-  } else {
-    playCurrentSource();
-  }
+// 頂端 pill 的 ❚❚：只有播放中才能暫停（防呆，不靠 disabled 一道擋）。
+function pauseCurrentSource() {
+  if (playerStore.state.transport !== 'playing') return;
+  synth.pause();
+  playerStore.set({ transport: 'paused', notice: null });
+  updateHumanGate();
 }
 
 /* ═══════════════════════════════════════════
@@ -337,7 +343,7 @@ function uiTick() {
   if (!isSongLoading && synth.isLoaded() && !endHandled && synth.isFinished()) {
     endHandled = true;
     synth.pause();
-    playerStore.set({ transport: 'paused' });
+    playerStore.set({ transport: 'paused', finished: true });
   }
   // humanGain 總開關的定期補算：讓「播放→暫停／播完」這類狀態轉變即使當下
   // 沒有新的手勢狀態進來，也會在 200ms 內把 humanGain 收到正確位置（synth.js 那邊 target 去重）。
@@ -367,29 +373,35 @@ export function startPlayer() {
 /* ═══════════════════════════════════════════
    🎛️ 畫面 1／3：頂端播放 pill（播放／暫停切換鈕 ＋ 歌名）
    ═══════════════════════════════════════════ */
-// 切換鈕的狀態只靠 class（顏色）＋圖示表達，來源是 player.transport：
-//   'idle' —— 還沒有可播放的來源（鈕 disabled、灰）；'loading' —— 解碼／下載中（鈕 disabled、顯示 ⋯）；
-//   'paused' —— 有來源、可按下播放（深灰底、▶）；'playing' —— 正在播（accent 黃底、❚❚）。
+// 三顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播）互相防呆：哪顆能按、哪顆是「目前狀態」（accent 黃底）
+// 由 transportButtonState() 依 store 推導，畫面只是照表寫 DOM——CLAUDE.md 有同一張表。
+//   沒歌（idle）／載入中（loading）／處理中（busy） → 全灰（載入中 ▶ 顯示 ⋯）
+//   剛載入、還沒播過 → 只有 ▶ 能按（已經在開頭，沒有東西可重播）
+//   播放中           → 只有 ❚❚ 能按（黃底）；播放中誤按重播會打斷演奏，所以 ▶／↻ 都灰
+//   暫停／播完       → ▶（續播；播完則從頭播）與 ↻ 能按
 // 歌名只放歌名（notice 覆蓋時例外），不寫「解析中／下載中」；優先單行，超長才縮小字級。
 const pill = document.getElementById('toolbar-playback');
-const btn = document.getElementById('btnPlayPause');
+const transportGroup = document.getElementById('transport-group');
+const btnPlay = document.getElementById('btnPlay');
+const btnPause = document.getElementById('btnPause');
+const btnReplay = document.getElementById('btnReplay');
 const statusText = document.getElementById('midiStatusText');
 // 頂端進度條：獨立於這個 pill 之外的元素（見 index.html），只在這裡讀 DOM 參照，不影響
-// fitSongTitle() 量的 pill／btn 寬度。
+// fitSongTitle() 量的 pill／按鈕組寬度。
 const topProgressBar = document.getElementById('topProgressBar');
 
 const IDLE_TITLE = '等待選擇歌曲...';
 
 // ── 歌名優先單行，超長才縮小字級（見 src/styles.css 的 .player-status-bar 註解）──
 // 量測邏輯：scrollWidth 是文字實際想要的寬度（不受目前有沒有被壓縮影響），跟 pill 扣掉
-// 播放鈕與 gap 之後能分給文字的寬度比較，超出就縮小 --song-title-scale；縮到下限
+// 三顆按鈕（整組）與 gap 之後能分給文字的寬度比較，超出就縮小 --song-title-scale；縮到下限
 // MIN_SONG_TITLE_SCALE 還是放不下，才加 .allow-wrap 退回換行。
 const MIN_SONG_TITLE_SCALE = 0.6;
 function fitSongTitle() {
   statusText.classList.remove('allow-wrap');
   statusText.style.setProperty('--song-title-scale', '1');
   const gapPx = parseFloat(getComputedStyle(pill).columnGap) || 0;
-  const available = pill.clientWidth - btn.offsetWidth - gapPx;
+  const available = pill.clientWidth - transportGroup.offsetWidth - gapPx;
   const natural = statusText.scrollWidth;
   if (available <= 0 || natural <= available) return;
   const scale = Math.max(MIN_SONG_TITLE_SCALE, available / natural);
@@ -399,8 +411,25 @@ function fitSongTitle() {
   }
 }
 
+// 三顆鈕的狀態表（見上方說明）。純函式：只看 store，回傳能不能按、哪顆是目前狀態、pill 是不是
+// is-empty（還沒有能播放的歌：idle／載入中，控制列的淡化條件靠它）。busy 期間 is-empty 維持 false，
+// 免得續播／重播那一瞬間控制列的透明度跳一下。
+function transportButtonState({ transport, started, finished, busy }) {
+  if (transport === 'idle' || transport === 'loading') {
+    return { play: false, pause: false, replay: false, current: null, empty: true };
+  }
+  if (busy) return { play: false, pause: false, replay: false, current: null, empty: false };
+  if (transport === 'playing') return { play: false, pause: true, replay: false, current: 'pause', empty: false };
+  // transport === 'paused'：還沒播過（已在開頭）不能重播；播到一半或播完都可以。
+  return { play: true, pause: false, replay: started || finished, current: null, empty: false };
+}
+
+// action 進來再對一次狀態表（防呆不只靠 disabled 一道擋：連按、程式呼叫都不會繞過去）。
+const whenAllowed = (button, fn) => () => { if (transportButtonState(playerStore.state)[button]) fn(); };
 const transportActions = {
-  'play-pause': () => togglePlayPause(),
+  'play': whenAllowed('play', () => playCurrentSource()),
+  'pause': whenAllowed('pause', () => pauseCurrentSource()),
+  'replay': whenAllowed('replay', () => playCurrentSource({ fromStart: true })),
 };
 
 function mountTransportPill() {
@@ -410,9 +439,13 @@ function mountTransportPill() {
 }
 
 function renderTransportPill({ player }) {
-  btn.classList.toggle('is-playing', player.transport === 'playing');
-  btn.classList.toggle('is-loading', player.transport === 'loading');
-  btn.disabled = player.transport === 'idle' || player.transport === 'loading';
+  const state = transportButtonState(player);
+  btnPlay.disabled = !state.play;
+  btnPause.disabled = !state.pause;
+  btnReplay.disabled = !state.replay;
+  btnPause.classList.toggle('is-current', state.current === 'pause');
+  btnPlay.classList.toggle('is-loading', player.transport === 'loading');
+  pill.classList.toggle('is-empty', state.empty);
 
   // 只在文字真的不同時才寫——相同字串也會觸發 pill（width:max-content）重新量寬＋重新置中，看起來在抽動。
   const text = player.notice ?? (player.songTitle || IDLE_TITLE);

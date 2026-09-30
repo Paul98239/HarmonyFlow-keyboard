@@ -178,7 +178,7 @@ body, html {
 }
 
 /* 所有按鈕共用的皮膚（底色／文字色／邊框／字重／游標／過渡／hover／disabled）。尺寸（padding、
-   圓角、字級）由 .tl-text-btn／.tl-trigger／.tl-close／.file-picker-btn／.tb-toggle 各自決定：
+   圓角、字級）由 .tl-text-btn／.tl-trigger／.tl-close／.file-picker-btn／.tb-btn 各自決定：
    工作列外部與面板內部是兩套尺寸系統，只共用皮膚。accent「開啟」狀態（鏡頭開著／面板開著／
    播放中）在 states 層統一寫一條。 */
 .btn {
@@ -319,7 +319,7 @@ body, html {
 .tl-scroll > *:first-child { padding-right: 2.4em; }
 
 /* ── 播放資訊 pill（#top-center-stack 第一個子元素，跟下面的控制列垂直疊在一起、都置中）──
-   內容只有「切換鈕＋歌名」，沒有時間讀數／可拖曳的時間軸——唯讀的播放進度是另一個獨立元素
+   內容只有「播放／暫停／重播三顆鈕＋歌名」，沒有時間讀數／可拖曳的時間軸——唯讀的播放進度是另一個獨立元素
    #topProgressBar（見下方 .top-progress-bar），不是這個 pill 的一部分。
    歌名完整顯示、不可用省略號截斷：pill 用 width:max-content 跟著內容自然變寬，只有 max-width
    攔住。max-width 直接沿用 #camera-frame 的寬度公式（min(100vw, 100vh*16/9)）——pill 最寬
@@ -372,7 +372,7 @@ body, html {
 
 /* 播放 pill 與控制列各自獨立淡化，純 CSS :hover／:has()／:focus-within，沒有 JS 計時器、
    沒有延遲：碰到（或鍵盤焦點進去）就顯示，沒碰到立刻淡化，兩者互不牽動。
-   還沒有能播放的歌曲之前（#btnPlayPause 是 disabled），工作列常駐不淡出——這時候它是唯一的
+   還沒有能播放的歌曲之前（播放 pill 帶 is-empty：idle／載入中），工作列常駐不淡出——這時候它是唯一的
    操作入口，年長使用者要先看得到「選歌」按鈕在哪裡；一旦選好歌（可播放或播放中），工作列
    回到原本 hover 才顯示的淡出邏輯，換成歌曲條常駐不淡出，把畫面重心讓給攝影機與正在播放的
    資訊。兩條規則共用同一個「有沒有歌可播」判斷，條件互斥。
@@ -386,7 +386,7 @@ body, html {
 .control-row:has(.tl-popup:not([hidden])) {
   opacity: 1;
 }
-#top-center-stack:has(#btnPlayPause:disabled) .control-row {
+#top-center-stack:has(#toolbar-playback.is-empty) .control-row {
   opacity: 1;
 }
 #toolbar-playback {
@@ -396,7 +396,7 @@ body, html {
   transition: opacity var(--dur-base) ease, width var(--dur-base) ease;
 }
 #toolbar-playback:hover { opacity: 1; }
-#toolbar-playback:has(#btnPlayPause:not(:disabled)) {
+#toolbar-playback:not(.is-empty) {
   opacity: 1;
 }
 
@@ -556,22 +556,27 @@ body, html {
   font-size: 1em; color: var(--text-muted);
 }
 
-/* ── 頂端 pill 的播放／暫停切換鈕 ──
-   單一一顆鈕，狀態只靠顏色＋圖示表達：
-     暫停中／可播放 → 深灰底、顯示 ▶
-     播放中         → accent 黃底、顯示 ❚❚（states 層的 .tb-toggle.is-playing） */
-.tb-toggle {
+/* ── 頂端 pill 的播放／暫停／重播三顆鈕 ──
+   三顆獨立按鈕，哪顆能按由 midiPlayer.js 的 transportButtonState() 依播放狀態決定；不能按的
+   disabled 變灰（見 .btn:disabled）。
+     沒歌／載入中 → 全灰（載入中 ▶ 顯示 ⋯）
+     剛載入       → 只有 ▶ 能按
+     播放中       → 只有 ❚❚ 能按，accent 黃底（states 層的 .tb-btn.is-current）
+     暫停／播完   → ▶ 與 ↻ 能按 */
+.tb-transport { display: flex; align-items: center; gap: 0.4em; flex-shrink: 0; }
+.tb-btn {
   flex-shrink: 0;
   width: 2.5em; height: 2.5em;
   display: flex; align-items: center; justify-content: center;
   border-radius: var(--radius-circle);
   transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast), transform .1s;
 }
-.tb-toggle:active:not(:disabled) { transform: scale(0.94); }
-.tb-toggle-icon { display: block; line-height: 1; font-size: 1.05em; }
-.tb-toggle-icon::before { content: "\25B6"; }              /* ▶ */
-.tb-toggle.is-playing .tb-toggle-icon::before { content: "\275A\275A"; letter-spacing: -0.12em; } /* ❚❚ */
-.tb-toggle.is-loading .tb-toggle-icon::before { content: "\22EF"; }  /* ⋯ */
+.tb-btn:active:not(:disabled) { transform: scale(0.94); }
+.tb-icon { display: block; line-height: 1; font-size: 1.05em; }
+.tb-play .tb-icon::before { content: "\25B6"; }                                  /* ▶ */
+.tb-pause .tb-icon::before { content: "\275A\275A"; letter-spacing: -0.12em; }   /* ❚❚ */
+.tb-replay .tb-icon::before { content: "\21BB"; }                                /* ↻ */
+.tb-play.is-loading .tb-icon::before { content: "\22EF"; }                       /* ⋯ */
 
 /* 頂端 pill 的歌名：完整顯示，不用省略號截斷，優先維持單行。--song-title-scale 是「JS 可以直接寫
    的連續量」CSS 變數之一（另外兩個是 --ui-fs、--popup-max-height），由
@@ -650,7 +655,7 @@ body, html {
 
   /* accent「開啟」狀態：鏡頭開著／面板開著／播放中，同一種視覺語彙；放這一層才不會被
      .btn:hover 蓋掉。 */
-  .tl-text-btn.is-on, .tl-trigger.is-open, .tb-toggle.is-playing {
+  .tl-text-btn.is-on, .tl-trigger.is-open, .tb-btn.is-current {
     background: var(--accent); border-color: var(--accent); color: var(--on-accent);
   }
 
