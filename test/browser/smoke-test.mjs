@@ -171,8 +171,23 @@ async function driveAppToPlaying(page, problems) {
   if (!finOk) problems.push(`播完後按 ▶ 沒有從頭播：${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s`);
 }
 
+// 差異測試（test/unit/oracle.test.mjs）用的是 devDependency 釘住版本的 spessasynth_core；app 走 CDN 的
+// @latest，兩邊版本可能漂移。這裡只印出來、版本不同就提醒，不算測試失敗。
+async function reportOfficialVersions() {
+  try {
+    const installed = JSON.parse(await readFile(join(REPO_ROOT, 'node_modules/spessasynth_core/package.json'), 'utf8')).version;
+    const cdn = async (pkg) => (await fetch(`https://cdn.jsdelivr.net/npm/${pkg}@latest/package.json`)).json();
+    const [lib, core] = await Promise.all([cdn('spessasynth_lib'), cdn('spessasynth_core')]);
+    const drift = core.version !== installed;
+    console.log(`${drift ? '⚠️' : '▶'} 官方套件版本：CDN 上 spessasynth_lib ${lib.version}、spessasynth_core ${core.version}；差異測試用的 devDependency 是 spessasynth_core ${installed}${drift ? '（已經不同，差異測試的標尺可能落後於 app 實際載入的版本）' : ''}`);
+  } catch (err) {
+    console.log(`▶ 無法取得官方套件版本（${err.message}），略過版本比對`);
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  await reportOfficialVersions();
   console.log(`▶ 啟動靜態伺服器 http://127.0.0.1:${PORT}/ （根目錄：${REPO_ROOT}）`);
   const server = await startStaticServer(REPO_ROOT, PORT);
 
