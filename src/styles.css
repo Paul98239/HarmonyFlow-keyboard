@@ -319,7 +319,7 @@ body, html {
 .tl-scroll > *:first-child { padding-right: 2.4em; }
 
 /* ── 播放資訊 pill（#top-center-stack 第一個子元素，跟下面的控制列垂直疊在一起、都置中）──
-   內容只有「播放／暫停／重播三顆鈕＋歌名」，沒有時間讀數／可拖曳的時間軸——唯讀的播放進度是另一個獨立元素
+   內容只有「播放／暫停／重播／試聽四顆鈕＋歌名」，沒有時間讀數／可拖曳的時間軸——唯讀的播放進度是另一個獨立元素
    #topProgressBar（見下方 .top-progress-bar），不是這個 pill 的一部分。
    歌名完整顯示、不可用省略號截斷：pill 用 width:max-content 跟著內容自然變寬，只有 max-width
    攔住。max-width 直接沿用 #camera-frame 的寬度公式（min(100vw, 100vh*16/9)）——pill 最寬
@@ -556,13 +556,14 @@ body, html {
   font-size: 1em; color: var(--text-muted);
 }
 
-/* ── 頂端 pill 的播放／暫停／重播三顆鈕 ──
-   三顆獨立按鈕，哪顆能按由 midiPlayer.js 的 transportButtonState() 依播放狀態決定；不能按的
+/* ── 頂端 pill 的播放／暫停／重播／試聽四顆鈕 ──
+   四顆獨立按鈕，哪顆能按由 midiPlayer.js 的 transportButtonState() 依播放狀態決定；不能按的
    disabled 變灰（見 .btn:disabled）。
      沒歌／載入中 → 全灰（載入中 ▶ 顯示 ⋯）
-     剛載入       → 只有 ▶ 能按
-     播放中       → 只有 ❚❚ 能按，accent 黃底（states 層的 .tb-btn.is-current）
-     暫停／播完   → ▶ 與 ↻ 能按 */
+     剛載入       → ▶ 與 ♪ 能按
+     播放中       → 只有 ❚❚ 能按，accent 黃底（states 層的 .tb-btn.is-current）；♪ 要先暫停
+     暫停／播完   → ▶、↻、♪ 能按
+     試聽中       → ♪ 恆黃底（再按結束試聽），▶ ❚❚ ↻ 照同一組規則作用在試聽 */
 .tb-transport { display: flex; align-items: center; gap: 0.4em; flex-shrink: 0; }
 .tb-btn {
   flex-shrink: 0;
@@ -576,6 +577,7 @@ body, html {
 .tb-play .tb-icon::before { content: "\25B6"; }                                  /* ▶ */
 .tb-pause .tb-icon::before { content: "\275A\275A"; letter-spacing: -0.12em; }   /* ❚❚ */
 .tb-replay .tb-icon::before { content: "\21BB"; }                                /* ↻ */
+.tb-preview .tb-icon::before { content: "\266A"; }                               /* ♪ */
 .tb-play.is-loading .tb-icon::before { content: "\22EF"; }                       /* ⋯ */
 
 /* 頂端 pill 的歌名：完整顯示，不用省略號截斷，優先維持單行。--song-title-scale 是「JS 可以直接寫
@@ -653,7 +655,7 @@ body, html {
      但 ui 層的 display:flex 會蓋過 UA；放在 states 層就一定贏。 */
   [hidden] { display: none; }
 
-  /* accent「開啟」狀態：鏡頭開著／面板開著／播放中，同一種視覺語彙；放這一層才不會被
+  /* accent「開啟」狀態：鏡頭開著／面板開著／播放中／試聽中，同一種視覺語彙；放這一層才不會被
      .btn:hover 蓋掉。 */
   .tl-text-btn.is-on, .tl-trigger.is-open, .tb-btn.is-current {
     background: var(--accent); border-color: var(--accent); color: var(--on-accent);

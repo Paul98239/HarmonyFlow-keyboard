@@ -23,6 +23,7 @@
   <link rel="modulepreload" href="./src/midi/midiPlayer.js">
   <link rel="modulepreload" href="./src/midi/midiParser.js">
   <link rel="modulepreload" href="./src/midi/humanPerformer.js">
+  <link rel="modulepreload" href="./src/midi/previewPlayer.js">
   <link rel="modulepreload" href="./src/midi/midiApi.js">
   <link rel="modulepreload" href="./src/vision/vision.js">
   <link rel="modulepreload" href="./src/vision/tracking.js">
@@ -56,9 +57,10 @@
          播放列的重播鈕；拖曳跳到任意時間點目前不做（要連動共用拍位與各聲部的接手狀態，工程量偏大）。 -->
     <progress id="topProgressBar" class="top-progress-bar" max="1" value="0" aria-label="播放進度" hidden></progress>
     <div id="top-center-stack">
-      <!-- 播放 pill：三顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播，互相防呆：哪顆能按由 midiPlayer.js 的
+      <!-- 播放 pill：四顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽，互相防呆：哪顆能按由 midiPlayer.js 的
            transportButtonState() 依播放狀態決定，不能按的就 disabled）＋歌名（完整顯示、不用省略號
-           截斷）。is-empty＝還沒有能播放的歌（idle／載入中），控制列的淡化條件靠它。 -->
+           截斷）。♪ 是進出試聽（官方 Sequencer）的開關，試聽中黃底；試聽中 ▶ ❚❚ ↻ 作用在試聽。
+           is-empty＝還沒有能播放的歌（idle／載入中），控制列的淡化條件靠它。 -->
       <div id="toolbar-playback" class="toolbar-playback is-empty">
         <div id="transport-group" class="tb-transport" role="group" aria-label="播放控制">
           <button id="btnPlay" class="btn tb-btn tb-play" type="button" data-action="play" disabled aria-label="播放">
@@ -68,6 +70,9 @@
             <span class="tb-icon" aria-hidden="true"></span>
           </button>
           <button id="btnReplay" class="btn tb-btn tb-replay" type="button" data-action="replay" disabled aria-label="重播">
+            <span class="tb-icon" aria-hidden="true"></span>
+          </button>
+          <button id="btnPreview" class="btn tb-btn tb-preview" type="button" data-action="preview" disabled aria-label="試聽">
             <span class="tb-icon" aria-hidden="true"></span>
           </button>
         </div>

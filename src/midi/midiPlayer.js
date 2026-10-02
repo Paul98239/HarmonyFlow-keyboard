@@ -20,6 +20,11 @@
 //  共用一個樂譜時鐘，時鐘以跟著揮手間隔估計的速度前進、碰到放行邊界就停格等下一次揮手，每次有效拋物線手勢放行下一拍；
 //  只有「曾被自己的演奏者真實觸發過」的聲部才出聲，別人放行（或代打放行）的拍它的音照樣發聲，停手超過短暫
 //  門檻後由代打暫時續走、只填空拍。完全沒有人指派時整份照時間連續自動播放。
+//
+//  試聽（♪）：用官方 SpessaSynth Sequencer 播同一份 MIDI（不經過我們的 parser，見 previewPlayer.js），
+//  拿來跟演奏對照聽感。跟演奏互斥（共用同一個合成器的 channel）：進入試聽會結束目前的演奏進度，
+//  離開試聽後演奏回到「已載入、還沒播過」，下次 ▶ 重新載入。store 的 mode 區分兩種：'perform'＝播放列
+//  作用在演奏，'preview'＝▶ ❚❚ ↻ 作用在試聽；哪顆鈕能按照同一張狀態表（transportButtonState）。
 // ============================================================
 
 import { Store, rafThrottle } from '../ui.js';
@@ -59,22 +64,25 @@ const LOADING_INDICATOR_DELAY_MS = 120; // 按播放後延遲這麼久才顯示 
  * @property {null | { kind: 'local', file: File, name: string } | { kind: 'cloud', id: string, blob: Blob, name: string }} source
  * @property {string} songTitle          來源名；空字串時頂端顯示「等待選擇歌曲...」
  * @property {string | null} notice      覆蓋歌名的訊息（暖機失敗／播放失敗／雲端下載失敗／檔案格式不支援）
- * @property {'idle' | 'loading' | 'paused' | 'playing'} transport
- * @property {boolean} started           這首載入後播過了沒（播放列三顆鈕的狀態表用：還沒播過時不能重播）
- * @property {boolean} finished          播完了（＝模組變數 endHandled 的鏡射；此時 ▶ 從頭播）
- * @property {boolean} busy              載入／續播／重播處理中（＝isSongLoading；三顆鈕立刻全灰）
+ * @property {'perform' | 'preview'} mode  播放列目前作用在演奏還是試聽（官方 Sequencer）
+ * @property {'idle' | 'loading' | 'paused' | 'playing'} transport  目前作用對象（mode 指的那一邊）的播放狀態
+ * @property {boolean} started           這首載入後播過了沒（播放列的狀態表用：還沒播過時不能重播）
+ * @property {boolean} finished          播完了（演奏：＝模組變數 endHandled 的鏡射；試聽：官方回報 isFinished）；此時 ▶ 從頭播
+ * @property {boolean} busy              載入／續播／重播／進入試聽處理中（＝isSongLoading；播放列按鈕立刻全灰）
  * @property {object | null} score       parseMidi() 的結果；null ＝ 沒有分譜資訊（單軌或解析失敗）
  * @property {object[]} parts            score.parts；長度 > 1 才顯示分譜區塊
  * @property {Map<string, number>} assignments partId → 演奏者 ID；改動時換新 Map
  * @property {number} playerCount        系統控制 bar 選的「現場人數」；0 ＝ 還沒選
- * @property {number} positionSeconds    目前播放位置（樂譜原始秒數，同 note.startSeconds 座標系）；
+ * @property {number} positionSeconds    目前播放位置（演奏：樂譜原始秒數，同 note.startSeconds 座標系；試聽：官方 currentTime）；
  *                                       頂端進度條唯讀顯示用，沒有任何 seek 路徑會寫它
+ * @property {number} previewDuration    試聽中這首的長度（秒，官方 duration）；進度條在試聽時拿它當分母，不在試聽是 0
  * @property {{ items: object[], categories: string[], query: string, category: string, status: 'idle' | 'searching' | 'ready' | 'empty' | 'error', selectedId: string }} library
  */
 export const playerStore = new Store(/** @type {PlayerState} */ ({
   source: null,
   songTitle: '',
   notice: null,
+  mode: 'perform',
   transport: 'idle',
   started: false,
   finished: false,
@@ -84,6 +92,7 @@ export const playerStore = new Store(/** @type {PlayerState} */ ({
   assignments: new Map(),
   playerCount: 0,
   positionSeconds: 0,
+  previewDuration: 0,
   library: { items: [], categories: [], query: '', category: '', status: 'idle', selectedId: '' },
 }));
 
@@ -184,11 +193,11 @@ function loadScore(arrayBuffer, label) {
 /* ═══════════════════════════════════════════
    選歌（本地／雲端）
    ═══════════════════════════════════════════ */
-// 每次換來源的共同前置：停掉引擎、清殘響、簽章失效，並發新的請求代號。
+// 每次換來源的共同前置：停掉引擎（演奏與試聽都停，載入中的試聽也中斷）、清殘響、簽章失效，並發新的請求代號。
 function beginSourceChange() {
   synth.flushPreviousSong();
   lastPlayedSignature = null;
-  playerStore.set({ transport: 'idle', notice: null, started: false, finished: false });
+  playerStore.set({ mode: 'perform', transport: 'idle', notice: null, started: false, finished: false, previewDuration: 0 });
   return ++sourceLoadToken;
 }
 const isStale = (token) => token !== sourceLoadToken;
@@ -254,7 +263,7 @@ async function playCurrentSource({ fromStart = false } = {}) {
   if (!s.source) return;
   // 重入防護：transport 是延遲 120ms 才切成 'loading' 的，在那之前連按第二下會再跑一次這裡，
   // 簽章就會記錄一份根本沒進引擎的組合。續播／重播這條路徑也是 async（AudioContext.resume），
-  // 一樣要擋；busy 讓三顆鈕立刻全灰，不用等 120ms。
+  // 一樣要擋；busy 讓播放列按鈕立刻全灰，不用等 120ms。
   if (isSongLoading) return;
   // 重播一首已經播完的歌時 endHandled 還停在 true，不先清掉真人聲部第一顆音會沒聲。
   endHandled = false;
@@ -294,12 +303,94 @@ async function playCurrentSource({ fromStart = false } = {}) {
   }
 }
 
-// 頂端 pill 的 ❚❚：只有播放中才能暫停（防呆，不靠 disabled 一道擋）。
+// 頂端 pill 的 ❚❚：只有播放中才能暫停（防呆，不靠 disabled 一道擋）。試聽中暫停的是官方 Sequencer。
 function pauseCurrentSource() {
   if (playerStore.state.transport !== 'playing') return;
-  synth.pause();
+  if (playerStore.state.mode === 'preview') synth.pausePreview();
+  else synth.pause();
   playerStore.set({ transport: 'paused', notice: null });
   updateHumanGate();
+}
+
+/* ═══════════════════════════════════════════
+   試聽（官方 Sequencer，見 previewPlayer.js）
+   ═══════════════════════════════════════════ */
+// 官方解析器要的是原始位元組：本地檔案與雲端 blob 都有 arrayBuffer()，每次讀都是新的一份。
+const sourceBytes = (source) => (source.kind === 'local' ? source.file : source.blob).arrayBuffer();
+
+// 試聽失敗時頂端提示的字：engine＝音源引擎壞了、parse／timeout＝官方解析器拒絕或沒有回應（也是 parser 差異的訊號）。
+const PREVIEW_NOTICE = {
+  engine: '⚠️ 音源引擎載入失敗',
+  parse: '官方播放器無法解析這首 MIDI',
+  timeout: '官方播放器無法解析這首 MIDI',
+};
+
+// ♪（演奏 → 試聽）：載入完成就從第一個音開始播。進入試聽＝結束目前演奏進度（兩邊共用合成器的 channel），
+// 所以簽章先作廢，離開後的 ▶ 一律整個重新載入。載入期間 busy（按鈕全灰）；任何失敗都回到演奏
+// 「已載入、還沒播過」並在頂端提示，來源在這期間被換掉（token 過期）則整段靜默作廢。
+async function enterPreview() {
+  const { source } = playerStore.state;
+  if (!source || isSongLoading) return;
+  isSongLoading = true;
+  playerStore.set({ busy: true });
+  const token = sourceLoadToken;
+  try {
+    const bytes = await sourceBytes(source);
+    if (isStale(token)) return;
+    lastPlayedSignature = null;
+    endHandled = false;
+    await synth.startPreview(bytes);
+    // 載入／恢復 AudioContext 期間換了來源：這次剛開始的試聽是孤兒，收掉。
+    if (isStale(token)) { synth.flushPreviousSong(); return; }
+    playerStore.set({
+      mode: 'preview', transport: 'playing', started: true, finished: false, notice: null,
+      previewDuration: synth.previewDuration(), positionSeconds: 0,
+    });
+    updateHumanGate();
+  } catch (err) {
+    if (isStale(token) || err.kind === 'aborted') return;
+    if (err.kind === 'parse' || err.kind === 'timeout') console.warn(`⚠️ 官方播放器無法解析 ${source.name}`, err);
+    else if (err.kind !== 'engine') console.error(err);
+    synth.flushPreviousSong(); // 失敗的載入可能已動過合成器，清乾淨
+    playerStore.set({
+      mode: 'perform', transport: 'paused', started: false, finished: false, previewDuration: 0,
+      notice: PREVIEW_NOTICE[err.kind] ?? `試聽失敗：${source.name}`,
+    });
+  } finally {
+    isSongLoading = false;
+    playerStore.set({ busy: false });
+  }
+}
+
+// ♪（試聽 → 演奏）：停掉試聽、合成器清乾淨，演奏回到「已載入、還沒播過」，進度條歸零。
+function leavePreview() {
+  synth.flushPreviousSong();
+  lastPlayedSignature = null;
+  endHandled = false;
+  playerStore.set({
+    mode: 'perform', transport: 'paused', started: false, finished: false,
+    notice: null, previewDuration: 0, positionSeconds: 0,
+  });
+  updateHumanGate();
+}
+
+// 試聽中的 ▶（續播；播完則從頭）與 ↻：跟 playCurrentSource() 一樣先 busy 全灰、await AudioContext 恢復。
+async function playPreview({ fromStart = false } = {}) {
+  if (isSongLoading) return;
+  isSongLoading = true;
+  playerStore.set({ busy: true });
+  try {
+    await (fromStart ? synth.restartPreview() : synth.resumePreview());
+    // await 期間換了來源或離開試聽：PreviewPlayer 已經停了，不要把「播放中」寫回去。
+    if (playerStore.state.mode !== 'preview') return;
+    playerStore.set({ transport: 'playing', finished: false, notice: null });
+  } catch (err) {
+    console.error(err);
+    if (playerStore.state.mode === 'preview') playerStore.set({ transport: 'paused', notice: `試聽失敗：${playerStore.state.source?.name ?? ''}` });
+  } finally {
+    isSongLoading = false;
+    playerStore.set({ busy: false });
+  }
 }
 
 /* ═══════════════════════════════════════════
@@ -339,7 +430,13 @@ export async function warmUpMidiEngine() {
 
 // 200ms 的 UI tick：播完偵測、humanGate 定期補算、頂端進度條同步。
 function uiTick() {
-  if (!isSongLoading && synth.isLoaded() && !endHandled && synth.isFinished()) {
+  const inPreview = playerStore.state.mode === 'preview';
+  if (inPreview) {
+    // 試聽播完：官方 Sequencer 自己會停（收掉所有音），這裡只負責把畫面切成「播完」。
+    if (!isSongLoading && !playerStore.state.finished && synth.isPreviewFinished()) {
+      playerStore.set({ transport: 'paused', finished: true });
+    }
+  } else if (!isSongLoading && synth.isLoaded() && !endHandled && synth.isFinished()) {
     endHandled = true;
     synth.pause();
     playerStore.set({ transport: 'paused', finished: true });
@@ -348,10 +445,11 @@ function uiTick() {
   // 沒有新的手勢狀態進來，也會在 200ms 內把 humanGain 收到正確位置（synth.js 那邊 target 去重）。
   updateHumanGate();
 
-  // 唯讀進度：位置來自 humanPerformer（原譜座標），不是真實經過時間——沒人觸發就會停住不動。
+  // 唯讀進度：演奏時位置來自 humanPerformer（原譜座標），不是真實經過時間——沒人觸發就會停住不動；
+  // 試聽時是官方 Sequencer 的 currentTime（連續前進）。
   // 用「跟目前 store 值的差距夠不夠大」節流，不是整數秒（沒有文字要顯示，不需要卡在整數）：
   // 差距小於 0.05s（畫面上幾乎看不出來的寬度變化）就不寫，避免每 200ms 都排一輪全區塊 render。
-  const pos = synth.isLoaded() ? synth.humanPerformer.getPositionSeconds() : 0;
+  const pos = inPreview ? synth.previewTime() : synth.isLoaded() ? synth.humanPerformer.getPositionSeconds() : 0;
   if (Math.abs(pos - playerStore.state.positionSeconds) > 0.05) {
     playerStore.set({ positionSeconds: pos });
   }
@@ -372,18 +470,20 @@ export function startPlayer() {
 /* ═══════════════════════════════════════════
    🎛️ 畫面 1／3：頂端播放 pill（播放／暫停切換鈕 ＋ 歌名）
    ═══════════════════════════════════════════ */
-// 三顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播）互相防呆：哪顆能按、哪顆是「目前狀態」（accent 黃底）
+// 四顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽）互相防呆：哪顆能按、哪顆是「目前狀態」（accent 黃底）
 // 由 transportButtonState() 依 store 推導，畫面只是照表寫 DOM——CLAUDE.md 有同一張表。
 //   沒歌（idle）／載入中（loading）／處理中（busy） → 全灰（載入中 ▶ 顯示 ⋯）
-//   剛載入、還沒播過 → 只有 ▶ 能按（已經在開頭，沒有東西可重播）
-//   播放中           → 只有 ❚❚ 能按（黃底）；播放中誤按重播會打斷演奏，所以 ▶／↻ 都灰
-//   暫停／播完       → ▶（續播；播完則從頭播）與 ↻ 能按
+//   剛載入、還沒播過 → ▶ 與 ♪ 能按（已經在開頭，沒有東西可重播）
+//   播放中           → 只有 ❚❚ 能按（黃底）；播放中誤按重播會打斷演奏，所以 ▶／↻ 都灰；♪ 也灰（要先暫停，免得打斷演奏）
+//   暫停／播完       → ▶（續播；播完則從頭播）、↻、♪ 能按
+//   試聽中（mode＝preview）→ 同樣的規則作用在試聽，♪ 恆黃底（再按結束試聽），試聽播放中 ♪ 也能按
 // 歌名只放歌名（notice 覆蓋時例外），不寫「解析中／下載中」；優先單行，超長才縮小字級。
 const pill = document.getElementById('toolbar-playback');
 const transportGroup = document.getElementById('transport-group');
 const btnPlay = document.getElementById('btnPlay');
 const btnPause = document.getElementById('btnPause');
 const btnReplay = document.getElementById('btnReplay');
+const btnPreview = document.getElementById('btnPreview');
 const statusText = document.getElementById('midiStatusText');
 // 頂端進度條：獨立於這個 pill 之外的元素（見 index.html），只在這裡讀 DOM 參照，不影響
 // fitSongTitle() 量的 pill／按鈕組寬度。
@@ -393,7 +493,7 @@ const IDLE_TITLE = '等待選擇歌曲...';
 
 // ── 歌名優先單行，超長才縮小字級（見 src/styles.css 的 .player-status-bar 註解）──
 // 量測邏輯：scrollWidth 是文字實際想要的寬度（不受目前有沒有被壓縮影響），跟 pill 扣掉
-// 三顆按鈕（整組）與 gap 之後能分給文字的寬度比較，超出就縮小 --song-title-scale；縮到下限
+// 四顆按鈕（整組）與 gap 之後能分給文字的寬度比較，超出就縮小 --song-title-scale；縮到下限
 // MIN_SONG_TITLE_SCALE 還是放不下，才加 .allow-wrap 退回換行。
 const MIN_SONG_TITLE_SCALE = 0.6;
 function fitSongTitle() {
@@ -410,25 +510,33 @@ function fitSongTitle() {
   }
 }
 
-// 三顆鈕的狀態表（見上方說明）。純函式：只看 store，回傳能不能按、哪顆是目前狀態、pill 是不是
-// is-empty（還沒有能播放的歌：idle／載入中，控制列的淡化條件靠它）。busy 期間 is-empty 維持 false，
-// 免得續播／重播那一瞬間控制列的透明度跳一下。
-function transportButtonState({ transport, started, finished, busy }) {
-  if (transport === 'idle' || transport === 'loading') {
-    return { play: false, pause: false, replay: false, current: null, empty: true };
+// 四顆鈕的狀態表（見上方說明）。純函式：只看 store，回傳能不能按、哪些鈕是目前狀態（accent 黃底，
+// current 是鈕名陣列）、pill 是不是 is-empty（還沒有能播放的歌：idle／載入中，控制列的淡化條件靠它）。
+// busy 期間 is-empty 維持 false，免得續播／重播那一瞬間控制列的透明度跳一下。
+function transportButtonState({ mode, transport, started, finished, busy }) {
+  const grey = { play: false, pause: false, replay: false, preview: false, current: [] };
+  if (transport === 'idle' || transport === 'loading') return { ...grey, empty: true };
+  if (busy) return { ...grey, empty: false };
+  const inPreview = mode === 'preview';
+  if (transport === 'playing') {
+    return {
+      play: false, pause: true, replay: false,
+      preview: inPreview, // 演奏播放中 ♪ 灰；試聽播放中 ♪ 是「結束試聽」，可按
+      current: inPreview ? ['pause', 'preview'] : ['pause'], empty: false,
+    };
   }
-  if (busy) return { play: false, pause: false, replay: false, current: null, empty: false };
-  if (transport === 'playing') return { play: false, pause: true, replay: false, current: 'pause', empty: false };
-  // transport === 'paused'：還沒播過（已在開頭）不能重播；播到一半或播完都可以。
-  return { play: true, pause: false, replay: started || finished, current: null, empty: false };
+  // transport === 'paused'：演奏還沒播過（已在開頭）不能重播，播到一半或播完都可以；試聽一律是播過才會在這裡，
+  // 重播恆可按。
+  return { play: true, pause: false, replay: inPreview || started || finished, preview: true, current: inPreview ? ['preview'] : [], empty: false };
 }
 
 // action 進來再對一次狀態表（防呆不只靠 disabled 一道擋：連按、程式呼叫都不會繞過去）。
 const whenAllowed = (button, fn) => () => { if (transportButtonState(playerStore.state)[button]) fn(); };
 const transportActions = {
-  'play': whenAllowed('play', () => playCurrentSource()),
+  'play': whenAllowed('play', () => (playerStore.state.mode === 'preview' ? playPreview() : playCurrentSource())),
   'pause': whenAllowed('pause', () => pauseCurrentSource()),
-  'replay': whenAllowed('replay', () => playCurrentSource({ fromStart: true })),
+  'replay': whenAllowed('replay', () => (playerStore.state.mode === 'preview' ? playPreview({ fromStart: true }) : playCurrentSource({ fromStart: true }))),
+  'preview': whenAllowed('preview', () => (playerStore.state.mode === 'preview' ? leavePreview() : enterPreview())),
 };
 
 function mountTransportPill() {
@@ -442,7 +550,10 @@ function renderTransportPill({ player }) {
   btnPlay.disabled = !state.play;
   btnPause.disabled = !state.pause;
   btnReplay.disabled = !state.replay;
-  btnPause.classList.toggle('is-current', state.current === 'pause');
+  btnPreview.disabled = !state.preview;
+  btnPause.classList.toggle('is-current', state.current.includes('pause'));
+  btnPreview.classList.toggle('is-current', state.current.includes('preview'));
+  btnPreview.setAttribute('aria-label', player.mode === 'preview' ? '結束試聽' : '試聽');
   btnPlay.classList.toggle('is-loading', player.transport === 'loading');
   pill.classList.toggle('is-empty', state.empty);
 
@@ -461,7 +572,8 @@ function renderTransportPill({ player }) {
 // 過去，「沒人觸發時停住不動」的既有原則不變。
 let hasShownProgress = false;
 function renderTopProgress({ player }) {
-  const total = player.score?.durationSeconds || 0;
+  // 試聽時分母是官方 duration（我們的 parser 即使解析失敗，試聽仍可用）。
+  const total = player.mode === 'preview' ? player.previewDuration : (player.score?.durationSeconds || 0);
   if (total > 0) hasShownProgress = true;
   topProgressBar.hidden = !hasShownProgress;
   if (total > 0) {

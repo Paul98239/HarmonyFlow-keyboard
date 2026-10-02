@@ -1,11 +1,13 @@
 // ============================================================
 //  mutation-check.mjs — 變異檢查：故意把排程器弄壞，看指定的測試會不會變紅（手動執行，不進 CI，純 Node）
 //
-//  做法：把 src／測試複製到暫存資料夾，在複製出來的 humanPerformer.js 套用一個「一行的破壞」，跑測試，檢查
-//  「指定的那幾個測試」有沒有失敗。不會動到工作目錄裡的任何檔案。沒有任何指定測試變紅＝這個行為沒有被保護。
+//  做法：把 src／測試複製到暫存資料夾，在複製出來的原始檔（預設 humanPerformer.js，也可以用 target 指定別的檔）
+//  套用一個「一行的破壞」，跑測試，檢查「指定的那幾個測試」有沒有失敗。不會動到工作目錄裡的任何檔案。沒有任何
+//  指定測試變紅＝這個行為沒有被保護。suites 可以含 'smoke'：用同一支瀏覽器測試（test/browser/smoke-test.mjs）
+//  跑被破壞的複本（HF_ROOT），每個要一分多鐘，所以只放確實要靠瀏覽器才抓得到的破壞。
 //  破壞用的字串必須在原始碼裡剛好出現一次；原始碼改了找不到就會直接報錯，提醒更新這張表。
 //
-//  用法：node test/tools/mutation-check.mjs [--only=關鍵字]
+//  用法：node test/tools/mutation-check.mjs [--only=關鍵字] [--skip-smoke | --only-smoke]
 // ============================================================
 
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,11 +17,14 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const TARGET = 'src/midi/humanPerformer.js';
+const TARGET = 'src/midi/humanPerformer.js'; // 沒有指定 target 的變異破壞這個檔
+const PREVIEW = 'src/midi/previewPlayer.js', PLAYER = 'src/midi/midiPlayer.js', SYNTH = 'src/midi/synth.js';
 const ONLY = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7);
+const SKIP_SMOKE = process.argv.includes('--skip-smoke'); // 只跑單元測試抓得到的變異（快）
+const ONLY_SMOKE = process.argv.includes('--only-smoke'); // 只跑要靠瀏覽器測試抓的變異（慢）
 
 // edits：[原始碼裡的那一行（或片段）, 換成什麼]。expect：應該變紅的測試名稱關鍵字（任何一個變紅就算抓到）；
-// suites：要跑哪些測試檔（預設只跑排程器的單元測試）。
+// suites：要跑哪些測試檔（預設只跑排程器的單元測試）；target：破壞哪個檔（預設排程器）。
 const MUTATIONS = [
   { name: 'FIFO 改回以音高為鍵（同音高的新音蓋掉舊音）', edits: [['queue.push({ endSec: n.endSeconds, legatoTo: n.legatoTo });', 'queue.length = 0; queue.push({ endSec: n.endSeconds, legatoTo: n.legatoTo });']],
     expect: ['同音高重疊（先進先出）', 'canon 完美演奏者'], suites: ['human-performer', 'oracle'] },
@@ -89,9 +94,64 @@ const MUTATIONS = [
     expect: ['第一次取樣之前'] },
   { name: '前奏期間電腦照樣倒數（提早揮的第一下之後前奏被追趕）', edits: [['if (this._autopilotLeftSec != null && this._clockSec >= this._entrySec - EPS) this._autopilotLeftSec -= dt;', 'if (this._autopilotLeftSec != null) this._autopilotLeftSec -= dt;']],
     expect: ['前奏：只在前奏中揮過一次手'] },
+  // ── 試聽：PreviewPlayer（單元測試）──
+  { name: '試聽不關掉官方的循環播放（loopCount 留著預設）', target: PREVIEW, suites: ['preview-player'], edits: [['seq.loopCount = 0; // 官方預設循環播放（-1），試聽播完就該停', '/* 變異：沒有關循環 */']],
+    expect: ['loopCount 明確設成 0'] },
+  { name: '試聽不比對 songChange 的檔名（舊載入的事件也算數）', target: PREVIEW, suites: ['preview-player'], edits: [['(song) => { if (song?.fileName === name) settle(); }', '() => { settle(); }']],
+    expect: ['別次載入晚到的 songChange', '載入中又 start()'] },
+  { name: '試聽載入沒有逾時（長度 0 的 MIDI 會永遠卡住）', target: PREVIEW, suites: ['preview-player'], edits: [["timer = setTimeout(() => settle(fail('timeout', '官方播放器沒有回應')), this._timeoutMs);", '/* 變異：沒有逾時 */']],
+    expect: ['逾時'] },
+  { name: '停止試聽不中斷還在等的載入', target: PREVIEW, suites: ['preview-player'], edits: [["this._abort?.(fail('aborted', '試聽被中斷'));", '/* 變異：不中斷 */']],
+    expect: ['載入中 stop()', '載入中又 start()'] },
+  { name: '載入結束後不移除官方事件的監聽（累積）', target: PREVIEW, suites: ['preview-player'], edits: [["seq.eventHandler.removeEvent('songChange', EVENT_ID);", '/* 變異：不移除 */']],
+    expect: ['監聽都已移除'] },
+  { name: '播完後續播不從頭（直接 play）', target: PREVIEW, suites: ['preview-player'], edits: [['if (this._seq.isFinished) this.restart();\n    else this._seq.play();', 'this._seq.play();']],
+    expect: ['播完（官方 isFinished）之後 resume()'] },
+  { name: '暫停不呼叫官方的 pause（試聽停不下來）', target: PREVIEW, suites: ['preview-player'], edits: [['pause() { if (this._active) this._seq.pause(); }', 'pause() { /* 變異：不暫停 */ }']],
+    expect: ['pause()／resume() 交給官方'] },
+  { name: '解析失敗不丟錯（當成載入成功）', target: PREVIEW, suites: ['preview-player'], edits: [["(err) => settle(fail('parse', err?.message || '官方解析器拒絕這首 MIDI'))", '() => settle()']],
+    expect: ['官方解析器拒絕（midiError）'] },
+  { name: '開始新的試聽前不先結束上一次', target: PREVIEW, suites: ['preview-player'], edits: [['this.stop(); // 上一次試聽（包含還在等的載入）先結束', '/* 變異：不先 stop */']],
+    expect: ['載入中又 start()'] },
+  // ── 試聽：播放列與引擎接線（瀏覽器測試，每個一分多鐘）──
+  { name: '換來源時不把播放列切回演奏（試聽 mode 殘留）', target: PLAYER, suites: ['smoke'], edits: [["playerStore.set({ mode: 'perform', transport: 'idle', notice: null, started: false, finished: false, previewDuration: 0 });", "playerStore.set({ transport: 'idle', notice: null, started: false, finished: false, previewDuration: 0 });"]],
+    expect: ['換歌', '按鈕狀態'] },
+  { name: '試聽播完 uiTick 不偵測（永遠停在「播放中」）', target: PLAYER, suites: ['smoke'], edits: [['!playerStore.state.finished && synth.isPreviewFinished()', 'false']],
+    expect: ['試聽播完'] },
+  { name: '演奏播放中 ♪ 也能按', target: PLAYER, suites: ['smoke'], edits: [['preview: inPreview, // 演奏播放中 ♪ 灰；試聽播放中 ♪ 是「結束試聽」，可按', 'preview: true,']],
+    expect: ['演奏播放中 ♪ 是灰的', '64 種狀態組合'] },
+  { name: '♪ 的 action 不對狀態表（灰的時候被呼叫也照做）', target: PLAYER, suites: ['smoke'], edits: [["'preview': whenAllowed('preview', () => (playerStore.state.mode === 'preview' ? leavePreview() : enterPreview())),", "'preview': () => (playerStore.state.mode === 'preview' ? leavePreview() : enterPreview()),"]],
+    expect: ['64 種狀態組合'] },
+  { name: '清場不停掉試聽（換歌／離開試聽之後官方還在播）', target: SYNTH, suites: ['smoke'], edits: [['  previewPlayer?.stop();\n  isSongLoaded = false;', '  isSongLoaded = false;']],
+    expect: ['離開試聽：官方 Sequencer 已停', '換歌'] },
+  { name: '離開試聽不清場（只切畫面）', target: PLAYER, suites: ['smoke'], edits: [['function leavePreview() {\n  synth.flushPreviousSong();\n', 'function leavePreview() {\n']],
+    expect: ['離開試聽：官方 Sequencer 已停'] },
+  { name: '進入試聽不結束演奏（排程器繼續跑）', target: SYNTH, suites: ['smoke'], edits: [["  if (!SequencerClass) throw engineError('音源引擎缺少 Sequencer');\n  flushPreviousSong();\n", "  if (!SequencerClass) throw engineError('音源引擎缺少 Sequencer');\n"]],
+    expect: ['進入試聽＝演奏進度歸零'] },
+  { name: '試聽失敗時畫面沒有提示', target: PLAYER, suites: ['smoke'], edits: [["      notice: PREVIEW_NOTICE[err.kind] ?? `試聽失敗：${source.name}`,\n", '']],
+    expect: ['試聽錯誤路徑'] },
 ];
 
+// 瀏覽器測試：用真實 repo 的 test/browser/smoke-test.mjs 跑 dir 這份被破壞的複本（HF_ROOT）。變紅的判斷＝它印出的
+// 「✗」行（check／expectTransport 的失敗項）；腳本中途丟錯（例如等不到某個狀態逾時）就以「出錯於<最後一個步驟>」當名稱。
+function runSmoke(dir) {
+  const r = spawnSync(process.execPath, ['--no-warnings', 'test/browser/smoke-test.mjs', '--duration', '300'], { cwd: ROOT, env: { ...process.env, HF_ROOT: dir }, encoding: 'utf8', timeout: 420000 });
+  const failed = [];
+  let lastStep = '';
+  for (const line of (r.stdout || '').split('\n')) {
+    if (line.startsWith('▶ ')) lastStep = line.slice(2).trim();
+    const m = line.match(/^ {2}✗ (.+)$/);
+    if (m) failed.push(m[1]);
+  }
+  // 腳本中途丟錯（例如等不到某個狀態逾時）：就算前面已經有別的「✗」行也要算，否則會被別的失敗遮住
+  if (/測試腳本本身出錯/.test(`${r.stdout}${r.stderr}`)) failed.push(`（smoke 測試出錯於「${lastStep}」）`);
+  else if (r.status !== 0 && !failed.length) failed.push(`（smoke 測試沒通過，但沒有印出失敗項，最後的步驟「${lastStep}」）`);
+  if (r.error || r.status === null) failed.push(`（smoke 沒有正常結束：${r.error?.message || r.signal}）`);
+  return failed;
+}
+
 function runSuite(dir, suite) {
+  if (suite === 'smoke') return runSmoke(dir);
   const r = spawnSync(process.execPath, ['--no-warnings', `test/unit/${suite}.test.mjs`], { cwd: dir, encoding: 'utf8', timeout: 180000 });
   const failed = [];
   let current = '';
@@ -106,20 +166,28 @@ function runSuite(dir, suite) {
 const tmp = mkdtempSync(join(tmpdir(), 'hf-mutation-'));
 try {
   mkdirSync(join(tmp, 'test'), { recursive: true });
-  cpSync(join(ROOT, 'src'), join(tmp, 'src'), { recursive: true, filter: (p) => !/GeneralUserGS|pose_landmarker/.test(p) });  // 不複製大檔
+  cpSync(join(ROOT, 'src'), join(tmp, 'src'), { recursive: true });   // 連音色庫與姿勢模型一起複製：瀏覽器測試要用
+  cpSync(join(ROOT, 'index.html'), join(tmp, 'index.html'));
   cpSync(join(ROOT, 'test/unit'), join(tmp, 'test/unit'), { recursive: true });
   for (const pkg of ['spessasynth_core', 'stb-vorbis']) cpSync(join(ROOT, 'node_modules', pkg), join(tmp, 'node_modules', pkg), { recursive: true });   // oracle 測試要用 spessasynth_core；複製而不是連結，rmSync 才不會碰到真的 node_modules
-  const original = readFileSync(join(ROOT, TARGET), 'utf8').replace(/\r\n/g, '\n');   // 換行統一成 LF：不管 checkout 時是 CRLF 還是 LF，多行的破壞字串都對得上
+  // 換行統一成 LF：不管 checkout 時是 CRLF 還是 LF，多行的破壞字串都對得上
+  const originals = new Map();
+  const originalOf = (target) => {
+    if (!originals.has(target)) originals.set(target, readFileSync(join(ROOT, target), 'utf8').replace(/\r\n/g, '\n'));
+    return originals.get(target);
+  };
   let bad = 0;
-  for (const m of MUTATIONS.filter((x) => x.name.includes(ONLY))) {
-    let mutated = original;
+  for (const m of MUTATIONS.filter((x) => x.name.includes(ONLY) && !(SKIP_SMOKE && x.suites?.includes('smoke')) && !(ONLY_SMOKE && !x.suites?.includes('smoke')))) {
+    const target = m.target || TARGET;
+    let mutated = originalOf(target);
     for (const [find, replace] of m.edits) {
       const count = mutated.split(find).length - 1;
       if (count !== 1) { console.error(`✗ ${m.name}：要破壞的字串在原始碼裡出現 ${count} 次（要剛好 1 次），請更新這張表：\n  ${find}`); process.exit(2); }
       mutated = mutated.replace(find, () => replace);
     }
-    writeFileSync(join(tmp, TARGET), mutated);
+    writeFileSync(join(tmp, target), mutated);
     const failed = (m.suites || ['human-performer']).flatMap((suite) => runSuite(tmp, suite));
+    writeFileSync(join(tmp, target), originalOf(target)); // 還原，下一個變異從乾淨的複本開始
     const caught = m.expect.filter((k) => failed.some((f) => f.includes(k)));
     if (!caught.length) bad++;
     console.log(`${caught.length ? '✓' : '✗'} ${m.name}\n    指定的測試變紅：${caught.length ? caught.join('、') : '沒有！'}；全部變紅的測試 ${failed.length} 個${failed.length ? `：${failed.slice(0, 4).map((f) => f.slice(0, 40)).join('、')}${failed.length > 4 ? '…' : ''}` : ''}`);

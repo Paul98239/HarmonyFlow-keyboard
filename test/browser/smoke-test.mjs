@@ -22,11 +22,12 @@
 
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
-import { extname, join, normalize } from 'node:path';
+import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
-const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+// HF_ROOT：變異檢查（test/tools/mutation-check.mjs）把被故意破壞的 src 複本當網站根目錄來跑同一支測試。
+const REPO_ROOT = process.env.HF_ROOT ? resolve(process.env.HF_ROOT) : fileURLToPath(new URL('../../', import.meta.url));
 const PORT = 5599; // 刻意跟 VS Code Live Server 常用的 5500 錯開，兩者可以同時開著不互相干擾
 const SAMPLE_MIDI = join(REPO_ROOT, 'src/assets/canon-violin-cello.mid');
 
@@ -49,6 +50,17 @@ const BENIGN_PATTERNS = [
   /was preloaded using link preload but not used/i, // headcount 還沒選之前 pose 模型本來就不會被用到
 ];
 const isBenign = (text) => BENIGN_PATTERNS.some((re) => re.test(text));
+
+// 「預期會出現的 console 訊息」：錯誤路徑測試（壞檔、官方解析失敗）本來就該留下 console.warn，不算問題；
+// 但同時要證明它真的有留下。expectConsole 在 fn 執行期間把符合的訊息從 problems 排除並計次，回傳每個
+// pattern 的命中次數（呼叫端斷言該出現的有出現）。
+const tolerated = { patterns: [], hits: new Map() };
+async function expectConsole(patterns, fn) {
+  tolerated.patterns = patterns;
+  tolerated.hits = new Map(patterns.map((re) => [re, 0]));
+  try { await fn(); } finally { tolerated.patterns = []; }
+  return tolerated.hits;
+}
 
 function parseArgs(argv) {
   const args = { duration: 8000, video: null };
@@ -80,21 +92,27 @@ function startStaticServer(root, port) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
-// 播放列三顆鈕（▶ 播放／❚❚ 暫停／↻ 重播）的狀態，對照 CLAUDE.md 的狀態表：能按＝沒有 disabled，
-// current＝目前狀態那顆（accent 黃底），empty＝pill 的 is-empty（沒歌可播，淡化條件靠它）。
+// 播放列四顆鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽）的狀態，對照 CLAUDE.md 的狀態表：能按＝沒有
+// disabled，current＝目前狀態的鈕（accent 黃底；試聽中 ♪ 也是），empty＝pill 的 is-empty（沒歌可播，
+// 淡化條件靠它）。名稱開頭是 preview 的列＝試聽中（狀態表下半），busy＝載入／續播／重播處理中。
 const TRANSPORT_STATES = {
-  idle:     { play: false, pause: false, replay: false, current: [], empty: true },
-  loading:  { play: false, pause: false, replay: false, current: [], empty: true },
-  ready:    { play: true,  pause: false, replay: false, current: [], empty: false },
-  playing:  { play: false, pause: true,  replay: false, current: ['btnPause'], empty: false },
-  paused:   { play: true,  pause: false, replay: true,  current: [], empty: false },
-  finished: { play: true,  pause: false, replay: true,  current: [], empty: false },
+  idle:     { play: false, pause: false, replay: false, preview: false, current: [], empty: true },
+  loading:  { play: false, pause: false, replay: false, preview: false, current: [], empty: true },
+  ready:    { play: true,  pause: false, replay: false, preview: true,  current: [], empty: false },
+  playing:  { play: false, pause: true,  replay: false, preview: false, current: ['btnPause'], empty: false },
+  paused:   { play: true,  pause: false, replay: true,  preview: true,  current: [], empty: false },
+  finished: { play: true,  pause: false, replay: true,  preview: true,  current: [], empty: false },
+  busy:     { play: false, pause: false, replay: false, preview: false, current: [], empty: false },
+  previewPlaying:  { play: false, pause: true,  replay: false, preview: true, current: ['btnPause', 'btnPreview'], empty: false },
+  previewPaused:   { play: true,  pause: false, replay: true,  preview: true, current: ['btnPreview'], empty: false },
+  previewFinished: { play: true,  pause: false, replay: true,  preview: true, current: ['btnPreview'], empty: false },
 };
 async function expectTransport(page, name, problems) {
   const got = await page.evaluate(() => ({
     play: !document.getElementById('btnPlay').disabled,
     pause: !document.getElementById('btnPause').disabled,
     replay: !document.getElementById('btnReplay').disabled,
+    preview: !document.getElementById('btnPreview').disabled,
     current: [...document.querySelectorAll('#transport-group .is-current')].map((el) => el.id),
     empty: document.getElementById('toolbar-playback').classList.contains('is-empty'),
   }));
@@ -129,9 +147,122 @@ const clickAndReadPosition = (page, buttonId) => page.evaluate(async (id) => {
   return humanPerformer.getPositionSeconds();
 }, buttonId);
 
-// 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → 把第一個聲部指派給演奏者 1 → 按播放
-// → 暫停 → 重播，沿途逐一斷言三顆鈕的狀態。跟真實使用者操作路徑一致（見 index.html 的
-// data-field／data-action），不繞過 UI 直接呼叫內部函式（只有上面兩種難以自然走到的狀態例外）。
+// ── 試聽（官方 Sequencer）相關的小工具 ──
+// waitForFunction 的判斷式必須是「同步」函式：async 函式回傳的 Promise 本身永遠是 truthy，Playwright 會當成
+// 條件立刻成立，等於沒等。所以把 store 與 synth 模組掛到測試頁面的 window.__hf（只在測試頁面上，app 不知道），
+// 判斷式就能同步讀。
+const exposeModules = (page) => page.evaluate(async () => {
+  window.__hf = {
+    store: (await import('/src/midi/midiPlayer.js')).playerStore,
+    synth: await import('/src/midi/synth.js'),
+  };
+});
+const previewTime = (page) => page.evaluate(async () => (await import('/src/midi/synth.js')).previewTime());
+const storeState = (page) => page.evaluate(async () => {
+  const s = (await import('/src/midi/midiPlayer.js')).playerStore.state;
+  return { mode: s.mode, transport: s.transport, started: s.started, finished: s.finished, busy: s.busy, notice: s.notice, previewDuration: s.previewDuration };
+});
+// 輪詢到試聽時間超過 seconds（官方 Sequencer 在 AudioWorklet 裡跑，時間靠 AudioContext 往前走；
+// context 沒恢復或沒在播時時間不會動）。逾時回傳目前的值讓斷言報出實際數字。
+async function waitForPreviewTimeAbove(page, seconds, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const t = await previewTime(page);
+    if (t > seconds || Date.now() > deadline) return t;
+    await page.waitForTimeout(100);
+  }
+}
+const check = (ok, label, problems, detail = '') => {
+  console.log(`  ${ok ? '✓' : '✗'} ${label}`);
+  if (!ok) problems.push(`${label}${detail ? `：${detail}` : ''}`);
+};
+
+// 一個只有一個音（4 拍＝2 秒）的最小合法 SMF，試聽「播完」與「換歌」用。不放進 repo：現場組出來比附檔案直接。
+function makeTinyMidi() {
+  const track = [
+    0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20,   // 速度 500000 μs／四分音符＝120 BPM
+    0x00, 0xc0, 0x00,                            // program 0
+    0x00, 0x90, 0x3c, 0x64,                      // 中央 C note-on
+    0x8f, 0x00, 0x80, 0x3c, 0x40,                // 1920 tick（4 拍）後 note-off（delta 0x8F 0x00 ＝ 1920）
+    0x00, 0xff, 0x2f, 0x00,                      // end of track
+  ];
+  const header = [0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xe0]; // format 0、1 軌、480 tpq
+  const len = track.length;
+  return Buffer.from([...header, 0x4d, 0x54, 0x72, 0x6b, 0, 0, (len >> 8) & 0xff, len & 0xff, ...track]);
+}
+const TINY_MIDI = { name: 'tiny.mid', mimeType: 'audio/midi', buffer: makeTinyMidi() };
+
+// 在頁面內重新載入一份本地檔案並等到 ready：換來源一律走真的 change 事件（同使用者選檔）。
+async function loadLocalFile(page, file) {
+  await page.setInputFiles('#localMidiInput', file);
+  await page.waitForFunction((name) => {
+    const s = window.__hf.store.state;
+    return s.transport === 'paused' && !s.busy && s.source?.name === name;
+  }, file.name, { timeout: 15000 });
+}
+
+// 試聽基本操作（選好範例、演奏還沒播過的 ready 狀態開始）：♪ 進入試聽 → 時間真的往前走 → ❚❚ 暫停
+// （時間停住）→ ▶ 續播（從暫停處繼續，不是從頭）→ 再暫停 → ↻ 重播（回到第一個音附近）→ ♪ 離開，
+// 回到演奏「已載入、還沒播過」。這也是第一次在 AudioContext 還沒恢復時用到官方 Sequencer：時間會動
+// 就證明 ♪ 的點擊有把 context resume 起來。
+async function drivePreviewControls(page, problems) {
+  console.log('▶ 試聽：按 ♪ 進入試聽（官方 Sequencer 自己解析、自己播）…');
+  await page.click('#btnPreview');
+  await page.waitForSelector('#btnPreview.is-current', { timeout: 15000 });
+  await expectTransport(page, 'previewPlaying', problems);
+  const t0 = await previewTime(page);
+  const t1 = await waitForPreviewTimeAbove(page, t0 + 2.5);
+  check(t1 > t0 + 2.5, '試聽的時間往前走（AudioContext 已恢復、官方 Sequencer 真的在播）', problems, `${t0.toFixed(2)}s → ${t1.toFixed(2)}s`);
+  const bar = await page.evaluate(() => {
+    const el = document.getElementById('topProgressBar');
+    return { hidden: el.hidden, value: el.value };
+  });
+  const st = await storeState(page);
+  check(!bar.hidden && bar.value > 0 && st.previewDuration > 0, '試聽時頂端進度條顯示官方 currentTime／duration', problems, JSON.stringify({ bar, previewDuration: st.previewDuration }));
+
+  console.log('▶ 試聽：暫停 → 續播 → 暫停 → 重播…');
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+  await expectTransport(page, 'previewPaused', problems);
+  // 「暫停後時間停住」＝在合理時間內穩定下來，不是暫停那一刻的值不再變：官方的暫停是送訊息給 worklet 處理，這裡同時在跑
+  // MediaPipe，主執行緒／音訊執行緒忙的時候實測會晚到好幾百毫秒，worklet 每秒送一次的 sync 又會把顯示時間校正過去。
+  // 連續兩次讀值（相隔 500ms）差距 < 0.05s 就算穩定；真的沒停的話永遠穩定不下來。
+  let tp = await previewTime(page), stable = false;
+  for (const deadline = Date.now() + 8000; Date.now() < deadline;) {
+    await page.waitForTimeout(500);
+    const now = await previewTime(page);
+    if (Math.abs(now - tp) < 0.05) { stable = true; tp = now; break; }
+    tp = now;
+  }
+  check(stable, '暫停後試聽時間停住（暫停與 sync 校正幾秒內塵埃落定）', problems, `最後讀到 ${tp.toFixed(2)}s`);
+  await page.click('#btnPlay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 5000 });
+  const t3 = await waitForPreviewTimeAbove(page, tp + 0.4);
+  check(t3 > tp + 0.4 && t3 < tp + 5, '續播從暫停處繼續（不是從頭）', problems, `暫停在 ${tp.toFixed(2)}s、續播後 ${t3.toFixed(2)}s`);
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+  await page.click('#btnReplay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 5000 });
+  // 重播＝回到第一個音：時間要掉回開頭附近（官方 skipToFirstNoteOn，第一個音之前的空白不播）
+  let tr = Infinity;
+  for (const deadline = Date.now() + 5000; Date.now() < deadline && !(tr < t0 + 1.5); await page.waitForTimeout(100)) tr = await previewTime(page);
+  check(tr < t0 + 1.5, '重播回到開頭（第一個音附近）', problems, `重播前 ${t3.toFixed(2)}s、重播後 ${tr.toFixed(2)}s、第一次開始時 ${t0.toFixed(2)}s`);
+
+  console.log('▶ 試聽：再按 ♪ 離開，回到演奏…');
+  await page.click('#btnPreview');
+  await page.waitForFunction(() => !document.getElementById('btnPreview').classList.contains('is-current'), null, { timeout: 5000 });
+  await expectTransport(page, 'ready', problems);
+  const after = await storeState(page);
+  check(after.mode === 'perform' && !after.started && !after.finished, '離開試聽：演奏回到「已載入、還沒播過」', problems, JSON.stringify(after));
+  check((await previewTime(page)) === 0, '離開試聽：官方 Sequencer 已停（試聽時間歸零）', problems);
+  await page.waitForTimeout(300); // 讓 uiTick（200ms）把進度寫回
+  const barAfter = await page.evaluate(() => document.getElementById('topProgressBar').value);
+  check(barAfter < 0.001, '離開試聽：進度條歸零', problems, String(barAfter));
+}
+
+// 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → （試聽基本操作）→ 把第一個聲部指派給演奏者 1
+// → 按播放 → 暫停 → 重播，沿途逐一斷言四顆鈕的狀態。跟真實使用者操作路徑一致（見 index.html 的
+// data-field／data-action），不繞過 UI 直接呼叫內部函式（只有「載入中」「播完」兩種難以自然走到的狀態例外）。
 async function driveAppToPlaying(page, problems) {
   await expectTransport(page, 'idle', problems);
 
@@ -146,6 +277,8 @@ async function driveAppToPlaying(page, problems) {
   await page.waitForSelector('.score-part-id', { timeout: 10000 });
   await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 10000 });
   await expectTransport(page, 'ready', problems);
+
+  await drivePreviewControls(page, problems);
 
   console.log('▶ 把第一個聲部指派給演奏者 1…');
   await page.locator('.score-part-id').first().selectOption('1');
@@ -178,6 +311,222 @@ async function driveAppToPlaying(page, problems) {
   const finOk = beforeFinishedPlay > 1 && afterFinishedPlay < 0.1;
   console.log(`  ${finOk ? '✓' : '✗'} 播完後按 ▶ 從頭播（${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s）`);
   if (!finOk) problems.push(`播完後按 ▶ 沒有從頭播：${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s`);
+}
+
+// 試聽 vs 演奏（接在 driveAppToPlaying 後面，此時演奏正在播放）：播放中 ♪ 是灰的、暫停後按 ♪ 會
+// 結束演奏進度；試聽中的手勢觸發被忽略、改指派不影響試聽；離開試聽後 ▶ 重新載入、演奏從頭開始。
+async function drivePreviewVsPerformance(page, problems) {
+  console.log('▶ 試聽 vs 演奏：演奏播放中 ♪ 是灰的，暫停後按 ♪ 結束演奏進度…');
+  check(await page.evaluate(() => document.getElementById('btnPreview').disabled), '演奏播放中 ♪ 是灰的（要先暫停）', problems);
+  await waitForPositionAbove(page, 0.3); // 演奏進度要先走一小段，後面才看得出「歸零」
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+  const perfPos = await positionSeconds(page);
+  await page.click('#btnPreview');
+  await page.waitForSelector('#btnPreview.is-current', { timeout: 15000 });
+  const posAfter = await positionSeconds(page);
+  check(perfPos > 0.3 && posAfter === 0, '進入試聽＝演奏進度歸零（排程器已停）', problems, `${perfPos.toFixed(2)}s → ${posAfter.toFixed(2)}s`);
+
+  console.log('▶ 試聽中有手勢觸發、改指派…');
+  // 此時演奏者 1 還指派著第一個聲部：若手勢沒被忽略，排程器會被啟動
+  await page.evaluate(async () => {
+    (await import('/src/midi/midiPlayer.js')).setGesturePerformanceState({ arcTriggerSeqBySlot: { 1: 7 }, presentSlots: [1] });
+  });
+  const tA = await previewTime(page);
+  await page.waitForTimeout(500);
+  const perf = await page.evaluate(async () => {
+    const { humanPerformer } = await import('/src/midi/synth.js');
+    return { playing: humanPerformer.isPlaying(), pos: humanPerformer.getPositionSeconds() };
+  });
+  check(!perf.playing && perf.pos === 0, '試聽中的手勢觸發被忽略（排程器沒有被啟動）', problems, JSON.stringify(perf));
+  await page.locator('.score-part-id').first().selectOption('');
+  await page.waitForTimeout(300);
+  const tB = await previewTime(page);
+  check(tB > tA + 0.4 && (await storeState(page)).mode === 'preview', '試聽中改指派：不影響試聽（時間照走、仍在試聽中）', problems, `${tA.toFixed(2)}s → ${tB.toFixed(2)}s`);
+
+  console.log('▶ 離開試聽、▶ 重新載入演奏…');
+  await page.click('#btnPreview');
+  await page.waitForFunction(() => !document.getElementById('btnPreview').classList.contains('is-current'), null, { timeout: 5000 });
+  await expectTransport(page, 'ready', problems);
+  await page.click('#btnPlay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+  const pos = await waitForPositionAbove(page, 0.3);
+  check(pos > 0.3, '離開試聽後 ▶ 重新載入，演奏從頭開始往前走', problems, `${pos.toFixed(2)}s`);
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+}
+
+// 試聽播完：載入最小 MIDI（單音 2 秒）→ ♪ → 官方回報播完、uiTick 偵測到 → 「播完」狀態（▶ 從頭、↻ 可按、
+// ♪ 黃底）→ ▶ 從頭播（又播完）→ ↻ 重播（又播完）→ ♪ 離開。
+async function drivePreviewEndOfSong(page, problems) {
+  console.log('▶ 試聽播完：載入最小 MIDI（單音 2 秒）→ ♪ → 等官方回報播完…');
+  await loadLocalFile(page, TINY_MIDI);
+  await expectTransport(page, 'ready', problems);
+  const waitFinished = () => page.waitForFunction(() => window.__hf.store.state.finished === true, null, { timeout: 15000 });
+  const waitNotFinished = () => page.waitForFunction(() => window.__hf.store.state.finished === false, null, { timeout: 5000 });
+  await page.click('#btnPreview');
+  await waitFinished();
+  await page.waitForTimeout(150);
+  await expectTransport(page, 'previewFinished', problems);
+
+  console.log('▶ 試聽播完後：▶ 從頭播、↻ 重播…');
+  await page.click('#btnPlay');
+  await waitNotFinished();
+  await expectTransport(page, 'previewPlaying', problems); // 2 秒的歌，播放中這一刻一定看得到
+  await waitFinished();
+  await page.waitForTimeout(150);
+  await expectTransport(page, 'previewFinished', problems);
+  await page.click('#btnReplay');
+  await waitNotFinished();
+  await expectTransport(page, 'previewPlaying', problems);
+  await waitFinished();
+  await page.waitForTimeout(150);
+  await expectTransport(page, 'previewFinished', problems);
+  check(true, '播完後 ▶ 與 ↻ 都能再播一次、再播完', problems);
+
+  await page.click('#btnPreview');
+  await page.waitForFunction(() => !document.getElementById('btnPreview').classList.contains('is-current'), null, { timeout: 5000 });
+  await expectTransport(page, 'ready', problems);
+}
+
+// 試聽載入中換歌的 race：同一個 JS task 裡按 ♪，delayMs 之後（程式直接設 input.files＋change 事件，不經 Playwright
+// 往返，時間才準）換成另一個檔案。delay 掃過「還在讀位元組」「官方載入中」「剛開始播」各種時機，不論落在
+// 哪一種，最後都要：回到演奏、不在試聽、官方 Sequencer 已停、新來源是 ready。
+async function drivePreviewRaces(page, problems) {
+  console.log('▶ 試聽載入中換歌（race）：♪ 之後 0／15／60／150／400ms 換來源…');
+  const tinyBytes = [...TINY_MIDI.buffer];
+  for (const delayMs of [0, 15, 60, 150, 400]) {
+    await loadLocalFile(page, TINY_MIDI);
+    await page.evaluate(async ({ delay, bytes }) => {
+      document.getElementById('btnPreview').click();
+      await new Promise((r) => setTimeout(r, delay));
+      const input = document.getElementById('localMidiInput');
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([new Uint8Array(bytes)], `other-${delay}.mid`, { type: 'audio/midi' }));
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, { delay: delayMs, bytes: tinyBytes });
+    await page.waitForFunction(() => {
+      const s = window.__hf.store.state;
+      return s.transport === 'paused' && !s.busy && s.source?.name.startsWith('other-');
+    }, null, { timeout: 15000 });
+    await page.waitForTimeout(250);
+    const st = await storeState(page);
+    const t = await previewTime(page);
+    const cur = await page.evaluate(() => document.getElementById('btnPreview').classList.contains('is-current'));
+    check(st.mode === 'perform' && !cur && t === 0 && !st.busy && st.notice === null && !st.started && !st.finished,
+      `♪ 後 ${delayMs}ms 換歌：回到演奏、試聽已停、新來源 ready`, problems, JSON.stringify({ ...st, previewTime: t, accent: cur }));
+  }
+  // 試聽中換歌（已經在播）：換到另一個檔案會立刻停掉試聽
+  await loadLocalFile(page, TINY_MIDI);
+  await page.click('#btnPreview');
+  await page.waitForSelector('#btnPreview.is-current', { timeout: 15000 });
+  await loadLocalFile(page, { ...TINY_MIDI, name: 'other-while-playing.mid' });
+  const st = await storeState(page);
+  check(st.mode === 'perform' && (await previewTime(page)) === 0, '試聽播放中換歌：立刻停掉試聽、回到演奏', problems, JSON.stringify(st));
+}
+
+// 試聽錯誤路徑：餵官方解析器壞掉的位元組 → 頂端提示、回到演奏「已載入、還沒播過」（♪ 仍可按）。
+async function drivePreviewBadBytes(page, problems) {
+  console.log('▶ 試聽錯誤路徑：餵壞掉的位元組（不是 MIDI）…');
+  const hits = await expectConsole([/分譜解析失敗/, /官方播放器無法解析/, /Invalid|MThd|not a|midi/i], async () => {
+    await loadLocalFile(page, { name: 'bad.mid', mimeType: 'audio/midi', buffer: Buffer.from('this is definitely not a standard midi file') });
+    await expectTransport(page, 'ready', problems);
+    await page.click('#btnPreview');
+    await page.waitForFunction(() => document.getElementById('midiStatusText').textContent === '官方播放器無法解析這首 MIDI', null, { timeout: 15000 });
+    await page.waitForTimeout(300);
+  });
+  await expectTransport(page, 'ready', problems);
+  const st = await storeState(page);
+  check(st.mode === 'perform' && !st.busy, '官方解析失敗：留在演奏、不卡在載入中', problems, JSON.stringify(st));
+  check([...hits.values()][1] > 0, '官方解析失敗有留下 console.warn 方便追查', problems, JSON.stringify([...hits]));
+}
+
+// 播放列狀態表窮舉：直接改 store，2（模式）× 4（transport）× 2（started）× 2（finished）× 2（busy）＝64 種組合，
+// 每一種都對照「獨立寫的期望」比對四顆鈕的灰亮、黃底與 pill 的 is-empty；而且每顆灰掉的鈕，直接呼叫它的 action
+// 都必須什麼都不做（防呆不只靠 disabled 一道擋）。期望表照 CLAUDE.md 的狀態表逐列寫成資料，不重用被測的函式。
+async function driveTransportTable(page, problems) {
+  console.log('▶ 播放列狀態表窮舉（64 種 store 組合 × 4 顆鈕灰亮／黃底／action 防呆）…');
+  const bad = await page.evaluate(async () => {
+    const { playerStore, actions } = await import('/src/midi/midiPlayer.js');
+    // 期望表：[▶, ❚❚, ↻, ♪] 能不能按；accent＝黃底的鈕；empty＝pill 的 is-empty。
+    const ROW = {
+      none:           { can: [0, 0, 0, 0], accent: [], empty: true },                    // 沒有歌／載入中
+      busy:           { can: [0, 0, 0, 0], accent: [], empty: false },                   // 載入／續播／重播處理中
+      performReady:   { can: [1, 0, 0, 1], accent: [], empty: false },                   // 演奏：已載入、還沒播
+      performPlaying: { can: [0, 1, 0, 0], accent: ['btnPause'], empty: false },         // 演奏：播放中（♪ 灰）
+      performPaused:  { can: [1, 0, 1, 1], accent: [], empty: false },                   // 演奏：暫停／播完
+      previewPlaying: { can: [0, 1, 0, 1], accent: ['btnPause', 'btnPreview'], empty: false },
+      previewPaused:  { can: [1, 0, 1, 1], accent: ['btnPreview'], empty: false },       // 試聽：暫停／播完
+    };
+    const expectedRow = (s) => {
+      if (s.transport === 'idle' || s.transport === 'loading') return ROW.none;
+      if (s.busy) return ROW.busy;
+      if (s.mode === 'preview') return s.transport === 'playing' ? ROW.previewPlaying : ROW.previewPaused;
+      if (s.transport === 'playing') return ROW.performPlaying;
+      return (s.started || s.finished) ? ROW.performPaused : ROW.performReady;
+    };
+    const ids = ['btnPlay', 'btnPause', 'btnReplay', 'btnPreview'];
+    const names = ['play', 'pause', 'replay', 'preview'];
+    const frames = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const snapshot = () => JSON.stringify(['mode', 'transport', 'started', 'finished', 'busy', 'notice'].map((k) => playerStore.state[k]));
+    const bad = [];
+    for (const mode of ['perform', 'preview'])
+      for (const transport of ['idle', 'loading', 'paused', 'playing'])
+        for (const started of [false, true])
+          for (const finished of [false, true])
+            for (const busy of [false, true]) {
+              const s = { mode, transport, started, finished, busy };
+              playerStore.set(s);
+              await frames();
+              const want = expectedRow(s);
+              const label = JSON.stringify(s);
+              ids.forEach((id, i) => {
+                const el = document.getElementById(id);
+                if (!el.disabled !== Boolean(want.can[i])) bad.push(`${label}：${id} 預期${want.can[i] ? '可按' : '灰'}`);
+                if (el.classList.contains('is-current') !== want.accent.includes(id)) bad.push(`${label}：${id} 黃底預期 ${want.accent.includes(id)}`);
+              });
+              if (document.getElementById('toolbar-playback').classList.contains('is-empty') !== want.empty) bad.push(`${label}：is-empty 預期 ${want.empty}`);
+              // 灰掉的鈕：action 被直接呼叫也必須是 no-op
+              const before = snapshot();
+              names.forEach((name, i) => { if (!want.can[i]) actions[name](); });
+              if (snapshot() !== before) bad.push(`${label}：灰掉的鈕被 action 直接呼叫後 store 變了 ${before} → ${snapshot()}`);
+            }
+    playerStore.set({ mode: 'perform', transport: 'paused', started: false, finished: false, busy: false });
+    return bad;
+  });
+  check(bad.length === 0, '64 種狀態組合的按鈕灰亮／黃底／action 防呆都符合狀態表', problems, bad.slice(0, 5).join('；'));
+}
+
+// 引擎壞掉時按 ♪：另開一個頁面把 spessasynth 的 CDN 網址擋掉，開機的暖機失敗（app 照常可用），選好歌按
+// ♪ → 頂端提示「音源引擎載入失敗」、回到演奏「已載入、還沒播過」，♪ 仍可按（再按會重試）。
+async function drivePreviewEngineFailure(browser, problems) {
+  console.log('▶ 試聽錯誤路徑：音源引擎載入失敗時按 ♪（另開頁面、擋掉 spessasynth CDN）…');
+  const page = await browser.newPage();
+  const stray = [];
+  const EXPECTED = [/MIDI 引擎初始化失敗/, /Failed to load resource/, /net::ERR/, /Failed to fetch dynamically imported module/];
+  page.on('console', (msg) => {
+    const text = msg.text();
+    if (isBenign(text) || EXPECTED.some((re) => re.test(text))) return;
+    if (msg.type() === 'error' || msg.type() === 'warning') stray.push(`console.${msg.type()}: ${text}`);
+  });
+  page.on('pageerror', (err) => stray.push(`pageerror: ${err.message}`));
+  try {
+    await page.route('**/spessasynth_lib@latest/**', (route) => route.abort());
+    await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load' });
+    await page.waitForFunction(() => !document.getElementById('app-shell')?.inert, { timeout: 30000 });
+    await page.setInputFiles('#localMidiInput', SAMPLE_MIDI);
+    await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 10000 });
+    await page.click('#btnPreview');
+    await page.waitForFunction(() => document.getElementById('midiStatusText').textContent === '⚠️ 音源引擎載入失敗', null, { timeout: 15000 });
+    await page.waitForTimeout(200);
+    await expectTransport(page, 'ready', problems);
+    const st = await storeState(page);
+    check(st.mode === 'perform' && !st.busy, '引擎壞了按 ♪：留在演奏、不卡在載入中、♪ 仍可按（再按會重試）', problems, JSON.stringify(st));
+  } finally {
+    await page.close();
+  }
+  check(stray.length === 0, '引擎載入失敗的頁面沒有預期之外的 console error／warning／pageerror', problems, stray.join('；'));
 }
 
 // 差異測試（test/unit/oracle.test.mjs）用的是 devDependency 釘住版本的 spessasynth_core；app 走 CDN 的
@@ -217,6 +566,8 @@ async function main() {
     const text = msg.text();
     if (isBenign(text)) return; // 不印、不計入——瀏覽器/驅動層雜訊，不是這個 app 的訊號
     console.log(`  [console.${type}] ${text}`);
+    const expected = tolerated.patterns.find((re) => re.test(text));
+    if (expected) { tolerated.hits.set(expected, tolerated.hits.get(expected) + 1); return; } // 錯誤路徑測試預期的訊息
     if (type === 'error' || type === 'warning') problems.push(`console.${type}: ${text}`);
   });
   page.on('pageerror', (err) => {
@@ -233,8 +584,15 @@ async function main() {
     console.log('▶ 等待載入完成（#app-shell 解除 inert）…');
     await page.waitForFunction(() => !document.getElementById('app-shell')?.inert, { timeout: 20000 });
     console.log('▶ 載入完成，app 已可互動');
+    await exposeModules(page);
 
     await driveAppToPlaying(page, problems);
+    await drivePreviewVsPerformance(page, problems);
+    await drivePreviewEndOfSong(page, problems);
+    await drivePreviewRaces(page, problems);
+    await drivePreviewBadBytes(page, problems);
+    await driveTransportTable(page, problems);
+    await drivePreviewEngineFailure(browser, problems);
 
     console.log(`▶ 靜置觀察 ${args.duration}ms，收集 console 訊息…`);
     await page.waitForTimeout(args.duration);

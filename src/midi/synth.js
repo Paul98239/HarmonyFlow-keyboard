@@ -2,8 +2,10 @@
 //  synth.js — spessasynth 合成器：兩個合成器（電腦輔助聲部 synth／真人聲部 synthHuman）、humanGain
 //  閘門＋音量凸顯。純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
 //
-//  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（排程器）送來的個別
-//  noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。
+//  演奏不用 Sequencer：兩個合成器都只接收 humanPerformer.js（排程器）送來的個別
+//  noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。試聽才用官方 Sequencer
+//  （previewPlayer.js 包裝，走電腦輔助那個合成器 synth），跟演奏互斥：兩者共用 synth 的 channel，
+//  任何一邊開始之前都先 flushPreviousSong() 把另一邊停掉。
 //
 //  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值；沒被自己的演奏者
 //  揮過手的聲部就是靜音（見 humanPerformer.js 的說明）。沒被指派的聲部固定走 synth，跟指派
@@ -13,6 +15,7 @@
 // ============================================================
 
 import { HumanPerformer } from './humanPerformer.js';
+import { PreviewPlayer } from './previewPlayer.js';
 
 /* ═══════════════════════════════════════════
    常數
@@ -62,6 +65,10 @@ let initPromise = null;
 let isSongLoaded = false;
 let isProcessingPlay = false;
 let lastGateTarget = -1;
+// 試聽：官方 Sequencer 類別在 initEngine() 跟 WorkletSynthesizer 一起從同一個套件取得（缺少只讓試聽
+// 不能用，不拖累演奏）；PreviewPlayer 第一次試聽才建立。previewUsed＝官方 Sequencer 動過合成器的
+// 狀態，下一次 flushPreviousSong() 要多做一次完整重設。
+let SequencerClass, previewPlayer = null, previewUsed = false;
 
 // 拍級事件驅動排程器（humanPerformer.js）：驅動 synth（未指派聲部，反應式播放）與
 // synthHuman（指派聲部，接手才發聲），由播放器的 12ms 排程 tick 呼叫 tick()。
@@ -102,8 +109,9 @@ export async function initEngine() {
 
   initPromise = (async () => {
     try {
-      const { WorkletSynthesizer } = await import(/* @vite-ignore */ LIB_ESM_URL);
+      const { WorkletSynthesizer, Sequencer } = await import(/* @vite-ignore */ LIB_ESM_URL);
       if (!WorkletSynthesizer) throw new Error('缺少必要匯出');
+      SequencerClass = Sequencer;
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
       await audioCtx.audioWorklet.addModule(WORKLET_URL);
@@ -181,11 +189,15 @@ export async function initEngine() {
   return initPromise;
 }
 
-// 換歌／換指派前的清場：收掉排程器與殘響，bank／program 歸零（鼓組 channel 跳過：那裡的
-// program 是鼓組編號，不是旋律音色）。
+// 換歌／換指派／進出試聽前的清場：收掉排程器、試聽與殘響，bank／program 歸零（鼓組 channel 跳過：
+// 那裡的 program 是鼓組編號，不是旋律音色）。
 export function flushPreviousSong() {
   humanPerformer.stop();
+  previewPlayer?.stop();
   isSongLoaded = false;
+  // 官方 Sequencer 載入與跳時間時會自己重設合成器、依那首歌改各 channel 的音色／音量／聲像；
+  // 離開試聽時整個重設回預設，之後的演奏才不會繼承那首歌的設定。
+  if (previewUsed && synth) { synth.reset(); previewUsed = false; }
   for (const s of [synth, synthHuman]) {
     if (!s) continue;
     for (let ch = 0; ch < channelCountOf(s); ch++) {
@@ -237,6 +249,37 @@ export function pause() {
 export function isLoaded() { return isSongLoaded; }
 export function isPaused() { return !isSongLoaded || !humanPerformer.isPlaying(); }
 export function isFinished() { return isSongLoaded && humanPerformer.isFinished(); }
+
+/* ═══════════════════════════════════════════
+   試聽（官方 Sequencer，見 previewPlayer.js）
+   ═══════════════════════════════════════════ */
+// 開始試聽：bytes 是 MIDI 檔的原始位元組，官方自己解析，不經過 midiParser.js。先清場（演奏與上一次
+// 試聽都結束），載入完成就從第一個音開始播；失敗丟帶 kind 的 Error：engine＝引擎沒就緒，parse／
+// timeout／aborted 見 previewPlayer.js。resolve 時已經在播。
+const engineError = (message) => Object.assign(new Error(message), { kind: 'engine' });
+export async function startPreview(bytes) {
+  if (!isReady && !(await initEngine())) throw engineError('音源引擎載入失敗');
+  if (!SequencerClass) throw engineError('音源引擎缺少 Sequencer');
+  flushPreviousSong();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  previewPlayer ??= new PreviewPlayer(() => new SequencerClass(synth));
+  previewUsed = true;
+  await previewPlayer.start(bytes);
+}
+export function pausePreview() { previewPlayer?.pause(); }
+// 續播／從頭跟 play()／restart() 一樣先確保 AudioContext 已恢復；await 期間若換歌（試聽已被 stop），
+// PreviewPlayer 自己會忽略這次續播。
+export async function resumePreview() {
+  if (audioCtx?.state === 'suspended') await audioCtx.resume();
+  previewPlayer?.resume();
+}
+export async function restartPreview() {
+  if (audioCtx?.state === 'suspended') await audioCtx.resume();
+  previewPlayer?.restart();
+}
+export function previewTime() { return previewPlayer?.time ?? 0; }
+export function previewDuration() { return previewPlayer?.duration ?? 0; }
+export function isPreviewFinished() { return previewPlayer?.finished ?? false; }
 
 // humanGain 是總開關兼音量凸顯：播放器算好「該不該開」（播放中、沒播完、真的有指派），這裡
 // 只負責平滑地切上去（到 HUMAN_EMPHASIS_GAIN，比電腦輔助軌的固定基準大聲）／切下來（到 0）；
