@@ -2,12 +2,12 @@
 //  synth.js — spessasynth 合成器：兩個合成器（電腦輔助聲部 synth／真人聲部 synthHuman）、humanGain
 //  閘門＋音量凸顯。純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
 //
-//  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（拍級事件驅動排程器）送來的個別
+//  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（排程器）送來的個別
 //  noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。
 //
 //  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值；沒被自己的演奏者
-//  觸發過、也沒有代打銜接的聲部就是靜音（見 humanPerformer.js 的代打說明）。沒被指派的聲部
-//  固定走 synth，不受任何人觸發影響，反應式播放。humanGain 開啟時的目標值刻意設在 1.0 以上
+//  揮過手的聲部就是靜音（見 humanPerformer.js 的說明）。沒被指派的聲部固定走 synth，跟指派
+//  聲部共用同一個樂譜時鐘，同一刻的音同時發聲。humanGain 開啟時的目標值刻意設在 1.0 以上
 //  （`HUMAN_EMPHASIS_GAIN`），讓使用者控制的聲部整體比電腦輔助的聲部更突出；電腦輔助那一軌
 //  固定不掛額外 gain，是這個音量對比的基準，不會跟著被調小聲。
 // ============================================================

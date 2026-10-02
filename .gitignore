@@ -10,3 +10,5 @@ docs/
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
+# 曲庫全掃用的本機快取（test/tools/library-scan.mjs --download 下載的 .mid），不進 git
+test/tools/library/

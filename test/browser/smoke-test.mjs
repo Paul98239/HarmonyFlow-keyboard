@@ -109,6 +109,17 @@ const setStore = (page, patch) => page.evaluate(async (p) => {
 }, patch).then(() => page.waitForTimeout(80));
 const positionSeconds = (page) => page.evaluate(async () =>
   (await import('/src/midi/synth.js')).humanPerformer.getPositionSeconds());
+// 輪詢到進度超過 seconds 才回傳（逾時就回傳目前的值，讓後面的斷言報出實際數字）。排程 tick 被主執行緒卡住時，
+// 樂譜時鐘每個 tick 最多只前進 100ms（見 humanPerformer.js 的 MAX_TICK_DT_SEC），headless Chromium 跑 MediaPipe 時
+// 進度會比真實時間慢，所以不能用固定睡眠估計進度。
+async function waitForPositionAbove(page, seconds, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pos = await positionSeconds(page);
+    if (pos > seconds || Date.now() > deadline) return pos;
+    await page.waitForTimeout(250);
+  }
+}
 // 在頁面內同一個 JS task 裡按下按鈕並立刻讀排程器位置：click 事件與排程器的重設都是同步做的，讀到的
 // 就是「剛重設」的值，不受 Playwright 往返延遲影響（無頭瀏覽器同時跑 MediaPipe 時，往返動輒一秒，
 // 進度在讀取前又走了一段）。
@@ -144,8 +155,7 @@ async function driveAppToPlaying(page, problems) {
   await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
   await expectTransport(page, 'playing', problems);
 
-  await page.waitForTimeout(2500); // 電腦輔助的聲部照實時播前奏，進度會往前走
-  const before = await positionSeconds(page);
+  const before = await waitForPositionAbove(page, 1); // 電腦輔助的聲部播前奏，進度會往前走
 
   console.log('▶ 暫停、再按重播…');
   await page.click('#btnPause');
@@ -162,8 +172,7 @@ async function driveAppToPlaying(page, problems) {
   await expectTransport(page, 'loading', problems);
   await setStore(page, { transport: 'paused', finished: true });
   await expectTransport(page, 'finished', problems);
-  await page.waitForTimeout(1500);
-  const beforeFinishedPlay = await positionSeconds(page);
+  const beforeFinishedPlay = await waitForPositionAbove(page, 1);
   const afterFinishedPlay = await clickAndReadPosition(page, 'btnPlay'); // 播完後按 ▶＝從頭播
   await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
   const finOk = beforeFinishedPlay > 1 && afterFinishedPlay < 0.1;

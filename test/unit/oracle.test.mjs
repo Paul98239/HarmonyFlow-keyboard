@@ -158,6 +158,9 @@ const FIXTURES = {
   // 第一個 note-on 之後用 running status 省略狀態位元組，並用「力度 0 的 note-on」當 note-off。
   'running status 與力度 0 的 note-off': smf(1, 480, mtrk(tempoEv(0, 500000),
     ev(0, 0x90, 60, 100), ev(480, 60, 0), ev(0, 62, 90), ev(480, 62, 0), ev(0, 64, 80), ev(480, 64, 0))),
+  // 同一份樂譜（3 顆音、起訖時間與力度都一樣），結束改用 Note Off（0x80）寫。
+  '同一份樂譜改用 Note Off（0x80）': smf(1, 480, mtrk(tempoEv(0, 500000),
+    ev(0, 0x90, 60, 100), ev(480, 0x80, 60, 0), ev(0, 0x90, 62, 90), ev(480, 0x80, 62, 0), ev(0, 0x90, 64, 80), ev(480, 0x80, 64, 0))),
   // 同音高重疊：官方與解析層都是先進先出，(0→480)、(240→720)。
   '同音高重疊（先進先出）': smf(1, 480, mtrk(tempoEv(0, 500000),
     ev(0, 0x90, 60, 100), ev(240, 0x90, 60, 90), ev(240, 0x80, 60, 0), ev(240, 0x80, 60, 0))),
@@ -316,20 +319,32 @@ for (const name of sampleAssets) {
   });
 }
 
-await runKnownDiff('L2 整首自動播放：每個 note-on 都有一個 note-off（官方合成器對同音高重疊是先進先出，少一個就會卡音）',
-  '排程器的 sounding 以音高為鍵＋自己的 tick 量化，讓同音高的下一顆在前一顆 note-off 之前發聲、note-off 遺失；WP-2 改成每音高 FIFO 佇列', async () => {
-    const ab = readAsset('canon-violin-cello.mid');
-    const log = autoPlay(parseMidi(ab));
-    const on = log.filter((e) => e.kind === 'noteOn').length, off = log.filter((e) => e.kind === 'noteOff').length;
-    assert(on === off, `note-on ${on} 個、note-off ${off} 個（少 ${on - off} 個＝官方合成器裡會卡住的音）`);
+// 「成對」以音為單位：排程器送給合成器的 noteOn 與 noteOff 次數相同、一一對應（官方合成器對同音高重疊是先進先出，
+// 少一個 noteOff 就會卡音）。原檔把音的結束寫成 Note Off 還是 velocity 0 的 Note On，parser 都配成同一顆音。
+for (const name of sampleAssets) {
+  await run(`L2 整首自動播放：${name} 送給合成器的 noteOn 與 noteOff 一一對應，而且不送 velocity 0 的 noteOn`, async () => {
+    const log = autoPlay(parseMidi(readAsset(name)));
+    const ons = log.filter((e) => e.kind === 'noteOn'), offs = log.filter((e) => e.kind === 'noteOff');
+    assert(ons.length === offs.length, `noteOn ${ons.length} 個、noteOff ${offs.length} 個（少 ${ons.length - offs.length} 個＝官方合成器裡會卡住的音）`);
+    assert(ons.every((e) => e.vel >= 1), '送出了 velocity 0 的 noteOn：合成器會把它當成 note-off');
   });
+}
 
-await runKnownDiff('L2 整首自動播放：收音時間跟官方一致（容許兩個 tick＝25ms）',
-  '同上：note-off 遺失使配對錯位；WP-2 修正後改成 run()', async () => {
-    const ab = readAsset('canon-violin-cello.mid');
+await run('L2 整首自動播放：原檔用 velocity 0 的 note-on 當 note-off，跟用 Note Off（0x80）寫的同一份樂譜，排程器送出完全相同的事件', async () => {
+  const viaVelocity0 = autoPlay(parseMidi(FIXTURES['running status 與力度 0 的 note-off']));
+  const viaNoteOff = autoPlay(parseMidi(FIXTURES['同一份樂譜改用 Note Off（0x80）']));
+  const summary = (log) => log.filter((e) => e.kind === 'noteOn' || e.kind === 'noteOff').map((e) => `${e.kind}:${e.key}@${e.sec.toFixed(3)}`);
+  assert(summary(viaVelocity0).length === 6, `3 顆音要有 3 個 noteOn、3 個 noteOff，實際 ${summary(viaVelocity0)}`);
+  assert(summary(viaVelocity0).join() === summary(viaNoteOff).join(), `兩種編碼的結果應該相同：\n    ${summary(viaVelocity0)}\n    ${summary(viaNoteOff)}`);
+});
+
+for (const name of sampleAssets) {
+  await run(`L2 整首自動播放：${name} 的收音時間跟官方一致（容許一個 tick＝12ms）`, async () => {
+    const ab = readAsset(name);
     const { events } = await officialPlayback(ab);
-    assertNotesMatch(pairOfficialNotes(events), notesOfLog(autoPlay(parseMidi(ab))), { channelOf: ignoreChannel, tolStartMs: 12.5, tolEndMs: 25 });
+    assertNotesMatch(pairOfficialNotes(events), notesOfLog(autoPlay(parseMidi(ab))), { channelOf: ignoreChannel, tolStartMs: 12.5, tolEndMs: 12.5 });
   });
+}
 
 await run('L2 音色狀態：每顆音發聲當下，它的 channel 上的 program 與 CC7／10／91／93 跟官方一致（canon 的 CC 都是預設值）', async () => {
   const ab = readAsset('canon-violin-cello.mid');
@@ -370,14 +385,14 @@ await run('L2 完美演奏者（×1）：音高、力度、顆數跟官方一致
   assertNotesMatch(withoutEnds(pairOfficialNotes(events)).map((n) => ({ ...n, start: 0 })), withoutEnds(notesOfLog(perform(score, [cello.id], 1).log)).map((n) => ({ ...n, start: 0 })), { channelOf: ignoreChannel });
 });
 
-await runKnownDiff('L2 完美演奏者（×1）：每顆音都在官方時間之後 0～26ms 內發聲',
-  '指派聲部的相連音要等前一顆音「自然收音」才能發聲，而自然收音是從發聲那一刻起算、又被 12ms tick 量化，每個全音符多 ~10ms，整個合奏越拖越晚（最多約 170ms）；WP-2 讓相連音不擋觸發', async () => {
-    const { events } = await officialPlayback(readAsset('canon-violin-cello.mid'));
-    const { score, cello } = canonPerformer();
-    // 第一次揮手落在第 12ms，各拍再加一個 tick 的量化，所以整體比官方晚 12～26ms。
-    const official = pairOfficialNotes(events).map((n) => ({ ...n, start: n.start + 0.012, end: null }));
-    assertNotesMatch(official, withoutEnds(notesOfLog(perform(score, [cello.id], 1).log)), { channelOf: ignoreChannel, tolStartMs: 14.5 });
-  });
+await run('L2 完美演奏者（×1）：每顆音都在官方時間之後 0～26ms 內發聲、收音也是（揮手本身比官方晚 12ms 再加 tick 量化）', async () => {
+  const { events } = await officialPlayback(readAsset('canon-violin-cello.mid'));
+  const { score, cello } = canonPerformer();
+  // 第一次揮手落在第 12ms，各拍再加一個 tick 的量化，所以整體比官方晚 12～26ms。相連音要等後繼音放行才收，
+  // 收音也跟著揮手走。
+  const official = pairOfficialNotes(events).map((n) => ({ ...n, start: n.start + 0.012, end: n.end == null ? null : n.end + 0.012 }));
+  assertNotesMatch(official, notesOfLog(perform(score, [cello.id], 1).log), { channelOf: ignoreChannel, tolStartMs: 14.5, tolEndMs: 14.5 });
+});
 
 /* ═══════════════════════════════════════════
    L3 同步不變量（不靠官方）
@@ -398,12 +413,11 @@ function simultaneityReport(speed) {
 }
 
 for (const speed of [1, 1.3, 0.8]) {
-  await runKnownDiff(`L3 同步：演奏者速度 ×${speed}，同一樂譜時刻的指派音與電腦輔助音實際發聲差 ≤ 12ms，且輔助音不早於該拍揮手`,
-    '①電腦輔助聲部用含等號的邊界先響下一拍的第一顆音（慢的演奏者）②指派聲部的相連音排隊鏈讓它越來越晚（準時的演奏者也會）；WP-2 修正後改成 run()', async () => {
-      const r = simultaneityReport(speed);
-      assert(r.pairs > 30, `前提：要有足夠的配對（實際 ${r.pairs} 對）`);
-      assert(r.maxAbs <= 12.5 && r.earlyAssist === 0, `${r.pairs} 對中最大發聲差 ${r.maxAbs.toFixed(0)}ms；${r.earlyAssist} 顆輔助音比該拍揮手早出聲`);
-    });
+  await run(`L3 同步：演奏者速度 ×${speed}，同一樂譜時刻的指派音與電腦輔助音實際發聲差 ≤ 12ms，且輔助音不早於該拍揮手`, async () => {
+    const r = simultaneityReport(speed);
+    assert(r.pairs > 30, `前提：要有足夠的配對（實際 ${r.pairs} 對）`);
+    assert(r.maxAbs <= 12.5 && r.earlyAssist === 0, `${r.pairs} 對中最大發聲差 ${r.maxAbs.toFixed(0)}ms；${r.earlyAssist} 顆輔助音比該拍揮手早出聲`);
+  });
 }
 
 console.log('\n全部測試跑完。');
