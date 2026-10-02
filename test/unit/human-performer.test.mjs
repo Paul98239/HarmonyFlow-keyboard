@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parseMidi } from '../../src/midi/midiParser.js';
-import { HumanPerformer } from '../../src/midi/humanPerformer.js';
+import { HumanPerformer, rateSample, smoothRate } from '../../src/midi/humanPerformer.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CANON_PATH = join(__dirname, '../../src/assets/canon-violin-cello.mid');
@@ -182,13 +182,17 @@ run('前奏：第一下揮手不追趕——電腦輔助照原速播完前奏，
 });
 
 run('收音依樂譜時鐘：慢的演奏者每次停格，長音也跟著時鐘等，不是發聲後各自倒數', () => {
-  // 拍 0 的 2.0s 長音（後面 1 拍以上才有下一顆音，不是相連音）。演奏者每 744ms 揮一次（樂譜每拍 500ms，每拍停格 244ms）。
-  // 時鐘走完 2.0s 要第 4 次揮手（2256ms）後再走 500ms：S 在 2748ms 的 tick 追上長音的結尾。
-  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 2.0 }, { beat: 5 }] }), [['p0', 1]]);
-  d.tick();
-  for (let k = 0; k < 4; k++) { d.wave(); d.runMs(732); }
-  d.runMs(800);
-  assert(Math.abs(offMs(log, 40) - 2748) <= 2 * TICK_MS, `長音應該在時鐘走到結尾（約 2748ms）才收，實際 ${offMs(log, 40)}ms`);
+  // 拍 0 的 2.0s 長音（後面 1 拍以上才有下一顆音，不是相連音）。演奏者每 744ms 揮一次（樂譜每拍 500ms，每拍停格一段）：
+  // 第 4 次揮手（2256ms）才放行拍 3，時鐘最早在那之後才走得到 2.0s；發聲後倒數 2.0s 的做法會在 2036ms 左右就收掉。
+  // 時鐘走多快取決於速度估計，所以不寫死絕對時間，只要求「長音恰好在時鐘走到結尾的那個 tick 收」。
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 2.0 }, { beat: 5 }] }), [['p0', 1]]);
+  let reached = null;                               // 時鐘第一次走到 2.0s 的 tick
+  const step = () => { d.tick(); if (reached === null && hp.getPositionSeconds() >= 2.0 - 1e-9) reached = d.nowMs; };
+  step();
+  for (let k = 0; k < 4; k++) { d.trigger(); step(); for (let i = 1; i < 62; i++) step(); }
+  for (let i = 0; i < 100; i++) step();
+  assert(reached !== null && reached > 2256, `時鐘最早在第 4 次揮手（2256ms）之後才走得到 2.0s，實際 ${reached}ms`);
+  assert(offMs(log, 40) === reached, `長音應該在時鐘走到結尾的那個 tick（${reached}ms）收，實際 ${offMs(log, 40)}ms`);
 });
 
 run('同音高重疊（先進先出）：兩顆同音高的重疊音各送一次 note-off，不留卡音', () => {
@@ -302,6 +306,147 @@ run('暫停會收掉所有還在響的音（含撐住的），不留下掛著的
   assert(!log.some((e) => e.t === 'off'), '前提：A 還被撐著');
   hp.pause();
   assert(log.filter((e) => e.t === 'off' && e.note === 40).length === 1, '暫停要對撐住的音送 noteOff');
+});
+
+/* ═══════════════════════════════════════════
+   速度跟隨：兩次真人揮手的間隔 → 速度倍率 r（演奏者的速度是原譜速度的幾倍），樂譜時鐘照 r 前進
+   ═══════════════════════════════════════════ */
+
+const near = (a, b, tol) => Math.abs(a - b) <= tol;
+
+run('速度取樣：兩次揮手之間樂譜走的秒數 ÷ 真實經過的秒數；範圍外（停頓、同一個動作偵測成兩次）不當速度', () => {
+  // [樂譜秒, 真實秒, 預期]，手算。範圍是原譜速度的 0.25～4 倍，邊界含在內。
+  const cases = [
+    [0.5, 0.5, 1], [0.5, 0.4, 1.25], [0.5, 0.8, 0.625],
+    [0.5, 2.0, 0.25], [2.0, 0.5, 4],                                    // 剛好在範圍邊界
+    [0.5, 2.5, null], [0.5, 0.1, null],                                 // 0.2 倍（停頓）、5 倍（重複偵測）
+    [0.5, 0, null], [0.5, -1, null], [0, 0.5, null],                    // 零或負的間隔、樂譜沒有往前走
+  ];
+  for (const [scoreSec, realSec, want] of cases) {
+    const got = rateSample(scoreSec, realSec);
+    assert(want === null ? got === null : got !== null && near(got, want, 1e-9),
+      `rateSample(${scoreSec}, ${realSec}) 應為 ${want}，實際 ${got}`);
+  }
+});
+
+run('速度平滑在對數域：快兩倍與慢一半對稱、取樣等於估計時不動、持續的新速度幾次就跟上', () => {
+  // 手算：2^0.35 = 1.2746（算術平均會是 1.35，把「快兩倍」估得比「慢一半」更極端）。
+  assert(near(smoothRate(1, 2), 1.2746, 1e-3), `smoothRate(1, 2) 應為 1.2746，實際 ${smoothRate(1, 2)}`);
+  assert(near(smoothRate(1, 2) * smoothRate(1, 0.5), 1, 1e-9), '加倍與減半要對稱（乘起來回到 1）');
+  assert(near(smoothRate(1.3, 1.3), 1.3, 1e-12), '取樣等於目前估計時，估計不動');
+  let r = 1;
+  for (let i = 0; i < 5; i++) r = smoothRate(r, 2);                     // 2^(1 − 0.65^5) = 1.845
+  assert(near(r, 1.845, 5e-3), `連續 5 次取樣 2，估計應該到 1.845，實際 ${r}`);
+});
+
+// 每拍都有音的聲部：代打不會替他走（下一拍就有他的音），所以下面這些測試只受「揮手 → 估計 → 時鐘速度」影響。
+const everyBeat = (n) => Array.from({ length: n }, (_, i) => i);
+// 揮 count 次手，每次間隔 intervalTicks 個 tick（12ms）；回傳每次揮手的假時間。
+function waveSteadily(d, count, intervalTicks) {
+  const times = [];
+  for (let k = 0; k < count; k++) { times.push(d.wave()); for (let i = 1; i < intervalTicks; i++) d.tick(); }
+  return times;
+}
+
+run('揮得比樂譜快 26％（每 33 個 tick＝396ms 一次，樂譜每拍 500ms）：估計跟上，之後每顆音都在揮手那個 tick 發聲', () => {
+  // 沒有估計時時鐘每拍落後約 100ms、要靠追趕補，音晚約 50ms 才發聲；估計到位後，時鐘剛好在下一次揮手時走到拍尾。
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: everyBeat(20) }), [['p0', 1]]);
+  d.tick();
+  const waveMs = waveSteadily(d, 16, 33);
+  const want = 0.5 / 0.396;                                             // 手算：1.2626
+  assert(near(hp._playbackRate, want, want * 0.02), `速度倍率應該到 ${want.toFixed(3)} 左右，實際 ${hp._playbackRate}`);
+  for (let k = 8; k < 16; k++) {
+    const late = onMs(log, 40 + k) - waveMs[k];
+    assert(late <= TICK_MS, `第 ${k} 拍的音應該在揮手那個 tick 發聲（估計早已到位），實際晚 ${late}ms`);
+  }
+});
+
+run('停頓不當成速度：幾秒沒揮手之後的第一下揮手，估計不被拉走；之後的取樣照常', () => {
+  const { hp, d } = makeHp(buildBeatScore({ p0: everyBeat(30) }), [['p0', 1]]);
+  d.tick();
+  waveSteadily(d, 10, 33);
+  const trained = hp._playbackRate;
+  assert(near(trained, 500 / 396, 0.03), `前提：估計應該已經到 1.26 左右，實際 ${trained}`);
+  d.runMs(3000); d.wave();                                              // 停 3 秒再揮：0.5s ÷ 3.4s ≈ 0.15 倍，低於 0.25
+  assert(near(hp._playbackRate, trained, trained * 0.005), `停頓的間隔不該被當成速度，估計從 ${trained} 變成 ${hp._playbackRate}`);
+  waveSteadily(d, 5, 33);                                               // 回來之後的正常間隔照常取樣
+  assert(near(hp._playbackRate, 500 / 396, 0.03), `回來之後應該繼續追蹤速度，實際 ${hp._playbackRate}`);
+});
+
+run('暫停期間的時間不算揮手間隔：暫停前後各一次揮手，不會被當成一次很慢的取樣', () => {
+  const { hp, d } = makeHp(buildBeatScore({ p0: everyBeat(30) }), [['p0', 1]]);
+  d.tick();
+  waveSteadily(d, 10, 33);
+  const trained = hp._playbackRate;
+  d.wave(); hp.pause(); d.runMs(444); hp.play();                        // 揮完手暫停 444ms，恢復後馬上再揮
+  d.wave();                                                             // 中間隔 456ms：落在範圍內（0.5 ÷ 0.456 ≈ 1.10），不擋掉就會被取樣
+  assert(near(hp._playbackRate, trained, trained * 0.005), `跨過暫停的間隔不該取樣，估計從 ${trained} 變成 ${hp._playbackRate}`);
+});
+
+run('慢的演奏者（每 83 個 tick＝996ms 一拍，樂譜每拍 500ms）：估計變慢後代打的門檻跟著放寬，不搶在揮手前走拍（棘輪）', () => {
+  // p0 前 6 拍每拍有音（代打不能走），之後每 2 拍一顆音（中間的空拍代打可以走）；演奏者每拍都揮手，含空拍。
+  // 沒有放寬時代打第一步等 max(800ms, 1.5 拍＝750ms)＝800ms，比他的間隔 996ms 短：代打先走一拍空拍，他緊接著的
+  // 揮手再推一拍，共用拍位就比他數的拍多一拍。估計到 0.54 倍之後門檻是 1.5 拍 ÷ 0.54 ＝ 1.4s，不會搶先。
+  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3, 4, 5, 8, 10, 12, 14, 16, 18] }), [['p0', 1]]);
+  d.tick();
+  const beats = [];
+  for (let k = 0; k <= 18; k++) { d.wave(); beats.push(hp._beatIndex); for (let i = 1; i < 83; i++) d.tick(); }
+  assert(beats.join() === everyBeat(19).join(), `每次揮手共用拍位都該剛好前進一拍（0..18），實際 ${beats}`);
+});
+
+run('代打照估計的速度走：手停下後第一步等 max(800ms, 1.5 拍 ÷ r)、之後每步等一拍 ÷ r；代打放行不取樣、也不讓揮手跟它配成取樣', () => {
+  // 演奏者每 21 個 tick＝252ms 揮一次（樂譜每拍 500ms，約 2 倍速），揮完拍 0..13 就停；p0 下一個音在拍 60，中間全是空拍。
+  // r ≈ 1.98：第一步 800ms（1.5 拍 ÷ r ＝ 380ms 比 800ms 短），之後每步 0.5s ÷ 1.98 ＝ 253ms（tick 量化成 264ms）：
+  // 手停後 804、1068、1332、1596、1860ms 各一步，2124ms 才有下一步。沒有 ÷ r 時每步 504ms，同一段時間只走 3 步。
+  const { hp, d } = makeHp(buildBeatScore({ p0: [...everyBeat(14), 60] }), [['p0', 1]]);
+  d.tick();
+  const lastWave = waveSteadily(d, 14, 21).at(-1);
+  const trained = hp._playbackRate;
+  assert(near(trained, 500 / 252, 0.05), `前提：估計應該到 1.98 左右，實際 ${trained}`);
+  d.runMs(lastWave + 2000 - d.nowMs);
+  assert(hp._beatIndex === 13 + 5, `手停後 2 秒內代打應該走 5 拍（到拍 18），實際到拍 ${hp._beatIndex}`);
+  assert(near(hp._playbackRate, trained, trained * 0.005), `代打放行不該取樣，估計應維持 ${trained}，實際 ${hp._playbackRate}`);
+  d.wave();                                                             // 演奏者回來：跟 2 秒前的揮手隔著代打，不能配成一次取樣（否則會取到 1.3 倍）
+  assert(near(hp._playbackRate, trained, trained * 0.005), `隔著代打的兩次揮手不該配成取樣，估計從 ${trained} 變成 ${hp._playbackRate}`);
+});
+
+run('終局照最後一次估計的速度播完：指派聲部的最後一個音放行後，電腦輔助的尾奏不回到原譜速度', () => {
+  // p0 拍 0..13，演奏者每 252ms 揮一次（約 2 倍速）；a0 每拍一顆到拍 30。拍 13 放行後沒有指派音了，B＝∞，尾奏（拍 14..30）
+  // 照估計速度走：每拍 0.5s ÷ 1.98 ＝ 253ms；回到原譜速度的話是 500ms。
+  const { log, d } = makeHp(buildBeatScore({ p0: everyBeat(14), a0: everyBeat(31) }), [['p0', 1]]);
+  d.tick();
+  waveSteadily(d, 14, 21);
+  d.runMs(6000);
+  const tail = log.filter((e) => e.t === 'on' && e.label === 'assist' && e.note >= 52 + 15).map((e) => e.ms);   // 拍 15..30
+  assert(tail.length === 16, `尾奏拍 15..30 共 16 顆音都該發聲，實際 ${tail.length}`);
+  const mean = (tail.at(-1) - tail[0]) / (tail.length - 1);
+  assert(near(mean, 253, 12), `尾奏每拍的間隔應該約 253ms（照估計速度），實際平均 ${mean.toFixed(0)}ms`);
+});
+
+run('合併窗的長度跟著速度倍率縮短：快的合奏（每拍約 132ms）裡，晚 96ms 才揮的另一位揮的是下一拍，不是跟上同一拍', () => {
+  // A 每 11 個 tick＝132ms 揮一次（樂譜每拍 500ms，約 3.8 倍速），窗長 min(250ms, 0.5s ÷ 3.8 × 0.4 ＝ 53ms)；
+  // B（從沒揮過）在 A 之後 96ms 才揮，已經過了窗。窗長若不除以速度倍率會是 200ms，96ms 就被當成跟上同一拍。
+  const { hp, d } = makeHp(buildBeatScore({ pA: everyBeat(40), pB: everyBeat(40) }), [['pA', 1], ['pB', 2]]);
+  d.tick();
+  waveSteadily(d, 17, 11);
+  d.wave(1);                                                            // A 的第 18 次揮手，間隔跟前面一樣是 132ms
+  const before = hp._beatIndex;
+  d.runMs(84); d.wave(2);                                               // B 在 A 之後 96ms 揮手
+  assert(hp._beatIndex === before + 1, `B 的揮手已經過了合併窗，應該放行下一拍（${before} → ${before + 1}），實際 ${hp._beatIndex}`);
+});
+
+run('晚到演奏者補音的範圍跟著速度倍率走：快的合奏（約 2 倍速）裡，晚 72ms 才揮第一下的人，他拍首的音仍然補上', () => {
+  // A 每 21 個 tick＝252ms 揮一次（約 2 倍速），窗長 min(250ms, 0.5s ÷ 1.98 × 0.4 ＝ 101ms)；B 從沒揮過，在 A 的第 16 次
+  // 揮手之後 72ms 第一次揮手（在窗內，跟上同一拍）。這 72ms 裡時鐘走了約 150ms 的樂譜（2 倍速），B 拍首的音已經是 150ms
+  // 前的事：「最近一個窗內走過的音先留著」要用樂譜時間算（窗長 × r ≈ 200ms），用窗長本身（101ms）會把它丟掉。
+  const { hp, log, d } = makeHp(buildBeatScore({ pA: everyBeat(40), pB: everyBeat(40) }), [['pA', 1], ['pB', 2]]);
+  d.tick();
+  waveSteadily(d, 15, 21);
+  d.wave(1);                                                            // A 的第 16 次揮手（放行拍 15），間隔跟前面一樣
+  d.runMs(60);
+  const tB = d.wave(2);                                                 // B 在 A 之後 72ms 第一次揮手
+  assert(hp._beatIndex === 15, `前提：B 在合併窗內，是跟上同一拍，實際拍位 ${hp._beatIndex}`);
+  assert(onMs(log, 52 + 15, 'human') === tB, `B 拍 15 的音要在他揮手那個 tick（${tB}ms）補上，實際 ${onMs(log, 52 + 15, 'human')}ms`);
 });
 
 /* ═══════════════════════════════════════════
@@ -651,8 +796,8 @@ const twoPartScore = () => buildBeatScore({ p0: [0, 2, 4, 6], a1: [0, 1, 2, 3, 4
 
 run('重設把排程器退回「剛載入」的狀態：播放中／暫停／播完三種情況，stop() 與 restart() 結果都相同', () => {
   const scenarios = {
-    播放中: (hp, d) => { d.tick(); d.wave(); d.runMs(1300); },
-    暫停: (hp, d) => { d.tick(); d.wave(); d.runMs(1300); hp.pause(); },
+    播放中: (hp, d) => { d.tick(); d.wave(); d.runMs(480); d.wave(); d.runMs(400); },   // 兩次靠近的揮手（中間沒有代打）：速度估計與上一次揮手的紀錄也要弄髒
+    暫停: (hp, d) => { d.tick(); d.wave(); d.runMs(480); d.wave(); d.runMs(400); hp.pause(); },
     播完: (hp, d) => { d.tick(); for (let i = 0; i < 40 && !hp.isFinished(); i++) { d.wave(); d.runMs(500); } },
   };
   const resets = { 'stop()': (hp) => hp.stop(), 'restart()': (hp) => { hp.restart(); hp.pause(); } };
@@ -663,8 +808,8 @@ run('重設把排程器退回「剛載入」的狀態：播放中／暫停／播
       hp.play();
       dirty(hp, d);
       const dirtied = snapshotDiffs(fresh, stateSnapshot(hp));
-      assert(dirtied.includes('_frontierSec') && dirtied.includes('_clockSec') && dirtied.includes('p0.triggered'),
-        `${sName}：前提不成立——放行邊界／時鐘／揮手紀錄根本沒被弄髒（只有 ${dirtied}），這個比對什麼都沒驗證`);
+      assert(dirtied.includes('_frontierSec') && dirtied.includes('_clockSec') && dirtied.includes('p0.triggered') && dirtied.includes('_playbackRate'),
+        `${sName}：前提不成立——放行邊界／時鐘／揮手紀錄／速度估計根本沒被弄髒（只有 ${dirtied}），這個比對什麼都沒驗證`);
       reset(hp);
       const diffs = snapshotDiffs(fresh, stateSnapshot(hp));
       assert(diffs.length === 0, `${sName}＋${rName}：重設後與剛載入不同的欄位：${diffs.join('、')}`);
@@ -847,7 +992,7 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者（�
       : { present: false, triggerSeq: 0, slot: null });
     const lastBeat = hp._beats.length - 1;
     const pWave = 12 / (beatSec * 1000 * 0.8);         // 平均約 0.8 拍揮一次
-    let now = 0, prevBeat = hp._beatIndex, prevPos = 0, advances = 0, stallReleases = 0, quietUntil = 0;
+    let now = 0, prevBeat = hp._beatIndex, prevPos = 0, advances = 0, stallReleases = 0, quietUntil = 0, minRate = Infinity, maxRate = 0;
     for (let i = 0; i < 5000; i++) {
       now += 12;
       if (i >= quietUntil && rand() < 0.002) quietUntil = i + 100 + Math.floor(rand() * 150); // 全體停手 1.2~3 秒：壓到停格
@@ -870,11 +1015,14 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者（�
       assert(pos >= prevPos - 1e-12, `seed ${seed}：樂譜時鐘倒退了（${prevPos} → ${pos}）`);
       assert(pos <= hp._frontierSec + 1e-9, `seed ${seed}：樂譜時鐘 ${pos}s 超過放行邊界 ${hp._frontierSec}s`);
       prevPos = pos;
+      assert(hp._playbackRate >= 0.25 - 1e-12 && hp._playbackRate <= 4 + 1e-12,
+        `seed ${seed}：速度倍率 ${hp._playbackRate} 超出範圍 [0.25, 4]（隨機揮手、離開、暫停都不該把估計推出去）`);
+      minRate = Math.min(minRate, hp._playbackRate); maxRate = Math.max(maxRate, hp._playbackRate);
 
       for (const v of hp._voices.values()) {            // 放行了、時鐘也走到的音，不會被留在後面沒發聲
         const n = v.notes[v.cursor];
-        if (v.kind === 'human' && !v.triggered && n) {  // 還沒揮過手的聲部：只留得住最近一個合併窗內走過的音
-          assert(n.startSeconds >= pos - hp._followWindowSec() - 1e-9, `seed ${seed}：${v.partId} 還沒揮過手，卻留著 ${pos - n.startSeconds}s 前的舊音`);
+        if (v.kind === 'human' && !v.triggered && n) {  // 還沒揮過手的聲部：只留得住最近一個合併窗內（樂譜時間：窗長 × r）走過的音
+          assert(n.startSeconds >= pos - hp._followWindowSec() * hp._playbackRate - 1e-9, `seed ${seed}：${v.partId} 還沒揮過手，卻留著 ${pos - n.startSeconds}s 前的舊音`);
           continue;
         }
         assert(!n || n.startSeconds > pos + 1e-9 || n.startSeconds >= hp._frontierSec,
@@ -888,6 +1036,7 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者（�
     assert(advances > 20, `seed ${seed}：前提：60 秒內共用拍位應該真的前進很多次（實際 ${advances} 次）`);
     assert(stallReleases > 0, `seed ${seed}：前提：這個壓力測試應該真的壓到停格釋放`);
     assert(maxSimultaneous >= 2, `seed ${seed}：前提：這個壓力測試應該真的壓到同音高重疊`);
+    assert(maxRate - minRate > 0.1, `seed ${seed}：前提：這個壓力測試應該真的讓速度倍率動起來（實際 ${minRate.toFixed(2)}～${maxRate.toFixed(2)}）`);
     hp.pause();                                         // 收掉還在響的音之後，每個 noteOn 都剛好有一個 noteOff
     flush();
     for (const [k, v] of balance) assert(v === 0, `seed ${seed}：${k} 的 noteOn 與 noteOff 差了 ${v} 個`);

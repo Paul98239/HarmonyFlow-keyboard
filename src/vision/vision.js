@@ -65,7 +65,7 @@ let tracker = new PersonTracker({ maxUsers: CONFIG.maxUsers });
 // 手勢：每個鎖定槽位左右手各一個 ArcDetector（拋物線手勢 → 換音符的觸發，見
 // humanPerformer.js；不輸出音量）。每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號
 // （→ humanPerformer 的前進許可）」＋「這一幀真的在場的槽位」，經 setPerformanceStateListener
-// 註冊的回呼送給播放器（midi/midiPlayer.js）。沒有 tempo 這回事，全曲固定用樂譜原速。
+// 註冊的回呼送給播放器（midi/midiPlayer.js）。這裡只送離散的觸發序號，播放速度由 humanPerformer.js 依兩次觸發的間隔估計。
 const MP_LEFT_WRIST = 15, MP_RIGHT_WRIST = 16;
 const MP_LEFT_ELBOW = 13, MP_RIGHT_ELBOW = 14;
 const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;

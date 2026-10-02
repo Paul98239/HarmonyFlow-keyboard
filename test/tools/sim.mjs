@@ -69,6 +69,7 @@ export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {
   hp.load(score, slotOf);
   hp.play();
   const seqs = players.map(() => 0), next = players.map(() => 0);
+  const beatAtWave = players.map(() => []);           // 每位演奏者每次揮手之後（那個 tick 結束時）的共用拍位，量「有沒有比他數的拍多走」用
   const gesture = (id) => {
     const slot = slotOf.get(id);
     return slot ? { present: true, triggerSeq: seqs[slot - 1], slot } : { present: false, triggerSeq: 0, slot: null };
@@ -78,11 +79,13 @@ export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {
   hp.tick(0, gesture);
   while (clock.ms < endMs) {
     clock.ms += tickMs;
-    players.forEach((p, i) => { while (next[i] < p.waves.length && clock.ms >= p.waves[next[i]]) { seqs[i]++; next[i]++; } });
+    const delivered = players.map(() => 0);
+    players.forEach((p, i) => { while (next[i] < p.waves.length && clock.ms >= p.waves[next[i]]) { seqs[i]++; next[i]++; delivered[i]++; } });
     hp.tick(clock.ms, gesture);
+    delivered.forEach((n, i) => { for (let j = 0; j < n; j++) beatAtWave[i].push(hp._beatIndex); });
     if (hp.isFinished() && players.every((p, i) => next[i] >= p.waves.length)) break;
   }
-  return { hp, records: rec.records, stats: rec.stats, clock, players };
+  return { hp, records: rec.records, stats: rec.stats, clock, players, beatAtWave };
 }
 
 /* ═══════════════════════════════════════════
@@ -182,7 +185,11 @@ export function measure(sim, { exempt = () => false, factor = 1, waves = null, b
     ? records.filter((r) => r.label === 'human' && Math.abs(r.note.startSeconds - hp._beats[r.note.beatIndex].startSeconds) < 1e-6 && waves[r.note.beatIndex - b0] != null)
       .map((r) => r.onMs - waves[r.note.beatIndex - b0]).sort((a, b) => a - b)
     : [];
+  // 棘輪：演奏者每拍揮一次（waves 與 b0 給了才量）時，第 k 次揮手之後共用拍位應該剛好是 b0 + k；多出來的拍是代打搶在
+  // 他揮手前走掉的。
+  const ahead = waves ? sim.beatAtWave[0].map((b, k) => b - (b0 + k)).filter((x) => x > 0) : [];
   return {
+    ratchetWaves: ahead.length, ratchetMax: ahead.length ? Math.max(...ahead) : 0,
     total, sounded: records.length, releasedMissing, unreleased,
     unpaired: records.filter((r) => r.offMs == null).length, strayOff: stats.strayOff, badVelocity: stats.badVelocity,
     syncMax: Math.round(syncMax), adjacent, compressed, bursts, legato, legatoGaps,

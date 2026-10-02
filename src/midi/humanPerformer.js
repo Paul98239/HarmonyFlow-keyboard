@@ -3,29 +3,35 @@
 //
 //  整個合奏共用「一個樂譜時鐘 S」（單位：樂譜秒，跟音符的 startSeconds／endSeconds 同一個座標系）。
 //  揮手不是讓某個聲部跳到某一拍，而是「放行下一拍」：放行邊界 B（`_frontierSec`）＝已放行那一拍的拍尾。
-//  S 以原譜速度往 B 前進，碰到 B 就停格等下一次揮手；所有聲部——指派的、電腦輔助的、代打的——的
-//  note-on／note-off 都只看 S，所以彼此在結構上不可能不同步，也不會有「某個聲部各自落後」的問題。
+//  S 以速度倍率 r（跟著真人揮手的間隔估計，見下）往 B 前進，碰到 B 就停格等下一次揮手；所有聲部——指派的、
+//  電腦輔助的、代打的——的 note-on／note-off 都只看 S，所以彼此在結構上不可能不同步，也不會有「某個聲部各自
+//  落後」的問題。
 //
 //  放行（`_arbitrate()` 是唯一改寫共用拍位的地方，一個 tick 最多放行一拍）：
 //    · 真人揮手：放行下一拍。多位演奏者同時揮手、一個人指派多個聲部（左右手）都只放行一拍；另一位剛放行這一拍
 //      之後的短暫合併窗（`FOLLOW_WINDOW_MS`）內晚到的揮手，視為跟上同一拍，不另外再推一拍。沒有任何還沒放行
 //      的音的聲部（已經演奏完），它的揮手直接忽略。
 //    · 代打：停手滿閒置門檻之後，電腦替「揮過手的聲部」走一拍空拍；只要這些聲部在下一拍有自己的音
-//      就不走——那顆音要本人揮手。倒數依 tick 的 dt 遞減，暫停期間不算停手。
-//  剛載入時放行邊界在起始拍的拍首（所有指派聲部最早的音所在的那一拍）：電腦輔助聲部先照原速播前奏，第一次
-//  揮手放行起始拍。沒有人被指派（或沒有拍格線，SMPTE）時 B＝∞，整首照時間連續自動播放。
+//      就不走——那顆音要本人揮手。之後每一步等剛走進那一拍要走的真實時間（拍長 ÷ r）。倒數依 tick 的 dt 遞減，
+//      暫停期間不算停手。
+//  剛載入時放行邊界在起始拍的拍首（所有指派聲部最早的音所在的那一拍）：電腦輔助聲部先播前奏（還沒有取過樣，
+//  r＝1＝原譜速度），第一次揮手放行起始拍。沒有人被指派（或沒有拍格線，SMPTE）時 B＝∞，整首照時間連續自動播放。
 //
 //  發聲：每個 tick 先收掉時鐘走過結尾的音，再放出「已放行、時鐘也走到」的音，最後再收一次（同一個 tick 內起音
 //  又結束的短音）。從未被自己的演奏者揮過手的指派聲部維持靜音；揮過手的聲部，別人放行的拍它的音照樣發聲
 //  （音量用代打的 CC7，見 `_tagVolumes()`）。
 //
 //  時鐘怎麼走（`_advanceClock()`）：
-//    · 追趕：揮手比時鐘早、S 落後最近放行那一拍的起點時，S 以 1＋16×落後量／拍長 倍速前進（上限 6 倍）——不跳、
+//    · 速度：S 每個 tick 前進 dt × r。r 是速度倍率＝演奏者的速度是原譜速度的幾倍：每次「真人」放行一拍，就用
+//      「樂譜在這兩拍的起點之間走的秒數 ÷ 兩次揮手之間真實過的秒數」取一次樣，在對數域指數平滑（`rateSample`／
+//      `smoothRate`）；還沒取過樣＝1。代打放行與暫停不取樣；代打與終局沿用最後一次估計，不重設。停格與代打的
+//      等待門檻、合併窗都是真實秒數，用 拍長 ÷ r 換算。
+//    · 追趕：揮手比時鐘早、S 落後最近放行那一拍的起點時，S 再乘上 1＋16×落後量／拍長 倍（上限 6 倍）——不跳、
 //      不丟音，拍內剩下的快速音仍依序發聲。第一次放行不追趕：前奏照原速播完才輪到真人的第一個音。
 //    · 停格：S 碰到 B 就停格。相連音（結尾到同聲部下一顆音的間隙 ≤ θ）在它的後繼音還沒放行時不收，免得停格
 //      那一下出現檔案裡沒有的空白；停格超過閒置門檻就把所有還在響的音收掉，不會無限期掛著。
 //    · 每個 tick 的 dt 上限 MAX_TICK_DT_SEC：分頁被節流後恢復時，不會一次吐出一大段。
-//  所有指派聲部都沒有還沒放行的音時進入終局：B＝∞，尾奏照時間播完，不需要多揮一下。
+//  所有指派聲部都沒有還沒放行的音時進入終局：B＝∞，尾奏照最後一次估計的速度播完，不需要多揮一下。
 //
 //  同音高重疊的音依發聲順序先進先出收音（跟官方合成器對 note-off 的解讀一致），每個 noteOn 都送出一個對應的
 //  noteOff。velocity 一律用樂譜原值；不重播 CC／pitch-bend，音色只在 load() 時套用一次。
@@ -49,27 +55,35 @@ const TOTAL_CHANNELS = CHANNELS_PER_PORT * 4;
    應用層常數——不是規格
    ═══════════════════════════════════════════ */
 // 「停手多久算閒置」：代打第一步的等待時間，也是時鐘停格超過多久就把還在響的音全部收掉的門檻。
-// 實際長度是 max(IDLE_MS, 目前拍長 × IDLE_BEATS)，見 _idleThresholdSec()。IDLE_MS 吸收揮手動作本身需要的時間與
-// 手勢偵測延遲，不是在等某段休止的確切長度。IDLE_BEATS 讓慢曲（拍長 > IDLE_MS）準時每拍揮一次的演奏者不會被代打
-// 搶先走一拍——否則他的揮手接著再推一拍，同一拍被算兩次（棘輪效應）；1.5 拍的容忍才不會誤判他停手了。
+// 實際長度是 max(IDLE_MS, 目前拍長 × IDLE_BEATS ÷ r)，見 _idleThresholdSec()（拍長 ÷ r 是這一拍實際要走的真實
+// 時間）。IDLE_MS 吸收揮手動作本身需要的時間與手勢偵測延遲，不是在等某段休止的確切長度。IDLE_BEATS 讓慢曲
+// （拍長 > IDLE_MS）或慢的演奏者（r < 1）準時每拍揮一次也不會被代打搶先走一拍——否則他的揮手接著再推一拍，同一拍
+// 被算兩次（棘輪效應）；1.5 拍的容忍才不會誤判他停手了。
 const IDLE_MS = 800;
 const IDLE_BEATS = 1.5;
 // 多人合併窗：某位演奏者的揮手落在「另一位剛剛（真人）放行這一拍」之後這麼短的時間內、而且他自己這一拍還沒動作
 // 過，視為「跟上這一拍」，不另外再推一拍——多人幾乎同時揮手是常態，各推一拍會讓合奏從第一下起就比最慢的人多走
-// 一拍。單人自己連續快揮不受影響（他永遠是這一拍的第一個動作）。窗長取 min(FOLLOW_WINDOW_MS, 拍長 ×
-// FOLLOW_WINDOW_BEAT_RATIO)，快曲時不會寬過半拍。
+// 一拍。單人自己連續快揮不受影響（他永遠是這一拍的第一個動作）。窗長取 min(FOLLOW_WINDOW_MS, 拍長 ÷ r ×
+// FOLLOW_WINDOW_BEAT_RATIO)，快曲或快的演奏者不會讓窗寬過半拍。
 const FOLLOW_WINDOW_MS = 250;
 const FOLLOW_WINDOW_BEAT_RATIO = 0.4;
 // 相連音的「小間隙」門檻 θ ＝ ticksPerQuarter / LEGATO_GAP_DIVISOR（480 tpq 時 30 tick）：音符結尾到同一個聲部
 // 下一個起音點的間隙 ≤ θ 才算相連的音。MuseScore 把相連音符寫成「記譜長度 − 1 tick」（間隙固定 1 tick），真正的
 // 最短休止（三十二分休止）≥ 60 tick，θ 落在兩者中間的空檔；用 tick 不用秒，跟速度無關。
 const LEGATO_GAP_DIVISOR = 16;
-// 時鐘追趕：S 落後最近放行那一拍的起點 L 秒時，前進速度是 1 + CATCHUP_GAIN × L／拍長 倍，最多 CATCHUP_MAX_SPEED 倍。
+// 時鐘追趕：S 落後最近放行那一拍的起點 L 秒時，前進速度（r 之外）再乘上 1 + CATCHUP_GAIN × L／拍長 倍，最多
+// CATCHUP_MAX_SPEED 倍。
 const CATCHUP_GAIN = 16;
 const CATCHUP_MAX_SPEED = 6;
 // 每個 tick 的時間步長上限：分頁被瀏覽器節流（背景分頁的計時器可能隔好幾秒才醒來）後恢復時，時鐘最多只前進這麼多，
 // 不會一次把空窗期的音全部放出來。
 const MAX_TICK_DT_SEC = 0.1;
+// 速度估計（見 rateSample／smoothRate）：RATE_ALPHA 是新取樣占的權重。曲庫模擬量測：α 在 0.2～0.5 之間揮手→發聲的
+// 延遲幾乎沒差，α 愈大每次取樣的雜訊愈直接進時鐘、被追趕壓縮的音愈多（α＝1 時多一倍以上），取 0.35。取樣超出
+// [RATE_MIN, RATE_MAX]（原譜速度的 1/4～4 倍）視為停頓或重複偵測，不採樣。
+const RATE_ALPHA = 0.35;
+const RATE_MIN = 0.25;
+const RATE_MAX = 4;
 // 浮點數比較的容差：S 是一路加 dt 累積出來的，跟 startSeconds／endSeconds 比大小時不能要求逐位元相等。
 const EPS = 1e-9;
 // 代打時這個聲部的 CC7（Channel Volume）：目標是校正到約等於電腦輔助聲部的音量基準（它們沒有掛
@@ -87,6 +101,29 @@ const EPS = 1e-9;
 // 不同的 MIDI 概念，velocity 只在 note-on 當下決定一次，CC7 是疊加在已經送出的音符之上的
 // 獨立音量調整。
 const AUTOPILOT_VOLUME_CC = 85;
+
+/* ═══════════════════════════════════════════
+   速度估計（純函式）：速度倍率 r＝演奏者的速度是原譜速度的幾倍（1＝原譜速度，2＝快一倍）
+   ═══════════════════════════════════════════ */
+
+/**
+ * 一次取樣：兩次真人揮手之間，樂譜走了幾秒 ÷ 真實過了幾秒。落在 [RATE_MIN, RATE_MAX] 之外回傳 null：
+ * 太慢＝停頓（走開、暫停後回來），太快＝同一個動作被偵測成兩次，都不是演奏者的速度。
+ */
+export function rateSample(scoreSec, realSec) {
+  if (!(realSec > 0)) return null;  // 間隔是 0、負的或 NaN 就算不出速度（寫成 !(x > 0) 才會連 NaN 一起擋掉）
+  const ratio = scoreSec / realSec;
+  return ratio >= RATE_MIN && ratio <= RATE_MAX ? ratio : null;
+}
+
+/**
+ * 在對數域做指數平滑：r' = r^(1−α) · sample^α，也就是以 (1−α):α 加權的幾何平均。速度倍率是乘法的量，
+ * 「快兩倍」與「慢一半」應該互為鏡像，所以平均要在對數域做（算術平均會偏高：2 與 0.5 的算術平均是 1.25，
+ * 幾何平均才是 1）；一次離群的取樣最多只把估計拉動 α 的比例。
+ */
+export function smoothRate(rate, sample) {
+  return rate ** (1 - RATE_ALPHA) * sample ** RATE_ALPHA; // ** 是指數運算子（同 Math.pow）
+}
 
 /* ═══════════════════════════════════════════
    輸出 channel 分配
@@ -193,6 +230,8 @@ export class HumanPerformer {
     this._stallSec = 0;        // 時鐘停在放行邊界已經多久
     this._autopilotLeftSec = null; // 合奏層級的代打倒數（秒，依 tick 的 dt 遞減）；null＝沒在倒數
     this._realAdvanceMs = null;    // 最近一次「真人」放行一拍的時刻（合併窗用，代打不算）
+    this._playbackRate = 1;        // 速度倍率 r：演奏者的速度是原譜速度的幾倍（還沒取過樣＝1）；時鐘 S 照這個速度前進
+    this._lastWave = null;         // 最近一次真人放行的 { ms 揮手時刻, sec 那一拍在樂譜裡的起點 }；取樣用，代打與暫停會清掉
     this._actedBeat = new Map();   // 槽位 → 這位演奏者最近一次動作（放行或跟上）所在的拍
     this.unplacedPartIds = [];
     this._playing = false;
@@ -325,6 +364,7 @@ export class HumanPerformer {
   pause() {
     this._playing = false;
     this._lastTickMs = null;
+    this._lastWave = null; // 暫停的時間不是揮手的間隔：恢復後的第一下揮手不跟暫停前的揮手配成一次取樣
     this.silence();
   }
 
@@ -383,6 +423,8 @@ export class HumanPerformer {
     this._stallSec = 0;
     this._autopilotLeftSec = null;
     this._realAdvanceMs = null;
+    this._playbackRate = 1;
+    this._lastWave = null;
     this._actedBeat = new Map();
     this._lastTickMs = null;
   }
@@ -469,6 +511,7 @@ export class HumanPerformer {
       if (release) {
         this._releaseNextBeat();
         this._realAdvanceMs = nowMs;
+        this._observeWave(nowMs);
       }
       for (const slot of waveSlots) this._actedBeat.set(slot, this._beatIndex);
       this._tagVolumes(false);
@@ -480,12 +523,25 @@ export class HumanPerformer {
       if (this._autopilotMayStep()) {
         this._releaseNextBeat();
         this._realAdvanceMs = null; // 合併窗只從「真人」的放行算起：代打走的那一步不算，演奏者緊接著的準時揮手是他自己的下一拍
+        this._lastWave = null;      // 代打放行不取樣；隔著代打的兩次真人揮手也不配成取樣（中間那拍是代打在它自己的時間放行的）
         this._tagVolumes(true);
-        this._autopilotLeftSec = this._beatLengthSec(); // 代打照著原譜的速度走，跟電腦輔助聲部的節奏對得上
+        // 代打照著估計的速度走：S 走過這一拍要 拍長÷r 的真實時間，下一步等這麼久，跟電腦輔助聲部的節奏對得上
+        this._autopilotLeftSec = this._beatLengthSec() / this._playbackRate;
       } else {
         this._autopilotLeftSec = null; // 整批不走：等真人下一次揮手再重新倒數
       }
     }
+  }
+
+  // 記下這次真人放行，並跟上一次真人放行配成一次速度取樣：樂譜在這兩拍的起點之間走的秒數 ÷ 兩次揮手之間真實過的
+  // 秒數（用起點差而不是「這拍的長度」，樂譜自己變速時才跟得上）。取樣落在合理範圍內才更新速度倍率。
+  _observeWave(nowMs) {
+    const wave = { ms: nowMs, sec: this._beats[this._beatIndex].startSeconds };
+    const last = this._lastWave;
+    this._lastWave = wave;
+    if (!last) return;
+    const sample = rateSample(wave.sec - last.sec, (wave.ms - last.ms) / 1000);
+    if (sample !== null) this._playbackRate = smoothRate(this._playbackRate, sample);
   }
 
   // 放行下一拍（還沒放行過任何一拍時放行起始拍本身）：邊界 B 推到那一拍的拍尾，追趕目標設在那一拍的起點。
@@ -510,8 +566,9 @@ export class HumanPerformer {
     return nowMs - this._realAdvanceMs <= this._followWindowSec() * 1000;
   }
 
+  // 窗長是真實秒數，拍長是樂譜秒數：拍長 ÷ r 才是這一拍實際要走的真實時間。
   _followWindowSec() {
-    return Math.min(FOLLOW_WINDOW_MS / 1000, this._beatLengthSec() * FOLLOW_WINDOW_BEAT_RATIO);
+    return Math.min(FOLLOW_WINDOW_MS / 1000, (this._beatLengthSec() / this._playbackRate) * FOLLOW_WINDOW_BEAT_RATIO);
   }
 
   // 代打這一步能不能走：所有「揮過手、而且還有沒放行的音」的指派聲部，下一顆音都離共用拍位至少兩拍，而且至少有
@@ -581,9 +638,10 @@ export class HumanPerformer {
     return beat.endSeconds - beat.startSeconds;
   }
 
-  // 「停手多久算閒置」，見 IDLE_MS。
+  // 「停手多久算閒置」，見 IDLE_MS。拍長 ÷ r 是這一拍實際要走的真實時間：演奏者慢（r 小）門檻放寬，不搶在他揮手前
+  // 代打；演奏者快（r 大）門檻縮短，但不低於 IDLE_MS。
   _idleThresholdSec() {
-    return Math.max(IDLE_MS / 1000, this._beatLengthSec() * IDLE_BEATS);
+    return Math.max(IDLE_MS / 1000, (this._beatLengthSec() * IDLE_BEATS) / this._playbackRate);
   }
 
   // 時鐘前進一個 tick：落後最近放行那一拍的起點就加速追趕，最多走到放行邊界 B；碰到 B 就停格，停格超過閒置門檻
@@ -591,8 +649,8 @@ export class HumanPerformer {
   _advanceClock(dt) {
     if (dt <= 0) return;
     const lag = this._catchUpToSec - this._clockSec;
-    const speed = lag > EPS ? Math.min(CATCHUP_MAX_SPEED, 1 + (CATCHUP_GAIN * lag) / this._beatLengthSec()) : 1;
-    this._clockSec = Math.min(this._clockSec + dt * speed, this._frontierSec);
+    const catchUp = lag > EPS ? Math.min(CATCHUP_MAX_SPEED, 1 + (CATCHUP_GAIN * lag) / this._beatLengthSec()) : 1;
+    this._clockSec = Math.min(this._clockSec + dt * this._playbackRate * catchUp, this._frontierSec);
 
     if (this._clockSec < this._frontierSec - EPS) { this._stallSec = 0; return; }
     this._stallSec += dt;
@@ -614,8 +672,9 @@ export class HumanPerformer {
         if (voice.kind === 'human' && !voice.triggered) {
           // 還沒被自己的演奏者揮過手的指派聲部不出聲。但最近一個合併窗內走過的音先留著：他只是比別人晚一點才
           // 揮第一下（跟上同一拍），拍首的音要補上，不然多人一起開始時，慢半拍的人永遠少了第一顆音；過了窗就
-          // 丟掉（晚進場、或從沒揮過手的演奏者不會憑空出聲，也不會有一串舊音在後來一口氣補出來）。
-          if (n.startSeconds < S - this._followWindowSec()) { voice.cursor++; continue; }
+          // 丟掉（晚進場、或從沒揮過手的演奏者不會憑空出聲，也不會有一串舊音在後來一口氣補出來）。窗長是真實
+          // 秒數，這裡比的是樂譜秒數：窗內時鐘走了 窗長 × r 個樂譜秒。
+          if (n.startSeconds < S - this._followWindowSec() * this._playbackRate) { voice.cursor++; continue; }
           break;
         }
         try { synth?.noteOn(voice.channel, n.note, n.velocity); } catch (err) {}

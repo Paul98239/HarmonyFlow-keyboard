@@ -114,6 +114,7 @@ function scanPerform(songs) {
   console.log(`同刻音發聲差 > ${TICK_TOL_MS}ms：${count((m) => m.syncMax > TICK_TOL_MS)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）`);
   console.log(`揮手→發聲 p50 中位數 ${median(rows.map((r) => r.m.lagP50))}ms、p99 中位數 ${median(rows.map((r) => r.m.lagP99))}ms（最差一次的 p99 ${Math.max(...rows.map((r) => r.m.lagP99 ?? 0))}ms）`);
   console.log(`追趕造成的壓縮：相鄰音間隔被壓到不到一半 ${sum('compressed')}／${sum('adjacent')}，擠在同一個 tick ${sum('bursts')}；相連音接點多出 >30ms 空白 ${sum('legatoGaps')}／${sum('legato')}`);
+  console.log(`共用拍位比演奏者數的拍多走（代打搶在揮手前走拍）：${count((m) => m.ratchetWaves)} 次模擬（最多 ${Math.max(...rows.map((r) => r.m.ratchetMax))} 拍）`);
   for (const style of STYLES.map((x) => x[0])) {
     const sub = rows.filter((r) => r.styleName === style);
     console.log(`  ${style}：揮手→發聲 p50 中位 ${median(sub.map((r) => r.m.lagP50))}ms、p99 中位 ${median(sub.map((r) => r.m.lagP99))}ms、被壓縮 ${sub.reduce((a, r) => a + r.m.compressed, 0)}／${sub.reduce((a, r) => a + r.m.adjacent, 0)}`);
@@ -136,8 +137,9 @@ function buildScenarios(score, rnd) {
   const out = [];
   // syncTolMs：同刻音發聲差的容許值。演奏者之間錯開的情境，晚幾十 ms 才揮第一下的人，他拍首的音是補上的（見
   // humanPerformer.js 的合併窗），所以容許值要加上最大的錯開量。
-  const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS } = {}) => out.push({ name, players, exempt, syncTolMs });
-  const solo = (name, o) => add(name, [A], [{ partIds: [A], waves: waves(b0Of([A]), o) }]);
+  // track：單人每拍揮一次、沒有漏揮的情境，另外量揮手→發聲的延遲與共用拍位有沒有比演奏者多走。
+  const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS, track = false } = {}) => out.push({ name, players, exempt, syncTolMs, track });
+  const solo = (name, o, track = false) => add(name, [A], [{ partIds: [A], waves: waves(b0Of([A]), o) }], { track });
 
   if (beats[b0Of([A])].startSeconds >= 2) solo('前奏提早揮手（第一下揮手落在前奏 30％處）', { leadMs: -beats[b0Of([A])].startSeconds * 700 });
   if (B) {
@@ -159,6 +161,12 @@ function buildScenarios(score, rnd) {
   }
   solo('休止期間不揮手（單人，連續 4 拍不揮）', { skipBeats: [6, 10] });
   for (const sec of [0.6, 2, 8]) solo(`停手 ${sec} 秒後回來（單人，第 11 拍）`, { pause: [10, sec * 1000] });
+  // 速度跟隨：factor＝揮手間隔是樂譜拍長的幾倍（<1 快、>1 慢），jitter＝每次間隔隨機偏差的比例。
+  for (const [factor, jitter] of [[0.7, 0.1], [0.85, 0.2], [1.25, 0.2], [1.6, 0.3]]) solo(`穩定速度 ×${factor}、抖動 ${jitter * 100}％（單人）`, { factor, jitter }, true);
+  solo('漸快（單人，揮手間隔從 ×1.4 漸漸縮到 ×0.6）', { factorAt: (k, n) => 1.4 - (0.8 * k) / n }, true);
+  solo('漸慢（單人，揮手間隔從 ×0.6 漸漸拉長到 ×1.4）', { factorAt: (k, n) => 0.6 + (0.8 * k) / n }, true);
+  solo('突然變快（單人，第 20 拍起揮手間隔從 ×1 變 ×0.5）', { factorAt: (k) => (k < 20 ? 1 : 0.5) }, true);
+  solo('突然變慢（單人，第 20 拍起揮手間隔從 ×1 變 ×2）', { factorAt: (k) => (k < 20 ? 1 : 2) }, true);
   return out.map((sc) => ({ ...sc, b0: b0Of(sc.players.flatMap((p) => p.partIds)) }));
 }
 
@@ -166,9 +174,9 @@ function scanScenarios(songs) {
   const byName = new Map();
   for (const s of songs.filter((x) => rankedParts(x.score).length >= 1)) {
     for (const sc of buildScenarios(s.score, makeRng(7))) {
-      const m = measure(simulate(s.score, sc.players), { exempt: sc.exempt });
+      const m = measure(simulate(s.score, sc.players), { exempt: sc.exempt, ...(sc.track ? { waves: sc.players[0].waves, b0: sc.b0 } : {}) });
       if (!byName.has(sc.name)) byName.set(sc.name, []);
-      byName.get(sc.name).push({ s, m, tol: sc.syncTolMs });
+      byName.get(sc.name).push({ s, m, tol: sc.syncTolMs, track: sc.track });
     }
   }
   console.log(`\n=== 情境掃描（每個情境的不變量：放行了的音都發聲、每個 noteOn 一個 noteOff、同刻音同一個 tick）===`);
@@ -177,7 +185,9 @@ function scanScenarios(songs) {
     const sum = (key) => runs.reduce((a, r) => a + r.m[key], 0);
     const bad = runs.filter((r) => r.m.releasedMissing || r.m.unpaired || r.m.strayOff || r.m.badVelocity || r.m.syncMax > r.tol);
     failures += bad.length;
-    console.log(`${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；放行了卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms；曲末沒被放行的音 ${sum('unreleased')} 顆（${runs.filter((r) => r.m.unreleased).length} 首）`);
+    let line = `${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；放行了卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms；曲末沒被放行的音 ${sum('unreleased')} 顆（${runs.filter((r) => r.m.unreleased).length} 首）`;
+    if (runs[0].track) line += `\n    揮手→發聲 p50 中位 ${median(runs.map((r) => r.m.lagP50))}ms、p99 中位 ${median(runs.map((r) => r.m.lagP99))}ms（最差一首 p99 ${Math.max(...runs.map((r) => r.m.lagP99 ?? 0))}ms）；共用拍位比演奏者數的拍多走：${runs.filter((r) => r.m.ratchetWaves).length} 首（最多 ${Math.max(...runs.map((r) => r.m.ratchetMax))} 拍）；被壓縮 ${sum('compressed')}／${sum('adjacent')}`;
+    console.log(line);
     for (const r of bad.slice(0, 3)) console.log('    ', r.s.title, JSON.stringify(r.m));
   }
   return failures;

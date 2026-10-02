@@ -29,7 +29,7 @@ const MUTATIONS = [
     expect: ['收音依樂譜時鐘'] },
   { name: '放行邊界改成含等號（邊界上的音在放行前就發聲）', edits: [['if (n.startSeconds > S + EPS || n.startSeconds >= B) break;', 'if (n.startSeconds > S + EPS || n.startSeconds > B) break;']],
     expect: ['放行邊界是排他的', 'L3 同步'], suites: ['human-performer', 'oracle'] },
-  { name: '拿掉追趕（時鐘直接跳到揮手的目標）', edits: [['this._clockSec = Math.min(this._clockSec + dt * speed, this._frontierSec);', 'this._clockSec = Math.min(Math.max(this._clockSec + dt, this._catchUpToSec), this._frontierSec);']],
+  { name: '拿掉追趕（時鐘直接跳到揮手的目標）', edits: [['this._clockSec = Math.min(this._clockSec + dt * this._playbackRate * catchUp, this._frontierSec);', 'this._clockSec = Math.min(Math.max(this._clockSec + dt * this._playbackRate, this._catchUpToSec), this._frontierSec);']],
     expect: ['揮得比樂譜快'] },
   { name: '拿掉停格釋放（停格太久也不收音）', edits: [['if (this._stallSec > this._idleThresholdSec()) this._noteOffAll();', '/* 變異：沒有停格釋放 */']],
     expect: ['停格釋放不分音的種類', '停格超過閒置門檻'] },
@@ -39,7 +39,7 @@ const MUTATIONS = [
     expect: ['每個 tick 的時間步長上限'] },
   { name: '拿掉第一次放行不追趕（提早揮手把前奏追成倍速）', edits: [['this._catchUpToSec = first ? this._clockSec : beat.startSeconds;', 'this._catchUpToSec = beat.startSeconds;']],
     expect: ['前奏：第一下揮手不追趕'] },
-  { name: '拿掉晚到演奏者的補音（走過就丟）', edits: [['if (n.startSeconds < S - this._followWindowSec()) { voice.cursor++; continue; }', 'if (true) { voice.cursor++; continue; }']],
+  { name: '拿掉晚到演奏者的補音（走過就丟）', edits: [['if (n.startSeconds < S - this._followWindowSec() * this._playbackRate) { voice.cursor++; continue; }', 'if (true) { voice.cursor++; continue; }']],
     expect: ['第二位晚 40ms'] },
   { name: '拿掉多人合併窗（晚到的揮手各推一拍）', edits: [['return nowMs - this._realAdvanceMs <= this._followWindowSec() * 1000;', 'return false;']],
     expect: ['多人合併窗'] },
@@ -51,6 +51,31 @@ const MUTATIONS = [
     expect: ['暫停會收掉所有還在響的音', '固定種子的整體不變量壓力測試'] },
   { name: '送出 velocity 0 的 noteOn', edits: [['synth?.noteOn(voice.channel, n.note, n.velocity);', 'synth?.noteOn(voice.channel, n.note, 0);']],
     expect: ['canon 完美演奏者', '固定種子的整體不變量壓力測試', '不送 velocity 0 的 noteOn'], suites: ['human-performer', 'oracle'] },
+  // ── 速度跟隨 ──
+  { name: '速度倍率固定 1（不跟著揮手速度）', edits: [['if (sample !== null) this._playbackRate = smoothRate(this._playbackRate, sample);', 'if (sample !== null) this._playbackRate = 1;']],
+    expect: ['揮得比樂譜快 26％', '慢的演奏者（每 83 個 tick', '代打照估計的速度走', '終局照最後一次估計'] },
+  { name: '速度平滑改成算術平均（不在對數域）', edits: [['return rate ** (1 - RATE_ALPHA) * sample ** RATE_ALPHA;', 'return (1 - RATE_ALPHA) * rate + RATE_ALPHA * sample;']],
+    expect: ['速度平滑在對數域'] },
+  { name: '取樣不擋範圍外的間隔（停頓也當成速度）', edits: [['return ratio >= RATE_MIN && ratio <= RATE_MAX ? ratio : null;', 'return ratio > 0 ? ratio : null;']],
+    expect: ['速度取樣', '停頓不當成速度'] },
+  { name: '暫停不清掉上一次揮手（跨過暫停的間隔被取樣）', edits: [['this._lastWave = null; // 暫停的時間不是揮手的間隔', '/* 變異：暫停沒有清掉上一次揮手 */ // 暫停的時間不是揮手的間隔']],
+    expect: ['暫停期間的時間不算揮手間隔'] },
+  { name: '代打放行不清掉上一次揮手（隔著代打的兩次揮手被配成取樣）', edits: [['this._lastWave = null;      // 代打放行不取樣', '/* 變異：代打沒有清掉上一次揮手 */ // 代打放行不取樣']],
+    expect: ['代打照估計的速度走'] },
+  { name: '代打每一步都等一整拍的原譜秒數（不除以速度倍率）', edits: [['this._autopilotLeftSec = this._beatLengthSec() / this._playbackRate;', 'this._autopilotLeftSec = this._beatLengthSec();']],
+    expect: ['代打照估計的速度走'] },
+  { name: '閒置門檻不除以速度倍率（慢的演奏者被代打搶先）', edits: [['(this._beatLengthSec() * IDLE_BEATS) / this._playbackRate', 'this._beatLengthSec() * IDLE_BEATS']],
+    expect: ['慢的演奏者（每 83 個 tick'] },
+  { name: '合併窗不除以速度倍率（快的合奏窗太寬）', edits: [['(this._beatLengthSec() / this._playbackRate) * FOLLOW_WINDOW_BEAT_RATIO', 'this._beatLengthSec() * FOLLOW_WINDOW_BEAT_RATIO']],
+    expect: ['合併窗的長度跟著速度倍率縮短'] },
+  { name: '補音範圍不乘速度倍率（拿真實秒數當樂譜秒數比）', edits: [['n.startSeconds < S - this._followWindowSec() * this._playbackRate', 'n.startSeconds < S - this._followWindowSec()']],
+    expect: ['晚到演奏者補音的範圍跟著速度倍率走'] },
+  { name: '時鐘不照速度倍率前進（永遠原譜速度）', edits: [['this._clockSec + dt * this._playbackRate * catchUp', 'this._clockSec + dt * catchUp']],
+    expect: ['揮得比樂譜快 26％', '終局照最後一次估計'] },
+  { name: '終局把速度倍率重設回 1（尾奏回到原譜速度）', edits: [['if (anyHuman) this._frontierSec = Infinity;', 'if (anyHuman) { this._frontierSec = Infinity; this._playbackRate = 1; }']],
+    expect: ['終局照最後一次估計的速度播完'] },
+  { name: '重設不清速度倍率（重播沿用上一輪的估計）', edits: [['    this._playbackRate = 1;\n    this._lastWave = null;\n', '    this._lastWave = null;\n']],
+    expect: ['重設把排程器退回'] },
 ];
 
 function runSuite(dir, suite) {
@@ -71,7 +96,7 @@ try {
   cpSync(join(ROOT, 'src'), join(tmp, 'src'), { recursive: true, filter: (p) => !/GeneralUserGS|pose_landmarker/.test(p) });  // 不複製大檔
   cpSync(join(ROOT, 'test/unit'), join(tmp, 'test/unit'), { recursive: true });
   for (const pkg of ['spessasynth_core', 'stb-vorbis']) cpSync(join(ROOT, 'node_modules', pkg), join(tmp, 'node_modules', pkg), { recursive: true });   // oracle 測試要用 spessasynth_core；複製而不是連結，rmSync 才不會碰到真的 node_modules
-  const original = readFileSync(join(ROOT, TARGET), 'utf8');
+  const original = readFileSync(join(ROOT, TARGET), 'utf8').replace(/\r\n/g, '\n');   // 換行統一成 LF：不管 checkout 時是 CRLF 還是 LF，多行的破壞字串都對得上
   let bad = 0;
   for (const m of MUTATIONS.filter((x) => x.name.includes(ONLY))) {
     let mutated = original;
