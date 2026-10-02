@@ -284,9 +284,9 @@ async function playCurrentSource({ fromStart = false } = {}) {
       // 傳快照（[partId, slot][]），不要傳活的 Map——humanPerformer.js 的 buildVoices() 需要
       // partId → 演奏者槽位的對應才能知道每個指派聲部要問哪個 ID 的手勢狀態。
       await synth.load(s.score, [...s.assignments]);
-      if (synth.humanPerformer.unplacedPartIds.length) {
-        console.warn('⚠️ 分譜聲部超過合成器可用的輸出 channel，以下聲部這一輪不會出聲：',
-          synth.humanPerformer.unplacedPartIds.join('、'));
+      if (synth.humanPerformer.unplacedVoiceIds.length) {
+        console.warn('⚠️ 分譜的 voice 超過合成器可用的輸出 channel（旋律 60 個、鼓組 4 種），以下 voice 這一輪不會出聲：',
+          synth.humanPerformer.unplacedVoiceIds.join('、'));
       }
       await synth.play();
       lastPlayedSignature = signature;

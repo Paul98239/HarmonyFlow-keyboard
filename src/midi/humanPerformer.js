@@ -35,7 +35,12 @@
 //  所有指派聲部都沒有還沒放行的音時進入終局：B＝∞，尾奏照最後一次估計的速度播完，不需要多揮一下。
 //
 //  同音高重疊的音依發聲順序先進先出收音（跟官方合成器對 note-off 的解讀一致），每個 noteOn 都送出一個對應的
-//  noteOff。velocity 一律用樂譜原值；不重播 CC／pitch-bend，音色只在 load() 時套用一次。
+//  noteOff。velocity 一律用樂譜原值；不重播 CC／pitch-bend，每個 voice 的初始狀態（bank／program 與 CC7／10／91／93）只在
+//  load() 時送一次，而且一定在該 channel 的第一個 noteOn 之前。
+//
+//  聲部單位：parser 把一個 MuseScore 樂器切成 part，part 底下有一個以上的 voice（一個譜表 × 一個樂器 channel，例如鋼琴兩行譜
+//  是兩個 voice）。指派（演奏者槽位）以 part 為單位，part 的所有 voice 共用同一個槽位；排程、發聲、輸出 channel 以 voice
+//  為單位。沒有 voices 的 part（手工組的舊資料形狀）自動視為單一 voice。
 // ============================================================
 
 import { buildBeatGrid } from './midiParser.js';
@@ -91,21 +96,22 @@ const RATE_MAX = 4;
 const RATE_OUTLIER = 0.4;
 // 浮點數比較的容差：S 是一路加 dt 累積出來的，跟 startSeconds／endSeconds 比大小時不能要求逐位元相等。
 const EPS = 1e-9;
-// 代打時這個聲部的 CC7（Channel Volume）：目標是校正到約等於電腦輔助聲部的音量基準（它們沒有掛
-// synth.js 的 HUMAN_EMPHASIS_GAIN，等於基準 1.0），真正的「凸顯」完全交給真人揮手時的
-// HUMAN_EMPHASIS_GAIN，代打本身不做額外凸顯或壓低。CC7 對音量不是線性關係——已查證 GM2 官方
-// 規格 §3.3.6（docs/midi-official-doc/General_MIDI_Level_2_07-2-6_1.2a.txt）明講 Channel
-// Volume／Expression 這組音量「數值的平方才正比於音量」，這個專案實際用的 spessasynth_core
-// 原始碼（GitHub spessasus/spessasynth_core 的 src/midi/midi_tools/midi_utils.ts）處理
-// Master Volume 時也是同一套平方關係（註解明講「it corresponds to CC volume, so volume is
-// squared」）。反推公式：HUMAN_EMPHASIS_GAIN × (CC7/100)² = 1.0 → CC7 = 100×√(1/1.4) ≈ 85。
-// 這個數字只用來對照 synth.js 的 HUMAN_EMPHASIS_GAIN，改動任一邊都要重算另一邊——兩個檔案
-// 之間無法用 import 連動（humanPerformer.js 不能反過來 import synth.js，會形成循環），跟這個
-// 專案裡 vision.js 的 EMIT_HEARTBEAT_MS 與 midiPlayer.js 的 GATE_STALE_MS 互相對照的既有寫法
-// 一致，只能靠註解手動同步。只調 CC7（音量），不動 note-on velocity（觸鍵力度）——這是兩種
-// 不同的 MIDI 概念，velocity 只在 note-on 當下決定一次，CC7 是疊加在已經送出的音符之上的
-// 獨立音量調整。
-const AUTOPILOT_VOLUME_CC = 85;
+// 代打時這個 voice 的 CC7（Channel Volume）＝它的原音量（baseVolume＝檔案 init 的 CC7，沒有就是 GM 預設 100）乘上這個比例：
+// 目標是校正到約等於電腦輔助聲部的音量基準（它們沒有掛 synth.js 的 HUMAN_EMPHASIS_GAIN，等於基準 1.0），真正的「凸顯」
+// 完全交給真人揮手時的 HUMAN_EMPHASIS_GAIN，代打本身不做額外凸顯或壓低。CC7 對音量不是線性關係——已查證 GM2 官方
+// 規格 §3.3.6（docs/midi-official-doc/General_MIDI_Level_2_07-2-6_1.2a.txt）明講 Channel Volume／Expression 這組音量
+// 「數值的平方才正比於音量」，這個專案實際用的 spessasynth_core 原始碼（GitHub spessasus/spessasynth_core 的
+// src/midi/midi_tools/midi_utils.ts）處理 Master Volume 時也是同一套平方關係（註解明講「it corresponds to CC volume,
+// so volume is squared」）。反推公式：HUMAN_EMPHASIS_GAIN × (比例)² = 1.0 → 比例 = √(1/1.4) ≈ 0.845，原音量 100 時
+// 就是 85（改版前寫死的 AUTOPILOT_VOLUME_CC）。這個數字只用來對照 synth.js 的 HUMAN_EMPHASIS_GAIN，改動任一邊都要重算
+// 另一邊——兩個檔案之間無法用 import 連動（humanPerformer.js 不能反過來 import synth.js，會形成循環），跟這個專案裡
+// vision.js 的 EMIT_HEARTBEAT_MS 與 midiPlayer.js 的 GATE_STALE_MS 互相對照的既有寫法一致，只能靠註解手動同步。只調 CC7
+// （音量），不動 note-on velocity（觸鍵力度）——這是兩種不同的 MIDI 概念，velocity 只在 note-on 當下決定一次，CC7 是
+// 疊加在已經送出的音符之上的獨立音量調整。
+const AUTOPILOT_VOLUME_RATIO = 0.845;
+// GM 預設的混音值（CC121 不會重設音量、聲像、Program，見 GML-v1 §3.2.5.2；channel 又是跨曲重複使用，所以沒有 init 的 voice
+// 也要明確送一次，避免沿用到別的曲子在同一個 channel 上留下的設定）。
+const GM_DEFAULT_VOLUME = 100, GM_DEFAULT_PAN = 64, GM_DEFAULT_REVERB = 0, GM_DEFAULT_CHORUS = 0;
 
 /* ═══════════════════════════════════════════
    速度估計（純函式）：速度倍率 r＝演奏者的速度是原譜速度的幾倍（1＝原譜速度，2＝快一倍）
@@ -144,38 +150,61 @@ function melodicChannelsFor(synth, drumChannel) {
   return out;
 }
 
-// 幫一組聲部各自分配一個輸出 channel，避免兩個原本共用同一個原始 channel 的聲部打架。
-// 鼓組固定用 drumChannel，其餘依序拿 melodicChannels 裡的號碼；配完就停手，排不進去的
-// 聲部回報給呼叫端，不出聲。
-function allocateChannels(parts, melodicChannels, drumChannel) {
-  const byPartId = new Map();
+// 這個合成器上的打擊輸出 channel＝每個 port 的打擊槽（9／25／41／57）：合成器只有一個 port 時只有 drumChannel 一個。
+function drumChannelsFor(synth, drumChannel) {
+  const ports = synth ? TOTAL_CHANNELS / CHANNELS_PER_PORT : 1;
+  return Array.from({ length: ports }, (_, p) => p * CHANNELS_PER_PORT + drumChannel);
+}
+
+// 幫一組 voice 各自分配一個輸出 channel，避免兩個原本共用同一個原始 channel 的 voice 打架。旋律 voice 依序拿
+// melodicChannels 裡的號碼；打擊 voice 依「不同鼓組 program」各佔一個打擊槽（同一個鼓組共用），鼓組種類超過打擊槽數
+// 就排不進去；排不進去的 voice 回報給呼叫端，不出聲。
+function allocateChannels(voices, melodicChannels, drumChannels) {
+  const byVoiceId = new Map();
   const unplaced = [];
+  const kitChannel = new Map(); // 鼓組 program → 輸出 channel
   let next = 0;
-  for (const p of parts) {
+  for (const v of voices) {
     // percussionKit 已經是 GM2 Bank Select（CC0/32）判定過的結果：channel 9 若明確用
     // Bank 79H(121) 切成旋律通道，這裡就不會被誤送進打擊 channel（見 midiParser.js 的
     // collectParts() 說明）。
-    if (p.percussionKit) { byPartId.set(p.id, drumChannel); continue; }
-    if (next < melodicChannels.length) { byPartId.set(p.id, melodicChannels[next++]); continue; }
-    unplaced.push(p.id);
+    if (v.percussionKit) {
+      if (!kitChannel.has(v.program) && kitChannel.size < drumChannels.length) kitChannel.set(v.program, drumChannels[kitChannel.size]);
+      if (kitChannel.has(v.program)) byVoiceId.set(v.id, kitChannel.get(v.program));
+      else unplaced.push(v.id);
+      continue;
+    }
+    if (next < melodicChannels.length) byVoiceId.set(v.id, melodicChannels[next++]);
+    else unplaced.push(v.id);
   }
-  return { byPartId, unplaced };
+  return { byVoiceId, unplaced };
 }
 
 /* ═══════════════════════════════════════════
    聲部（voice）建構
    ═══════════════════════════════════════════ */
 
-function makeVoice(partId, slot, notes, kind, channel) {
+// 一個 part 底下的 voice 規格：新資料形狀直接用 part.voices；沒有 voices 的 part（手工組的舊資料形狀）視為單一 voice，
+// id 沿用 part.id。
+function voiceSpecsOf(part) {
+  if (part.voices) return part.voices.map((v) => ({ ...v, partId: part.id }));
+  return [{ id: part.id, partId: part.id, program: part.program ?? 0, bank: part.bank ?? { msb: 0, lsb: 0 }, percussionKit: !!part.percussionKit, init: null }];
+}
+
+function makeVoice(spec, slot, notes, kind, channel) {
+  const baseVolume = spec.init?.volume ?? GM_DEFAULT_VOLUME;
   return {
-    partId, slot, kind, channel, notes,
+    id: spec.id, partId: spec.partId, slot, kind, channel, notes,
+    program: spec.program ?? 0, bank: spec.bank, init: spec.init ?? null,
+    baseVolume,             // 真人音量＝檔案的原音量（init 的 CC7，沒有就 100）
+    autopilotVolume: Math.round(baseVolume * AUTOPILOT_VOLUME_RATIO), // 代打音量，見 AUTOPILOT_VOLUME_RATIO
     cursor: 0,              // 下一個還沒處理（發聲或靜音略過）的音符在 notes 裡的位置
     sounding: new Map(),    // 音高 → [{ endSec, legatoTo }]：正在響的音；同音高重疊時依發聲順序排隊，先進先出收音
     triggered: false,       // 指派聲部的演奏者是否真實揮過手；沒揮過就維持靜音，見 _emitNotes
     lastSeq: null,          // 上次觀察到的手勢 triggerSeq，null＝還沒對過基準
     lastSlot: undefined,    // 上次觀察到的指派槽位，與現在不同就重新對齊基準（見 _arbitrate）
     isAutopilot: false,     // 目前用代打音量（CC7 調低）還是真人音量，驅動 _syncVolume() 的 CC7 切換
-    _lastSentCc7: 100,      // 上次送出的 CC7 值，避免重送同一個值
+    _lastSentCc7: baseVolume, // 上次送出的 CC7 值，避免重送同一個值
   };
 }
 
@@ -183,34 +212,37 @@ function makeVoice(partId, slot, notes, kind, channel) {
 // 靜音，不需要幫它在 assistSynth 上保留一條代打用的 channel。兩個池子各自獨立，配額用完的聲部回報在 unplaced，
 // 這一輪不會出聲。
 function buildVoices(score, assignments, assistSynth, humanSynth, cfg) {
-  const voices = new Map(); // partId → voice
+  const voices = new Map(); // voiceId → voice
   const unplaced = [];
 
-  const notesByPart = new Map(); // score.notes 已依 startTick 排序，照順序分組即可
+  const notesByVoice = new Map(); // score.notes 已依 startTick 排序，照順序分組即可；舊資料形狀的音符沒有 voiceId，用 partId
   for (const n of score.notes) {
-    let list = notesByPart.get(n.partId);
-    if (!list) notesByPart.set(n.partId, (list = []));
+    const key = n.voiceId ?? n.partId;
+    let list = notesByVoice.get(key);
+    if (!list) notesByVoice.set(key, (list = []));
     list.push(n);
   }
 
-  const assignedParts = score.parts.filter((p) => assignments.has(p.id));
-  const assistParts = score.parts.filter((p) => !assignments.has(p.id));
+  const assignedSpecs = [], assistSpecs = [];
+  for (const part of score.parts) {
+    for (const spec of voiceSpecsOf(part)) (assignments.has(part.id) ? assignedSpecs : assistSpecs).push(spec);
+  }
 
-  const { byPartId: humanCh, unplaced: u1 } =
-    allocateChannels(assignedParts, melodicChannelsFor(humanSynth, cfg.drumChannel), cfg.drumChannel);
-  const { byPartId: assistCh, unplaced: u2 } =
-    allocateChannels(assistParts, melodicChannelsFor(assistSynth, cfg.drumChannel), cfg.drumChannel);
+  const { byVoiceId: humanCh, unplaced: u1 } =
+    allocateChannels(assignedSpecs, melodicChannelsFor(humanSynth, cfg.drumChannel), drumChannelsFor(humanSynth, cfg.drumChannel));
+  const { byVoiceId: assistCh, unplaced: u2 } =
+    allocateChannels(assistSpecs, melodicChannelsFor(assistSynth, cfg.drumChannel), drumChannelsFor(assistSynth, cfg.drumChannel));
   unplaced.push(...u1, ...u2);
 
-  for (const p of assignedParts) {
-    const channel = humanCh.get(p.id);
+  for (const spec of assignedSpecs) {
+    const channel = humanCh.get(spec.id);
     if (channel === undefined) continue;
-    voices.set(p.id, makeVoice(p.id, assignments.get(p.id), notesByPart.get(p.id) || [], 'human', channel));
+    voices.set(spec.id, makeVoice(spec, assignments.get(spec.partId), notesByVoice.get(spec.id) || [], 'human', channel));
   }
-  for (const p of assistParts) {
-    const channel = assistCh.get(p.id);
+  for (const spec of assistSpecs) {
+    const channel = assistCh.get(spec.id);
     if (channel === undefined) continue;
-    voices.set(p.id, makeVoice(p.id, null, notesByPart.get(p.id) || [], 'assist', channel));
+    voices.set(spec.id, makeVoice(spec, null, notesByVoice.get(spec.id) || [], 'assist', channel));
   }
   return { voices, unplaced };
 }
@@ -225,7 +257,7 @@ export class HumanPerformer {
     this.humanSynth = null;    // 真人聲部合成器（被指派聲部）
     this._score = null;
     this._beats = [];          // buildBeatGrid() 的結果；空陣列＝無法算拍（SMPTE division）
-    this._voices = new Map();  // partId → voice
+    this._voices = new Map();  // voiceId → voice
     this._clockSec = 0;        // 樂譜時鐘 S
     this._frontierSec = 0;     // 放行邊界 B：音符 startSeconds < B 才算被放行；Infinity＝全部放行
     this._beatIndex = 0;       // 共用拍位：最近放行的那一拍（還沒放行過任何一拍時＝起始拍）
@@ -242,7 +274,7 @@ export class HumanPerformer {
     this._pendingRate = null;      // 暫存的離群速度取樣（見 RATE_OUTLIER）；下一個取樣對得上才套用
     this._lastWave = null;         // 最近一次真人揮手的 { ms 揮手時刻, len 那一拍的樂譜長度 }；取樣用，暫停會清掉
     this._actedBeat = new Map();   // 槽位 → 這位演奏者最近一次動作（放行或跟上）所在的拍
-    this.unplacedPartIds = [];
+    this.unplacedVoiceIds = []; // 輸出 channel 排不進去（旋律 voice 超過 60 個、鼓組超過 4 種）的 voice，這一輪不出聲
     this._playing = false;
     this._lastTickMs = null;   // null＝下一次 tick() 不推進時鐘，只記錄基準
   }
@@ -267,7 +299,7 @@ export class HumanPerformer {
     this._score = score || null;
     this._beats = score ? buildBeatGrid(score) : [];
     this._voices = new Map();
-    this.unplacedPartIds = [];
+    this.unplacedVoiceIds = [];
     if (score) this._createVoices(score, assignments);
     // 沒有樂譜時 voices 是空的：起始拍 0、放行邊界 Infinity，tick() 空轉不會碰到拍格線。
     this._startBeatIndex = this._computeStartBeatIndex();
@@ -281,21 +313,12 @@ export class HumanPerformer {
     // 沒有拍格線（SMPTE division，A5）：指派聲部的推進全靠拍位，算不出來就退回整首自動播放——忽略指派。
     const assignMap = !this._beats.length ? new Map()
       : assignments instanceof Map ? assignments : new Map(assignments || []);
-    const partById = new Map(score.parts.map((p) => [p.id, p]));
 
     const { voices, unplaced } = buildVoices(score, assignMap, this.assistSynth, this.humanSynth, this.cfg);
     this._voices = voices;
-    this.unplacedPartIds = unplaced;
+    this.unplacedVoiceIds = unplaced;
 
-    for (const voice of this._voices.values()) {
-      const part = partById.get(voice.partId);
-      const synth = this._synthOf(voice);
-      this._applyInitialPatch(synth, voice.channel, part);
-      // CC7 不在「reset all controllers」清單裡（已用 GML-v1 §3.2.5.2 驗證），channel 又是
-      // 跨曲重複使用：明確送一次 GM 預設值 100，避免沿用到別的曲子／別的聲部在同一個
-      // channel 索引上留下的音量設定。
-      try { synth?.controllerChange(voice.channel, 7, 100); } catch (err) {}
-    }
+    for (const voice of this._voices.values()) this._applyInitialPatch(this._synthOf(voice), voice);
 
     this._tagNotesWithBeat();
     this._tagLegato();
@@ -354,12 +377,19 @@ export class HumanPerformer {
     }
   }
 
-  _applyInitialPatch(synth, channel, part) {
+  // voice 的初始狀態：bank／program，再加上混音 CC7／10／91／93（來源 voice.init＝檔案 tick 0 的值；沒有就明確送 GM 預設，
+  // 見 GM_DEFAULT_*）。load() 時送一次，比該 channel 的任何 noteOn 都早。
+  _applyInitialPatch(synth, voice) {
     if (!synth) return;
+    const { channel, bank, init } = voice;
     try {
-      synth.controllerChange(channel, 0, part.bank?.msb || 0);
-      synth.controllerChange(channel, 32, part.bank?.lsb || 0);
-      synth.programChange(channel, part.program || 0);
+      synth.controllerChange(channel, 0, bank?.msb || 0);
+      synth.controllerChange(channel, 32, bank?.lsb || 0);
+      synth.programChange(channel, voice.program || 0);
+      synth.controllerChange(channel, 7, voice.baseVolume);
+      synth.controllerChange(channel, 10, init?.pan ?? GM_DEFAULT_PAN);
+      synth.controllerChange(channel, 91, init?.reverb ?? GM_DEFAULT_REVERB);
+      synth.controllerChange(channel, 93, init?.chorus ?? GM_DEFAULT_CHORUS);
     } catch (err) { /* 初始音色設定失敗不致命 */ }
   }
 
@@ -422,9 +452,9 @@ export class HumanPerformer {
       voice.lastSeq = null;
       voice.lastSlot = undefined;
       voice.isAutopilot = false;
-      // CC7 要明確送回基準：代打留下的 85 還在合成器上，而 _lastSentCc7 的去重會擋掉之後的重送。
-      voice._lastSentCc7 = 100;
-      try { this._synthOf(voice)?.controllerChange(voice.channel, 7, 100); } catch (err) {}
+      // CC7 要明確送回原音量：代打留下的調低值還在合成器上，而 _lastSentCc7 的去重會擋掉之後的重送。
+      voice._lastSentCc7 = voice.baseVolume;
+      try { this._synthOf(voice)?.controllerChange(voice.channel, 7, voice.baseVolume); } catch (err) {}
     }
     this._clockSec = 0;
     this._beatIndex = this._startBeatIndex;
@@ -635,10 +665,10 @@ export class HumanPerformer {
     }
   }
 
-  // 代打與真人揮手共用的音量對比：代打時 CC7 調低，真人揮手時恢復 GM 預設 100，只影響音量、
-  // 不影響 note-on velocity（樂譜原值不變）。voice._lastSentCc7 去重，同一個值不重複送。
+  // 代打與真人揮手共用的音量對比：代打時 CC7 調低（原音量 × AUTOPILOT_VOLUME_RATIO），真人揮手時恢復原音量，只影響
+  // 音量、不影響 note-on velocity（樂譜原值不變）。voice._lastSentCc7 去重，同一個值不重複送。
   _syncVolume(voice) {
-    const cc = voice.isAutopilot ? AUTOPILOT_VOLUME_CC : 100;
+    const cc = voice.isAutopilot ? voice.autopilotVolume : voice.baseVolume;
     if (voice._lastSentCc7 === cc) return;
     voice._lastSentCc7 = cc;
     try { this._synthOf(voice)?.controllerChange(voice.channel, 7, cc); } catch (err) {}

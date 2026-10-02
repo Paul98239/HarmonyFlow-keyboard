@@ -896,7 +896,7 @@ run('play() 恢復播放時重新武裝靜止計時，不會立刻誤判代打',
   assert(!cc7.includes(85), `恢復播放後 600ms 內不應該立刻代打（代打會把 CC7 切到 85），實際送出 ${cc7}`);
 });
 
-run('AUTOPILOT_VOLUME_CC 是 85：真人揮手送 CC7=100，代打送 CC7=85', () => {
+run('原音量 100 的 voice：真人揮手送 CC7=100，代打送 CC7=85（原音量 × AUTOPILOT_VOLUME_RATIO）', () => {
   const { log, d } = makeHp(canonScore, [[canonCello.id, 1]]);
   d.tick(); d.wave();
   const cc7 = () => log.filter((e) => e.t === 'cc' && e.cc === 7 && e.label === 'human').map((e) => e.val);
@@ -929,7 +929,7 @@ run('canon 完美演奏者（每拍準時揮手）：每顆音發聲一次，not
 function stateSnapshot(hp) {
   const state = {};
   for (const [k, v] of Object.entries(hp)) {
-    if (k === 'cfg' || k === '_score' || k === '_beats' || k === '_voices' || k === 'unplacedPartIds') continue;
+    if (k === 'cfg' || k === '_score' || k === '_beats' || k === '_voices' || k === 'unplacedVoiceIds') continue;
     if (typeof v === 'function' || (v && typeof v.noteOn === 'function')) continue; // 函式、合成器物件
     state[k] = v;
   }
@@ -1066,6 +1066,146 @@ run('放行邊界走出拍格線（軌尾收尾的零長度音落在格線盡頭
   d.runMs(1000);
   assert(onNotes(log).join() === '40,99', `兩顆音都該發聲，實際 ${onNotes(log)}`);
   assert(hp.isFinished(), '放完之後應該算播完');
+});
+
+/* ═══════════════════════════════════════════
+   voice 化：一個 part 底下有多個 voice（鋼琴兩行譜、弓弦的 pizzicato channel）、打擊 channel 分配、
+   初始 CC、baseVolume。part.voices 是新資料形狀；沒有 voices 的 part 是舊形狀，視為單一 voice。
+   ═══════════════════════════════════════════ */
+
+// 假合成器：記下 program 與每個 CC，順序就是送出的順序（初始化要在第一個 noteOn 之前）。
+function makeLoggingSynth(log, label, clock) {
+  return {
+    controllerChange: (ch, cc, val) => log.push({ t: 'cc', label, ch, cc, val, ms: clock.ms }),
+    programChange: (ch, program) => log.push({ t: 'pc', label, ch, program, ms: clock.ms }),
+    noteOn: (ch, note, vel) => log.push({ t: 'on', label, ch, note, vel, ms: clock.ms }),
+    noteOff: (ch, note) => log.push({ t: 'off', label, ch, note, ms: clock.ms }),
+  };
+}
+function makeVoiceHp(score, assignments, { play = true } = {}) {
+  const log = [], clock = { ms: 0 };
+  const hp = new HumanPerformer();
+  hp.setSynths(makeLoggingSynth(log, 'assist', clock), makeLoggingSynth(log, 'human', clock));
+  hp.load(score, new Map(assignments));
+  const d = makeDriver(hp, Object.fromEntries(assignments), clock);
+  if (play) hp.play();
+  return { hp, log, d };
+}
+
+// spec：[{ id, voices: [{ id, program?, kit?（鼓組 program）, init?, bank?, notes: [拍序號…] }] }]。每個 voice 一條單音旋律。
+function buildVoiceScore(spec, beatSec = 0.5) {
+  const tpq = 480, notes = [], parts = [];
+  spec.forEach((p, pi) => {
+    const voices = p.voices.map((v, vi) => {
+      const voice = {
+        id: v.id, partId: p.id, trackIndex: pi, channel: v.channel ?? pi * 4 + vi,
+        program: v.program ?? v.kit ?? 0, bank: v.bank ?? { msb: v.kit !== undefined ? 120 : 121, lsb: 0 },
+        percussionKit: v.kit !== undefined, init: v.init ?? null, noteCount: v.notes.length,
+      };
+      v.notes.forEach((beat, ni) => {
+        notes.push({
+          partId: p.id, voiceId: v.id, trackIndex: pi, channel: voice.channel, note: v.pitch ?? 40 + parts.length * 12 + vi * 6 + ni, velocity: 100,
+          startTick: beat * tpq, endTick: beat * tpq + 12, startSeconds: beat * beatSec, endSeconds: beat * beatSec + 0.025, durationSeconds: 0.025,
+        });
+      });
+      return voice;
+    });
+    parts.push({ id: p.id, name: p.id, noteCount: voices.reduce((s, v) => s + v.noteCount, 0), voices });
+  });
+  notes.sort((a, b) => a.startTick - b.startTick || a.trackIndex - b.trackIndex);
+  const totalBeats = Math.max(...notes.map((n) => n.startTick / tpq)) + 8;
+  return {
+    parts, notes, durationSeconds: totalBeats * beatSec, durationTicks: totalBeats * tpq, ticksPerQuarter: tpq,
+    timeSignatures: [{ tick: 0, numerator: 4, denominator: 4, clocksPerClick: 24, thirtySecondNotesPer24Clocks: 8 }],
+    tickToSeconds: (t) => (t / tpq) * beatSec,
+  };
+}
+
+run('voice 化：一個 part 兩個 voice（鋼琴兩行譜）各拿一個輸出 channel、都走真人軌、共用同一個指派槽位；音符依 voiceId 分給各自的 voice', () => {
+  const score = buildVoiceScore([
+    { id: 'piano', voices: [{ id: 't1c0', notes: [0, 2], pitch: 72 }, { id: 't2c0', notes: [0, 2], pitch: 48 }] },
+    { id: 'flute', voices: [{ id: 't3c1', notes: [0, 2], pitch: 80 }] },
+  ]);
+  const { hp, log, d } = makeVoiceHp(score, [['piano', 1]]);
+  assert(hp._voices.size === 3, `3 個 voice（鋼琴 2、長笛 1），實際 ${hp._voices.size}`);
+  const upper = hp._voices.get('t1c0'), lower = hp._voices.get('t2c0'), flute = hp._voices.get('t3c1');
+  assert(upper && lower && flute, `voice 要用 voiceId 當 key，實際 ${[...hp._voices.keys()]}`);
+  assert(upper.kind === 'human' && lower.kind === 'human' && flute.kind === 'assist', '鋼琴的兩個 voice 都走真人軌，長笛走電腦輔助');
+  assert(upper.slot === 1 && lower.slot === 1 && upper.partId === 'piano' && lower.partId === 'piano', '兩個 voice 共用 part 的指派槽位、partId 保留');
+  assert(upper.channel !== lower.channel, `兩個 voice 輸出 channel 不同，實際 ${upper.channel}／${lower.channel}`);
+  assert(upper.notes.length === 2 && upper.notes.every((n) => n.note === 72) && lower.notes.every((n) => n.note === 48), '音符依 voiceId 分組');
+  d.tick(); d.wave(); d.runMs(100);
+  const humanOn = log.filter((e) => e.t === 'on' && e.label === 'human');
+  assert(humanOn.map((e) => e.note).sort().join() === '48,72', `一次揮手兩個譜表同拍的音都發聲，實際 ${humanOn.map((e) => e.note)}`);
+  assert(new Set(humanOn.map((e) => e.ch)).size === 2, '兩個音在不同的輸出 channel');
+});
+
+run('voice 初始化：bank／program 之外，CC7／10／91／93 在該 channel 第一個 noteOn 之前送出；沒有 init 用 GM 預設 100／64／0／0', () => {
+  const score = buildVoiceScore([
+    { id: 'a', voices: [{ id: 'a0', program: 73, init: { volume: 90, pan: 30, reverb: 20, chorus: 10 }, bank: { msb: 0, lsb: 4 }, notes: [0] }] },
+    { id: 'b', voices: [{ id: 'b0', program: 40, notes: [0] }] },
+  ]);
+  const { hp, log, d } = makeVoiceHp(score, []);
+  d.runMs(100);
+  const initOf = (voiceId) => {
+    const ch = hp._voices.get(voiceId).channel;
+    const before = log.slice(0, log.findIndex((e) => e.t === 'on' && e.ch === ch));
+    const mine = before.filter((e) => e.ch === ch);
+    return { pc: mine.find((e) => e.t === 'pc')?.program, cc: Object.fromEntries(mine.filter((e) => e.t === 'cc').map((e) => [e.cc, e.val])) };
+  };
+  const a = initOf('a0'), b = initOf('b0');
+  assert(a.pc === 73 && a.cc[0] === 0 && a.cc[32] === 4 && a.cc[7] === 90 && a.cc[10] === 30 && a.cc[91] === 20 && a.cc[93] === 10,
+    `a0 的初始化（program、bank、CC7／10／91／93）要在第一個 noteOn 之前送出，實際 ${JSON.stringify(a)}`);
+  assert(b.pc === 40 && b.cc[7] === 100 && b.cc[10] === 64 && b.cc[91] === 0 && b.cc[93] === 0,
+    `沒有 init 的 voice 明確送 GM 預設 100／64／0／0，實際 ${JSON.stringify(b)}`);
+});
+
+run('打擊 voice：依鼓組 program 分配到 9／25／41／57，同一個鼓組共用；第 5 種鼓組回報 unplaced；旋律 voice 不會落在打擊槽', () => {
+  const kits = [0, 8, 16, 24, 32];
+  const score = buildVoiceScore([
+    ...kits.map((kit, i) => ({ id: `k${i}`, voices: [{ id: `kit${i}`, kit, notes: [0] }] })),
+    { id: 'k0b', voices: [{ id: 'kit0b', kit: 0, notes: [1] }] },                                       // 第二個標準鼓組：跟第一個共用 channel
+    ...Array.from({ length: 20 }, (_, i) => ({ id: `m${i}`, voices: [{ id: `mel${i}`, program: i, notes: [0] }] })),
+  ]);
+  const { hp } = makeVoiceHp(score, []);
+  const ch = (id) => hp._voices.get(id)?.channel;
+  assert([ch('kit0'), ch('kit1'), ch('kit2'), ch('kit3')].join() === '9,25,41,57', `前四種鼓組應依序在 9／25／41／57，實際 ${[ch('kit0'), ch('kit1'), ch('kit2'), ch('kit3')]}`);
+  assert(ch('kit0b') === 9, `同一種鼓組共用 channel，實際 ${ch('kit0b')}`);
+  assert(ch('kit4') === undefined && hp.unplacedVoiceIds.join() === 'kit4', `第 5 種鼓組沒有打擊槽可用，應回報 unplaced，實際 ${hp.unplacedVoiceIds}`);
+  const melodic = [...hp._voices.values()].filter((v) => v.id.startsWith('mel')).map((v) => v.channel);
+  assert(melodic.length === 20 && new Set(melodic).size === 20, `20 個旋律 voice 各一個 channel，實際 ${melodic}`);
+  assert(melodic.every((c) => c % 16 !== 9), `旋律 voice 不能落在任何 port 的打擊槽（9／25／41／57），實際 ${melodic}`);
+});
+
+run('輸出 channel 用完：多出來的 voice 回報在 unplacedVoiceIds（列 voice，不是 part）', () => {
+  const score = buildVoiceScore(Array.from({ length: 62 }, (_, i) => ({ id: `p${i}`, voices: [{ id: `v${i}`, notes: [0] }] })));
+  const { hp } = makeVoiceHp(score, [], { play: false });
+  assert(hp._voices.size === 60 && hp.unplacedVoiceIds.join() === 'v60,v61', `64 個 channel 扣掉 4 個打擊槽剩 60 個，實際 ${hp._voices.size} 個、unplaced ${hp.unplacedVoiceIds}`);
+});
+
+run('baseVolume：真人用 voice 的原音量（init 的 CC7），代打是原音量 × 0.845（約等於電腦輔助軌）；重播送回原音量', () => {
+  const score = buildVoiceScore([
+    { id: 'p0', voices: [{ id: 'p0v', init: { volume: 90, pan: 64, reverb: 0, chorus: 0 }, notes: [0, 1, 2, 3, 4, 5, 6, 7] }] },
+    { id: 'a0', voices: [{ id: 'a0v', notes: [0, 1, 2, 3, 4, 5, 6, 7] }] },
+  ]);
+  const { hp, log, d } = makeVoiceHp(score, [['p0', 1]]);
+  const ch = hp._voices.get('p0v').channel;
+  const cc7 = () => log.filter((e) => e.t === 'cc' && e.cc === 7 && e.ch === ch && e.label === 'human').map((e) => e.val);
+  assert(cc7().at(-1) === 90, `載入時送 init 的音量 90，實際 ${cc7()}`);
+  d.tick(); d.wave();
+  assert(cc7().at(-1) === 90, `真人揮手的拍用原音量 90，實際 ${cc7()}`);
+  runTo(d, d.nowMs + 3000);                                   // 停手：電腦代打放行
+  assert(cc7().at(-1) === Math.round(90 * 0.845), `代打用 round(90×0.845)＝${Math.round(90 * 0.845)}，實際 ${cc7()}`);
+  hp.restart();
+  assert(cc7().at(-1) === 90, `重播要把 CC7 送回原音量 90，實際 ${cc7()}`);
+  assert(Math.round(100 * 0.845) === 85, '原音量 100 時代打音量仍是 85（跟改版前相同）');
+});
+
+run('舊資料形狀（part 沒有 voices，手工譜）：視為單一 voice，id 沿用 part.id，行為照舊', () => {
+  const { hp } = makeHp(buildBeatScore({ p0: [0, 2], a1: [1] }), [['p0', 1]], { play: false });
+  const v = hp._voices.get('p0');
+  assert(v && v.partId === 'p0' && v.kind === 'human' && v.slot === 1, `舊形狀的 part 就是一個 voice（id＝part.id），實際 ${JSON.stringify([...hp._voices.keys()])}`);
+  assert(hp._voices.get('a1').kind === 'assist', '未指派的舊形狀 part 照常是電腦輔助');
 });
 
 /* ═══════════════════════════════════════════

@@ -229,7 +229,7 @@ export function autoPlayStats(score) {
   const total = [...hp._voices.values()].reduce((a, v) => a + v.notes.length, 0);
   return {
     finished: hp.isFinished(), total, sounded: records.length, unpaired: records.filter((r) => r.offMs == null).length,
-    strayOff: stats.strayOff, badVelocity: stats.badVelocity, onErr, offErr, unplaced: hp.unplacedPartIds.length,
+    strayOff: stats.strayOff, badVelocity: stats.badVelocity, onErr, offErr, unplaced: hp.unplacedVoiceIds.length,
   };
 }
 

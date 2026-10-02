@@ -167,6 +167,11 @@ export async function initEngine() {
       // addNewChannel() 挪到 soundBank 載入完成之後即可避開。
       for (const s of [synth, synthHuman]) {
         for (let i = CHANNELS_PER_PORT; i < TOTAL_CHANNELS; i++) s.addNewChannel();
+        // spessasynth_core 的 createMIDIChannel() 會把動態新增的 channel 預設設成打擊 channel（已用 worklet 回讀實測：
+        // channel 16～63 全是打擊），旋律聲部超過 15 個的歌，channel 16 以上的聲部就會用鼓組發聲。整個合成器重設一次
+        // 會把每個 channel 設回 GM 配置（只有每個 port 的 channel 9 是打擊）。訊息有順序，這個 reset 一定排在上面
+        // 那些 addNewChannel 之後才被 worklet 處理。
+        s.reset();
       }
 
       isReady = true;

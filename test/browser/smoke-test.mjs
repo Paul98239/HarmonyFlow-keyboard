@@ -260,11 +260,28 @@ async function drivePreviewControls(page, problems) {
   check(barAfter < 0.001, '離開試聽：進度條歸零', problems, String(barAfter));
 }
 
+// worklet 回讀：開機後兩個合成器各 64 個 channel 的打擊配置。主執行緒的 synth.midiChannels[i].patch 是 worklet 回報的
+// 狀態（programChange 事件），不是我們自己記的值——只有每個 port 的 channel 9（9／25／41／57）該是打擊，其餘都是旋律。
+// spessasynth_core 對動態新增的 channel 預設會設成打擊 channel，沒有明確改回來的話，channel 16 以上的旋律聲部會用鼓組
+// 發聲（旋律聲部超過 15 個的歌，例如國旗歌的 24 個）。冒煙測試看不到 worklet 內部，光「沒有報錯」不算通過。
+async function checkChannelLayout(page, problems) {
+  await page.waitForTimeout(800); // worklet 的狀態回報是非同步的，等它們都到
+  const drums = await page.evaluate(async () => {
+    const { humanPerformer } = await import('/src/midi/synth.js');
+    const drumsOf = (syn) => Array.from({ length: 64 }, (_, i) => (syn.midiChannels[i]?.patch?.isDrum ? i : -1)).filter((i) => i >= 0);
+    return { assist: drumsOf(humanPerformer.assistSynth), human: drumsOf(humanPerformer.humanSynth) };
+  });
+  for (const label of ['assist', 'human']) {
+    check(JSON.stringify(drums[label]) === '[9,25,41,57]', `開機後 ${label} 合成器只有每個 port 的 channel 9 是打擊（9／25／41／57）`, problems, `實際打擊 channel：${drums[label]}`);
+  }
+}
+
 // 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → （試聽基本操作）→ 把第一個聲部指派給演奏者 1
 // → 按播放 → 暫停 → 重播，沿途逐一斷言四顆鈕的狀態。跟真實使用者操作路徑一致（見 index.html 的
 // data-field／data-action），不繞過 UI 直接呼叫內部函式（只有「載入中」「播完」兩種難以自然走到的狀態例外）。
 async function driveAppToPlaying(page, problems) {
   await expectTransport(page, 'idle', problems);
+  await checkChannelLayout(page, problems);
 
   console.log('▶ 選現場人數＝1…');
   await page.selectOption('#poseCountSelect', '1');
