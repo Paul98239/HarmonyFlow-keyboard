@@ -21,6 +21,7 @@
 // ============================================================
 
 import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -201,6 +202,79 @@ async function loadLocalFile(page, file) {
   }, file.name, { timeout: 15000 });
 }
 
+// MuseScore 匯出器形狀的 MIDI（跟 test/unit/playability.test.mjs 同一份佈局）：鋼琴兩行譜（上行譜有初始化區塊，音量 90）、
+// 弓弦兩個 channel 有音（normal 與 pizzicato，pizzicato 的混音值不是預設）、打擊（channel 9）。約 4 秒。
+function makeMuseScoreShapedMidi() {
+  const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const vlq = (n) => { const b = [n & 0x7f]; n >>>= 7; while (n > 0) { b.unshift((n & 0x7f) | 0x80); n >>>= 7; } return b; };
+  const track = (events) => {
+    const body = events.flatMap((e) => [...vlq(e.d), ...e.b]).concat([...vlq(0), 0xff, 0x2f, 0x00]);
+    return [0x4d, 0x54, 0x72, 0x6b, ...u32(body.length), ...body];
+  };
+  const enc = new TextEncoder();
+  const nameEv = (s) => { const b = [...enc.encode(s)]; return { d: 0, b: [0xff, 0x03, b.length, ...b] }; };
+  const cc = (c, n, v) => ({ d: 0, b: [0xb0 | c, n, v] });
+  const init = (c, program, { vol = 100, pan = 64, rev = 0, cho = 0 } = {}) =>
+    [cc(c, 121, 0), { d: 0, b: [0xc0 | c, program] }, cc(c, 7, vol), cc(c, 10, pan), cc(c, 91, rev), cc(c, 93, cho)];
+  const notes = (c, pitches, { start = 0, dur = 479 } = {}) => pitches.flatMap((p, i) => [
+    { d: i === 0 ? start : 1, b: [0x90 | c, p, 90 + i] }, { d: dur, b: [0x80 | c, p, 0] }]);
+  const tracks = [
+    track([nameEv('Piano'), { d: 0, b: [0xff, 0x51, 3, 0x07, 0xa1, 0x20] }, ...init(0, 0, { vol: 90 }), ...notes(0, [72, 74, 76, 77, 79, 81, 83, 84])]),
+    track([nameEv('Piano'), ...notes(0, [48, 50, 52, 53, 55, 57, 59, 60])]),
+    track([nameEv('Violin'), ...init(1, 40), ...init(2, 45, { vol: 80, pan: 30, rev: 20, cho: 10 }), ...init(3, 44),
+      ...notes(1, [67, 69, 71, 72]), ...notes(2, [60, 62, 64, 65], { start: 2400 })]),
+    track([nameEv('Drumset'), ...init(9, 0), ...notes(9, [36, 38, 36, 38, 36, 38, 36, 38], { dur: 100 })]),
+  ];
+  return Buffer.from([0x4d, 0x54, 0x68, 0x64, ...u32(6), 0, 1, 0, tracks.length, 0x01, 0xe0, ...tracks.flat()]);
+}
+const MUSESCORE_MIDI = { name: 'musescore-shaped.mid', mimeType: 'audio/midi', buffer: makeMuseScoreShapedMidi() };
+
+// worklet 回讀：真的把檔案載入、整首自動播放，同時監聽 worklet 回報的事件（合成器處理過的 programChange／controllerChange／
+// noteOn，不是我們自己記的值），逐個 voice 檢查：它的輸出 channel 在第一個 noteOn 之前，worklet 真的收到了該 voice 的
+// program 與 CC7／10／91／93（值等於 parser 解出來、排程器送出去的），打擊 voice 真的在打擊 channel 出聲，而且各 channel 的
+// 打擊配置在載入前後都是 GM 的樣子。冒煙測試看不到 worklet 內部，光「沒有報錯」不算通過。
+async function checkWorkletReadback(page, problems) {
+  console.log('▶ worklet 回讀：載入 MuseScore 形狀的譜、整首自動播放，檢查 worklet 收到的初始狀態…');
+  await loadLocalFile(page, MUSESCORE_MIDI);
+  await page.evaluate(async () => {
+    const { humanPerformer } = await import('/src/midi/synth.js');
+    window.__echo = [];
+    for (const [label, syn] of [['assist', humanPerformer.assistSynth], ['human', humanPerformer.humanSynth]]) {
+      syn.eventHandler.addEvent('programChange', 'smoke-echo', (e) => window.__echo.push({ label, t: 'pc', ch: e.channel, program: e.program, msb: e.bankMSB, lsb: e.bankLSB }));
+      syn.eventHandler.addEvent('controllerChange', 'smoke-echo', (e) => window.__echo.push({ label, t: 'cc', ch: e.channel, cc: e.controller, value: e.value }));
+      syn.eventHandler.addEvent('noteOn', 'smoke-echo', (e) => window.__echo.push({ label, t: 'on', ch: e.channel, key: e.midiNote }));
+    }
+  });
+  await page.click('#btnPlay');
+  await page.waitForFunction(() => window.__hf.synth.humanPerformer.isFinished(), null, { timeout: 30000 });
+  await page.waitForTimeout(600); // worklet 的事件回報是非同步的，等最後幾個到齊
+  const got = await page.evaluate(async () => {
+    const { humanPerformer } = await import('/src/midi/synth.js');
+    const voices = [...humanPerformer._voices.values()].map((v) => ({
+      id: v.id, kind: v.kind, channel: v.channel, program: v.program, percussionKit: v.percussionKit,
+      baseVolume: v.baseVolume, init: v.init, noteCount: v.notes.length,
+    }));
+    const drums = (syn) => Array.from({ length: 64 }, (_, i) => (syn.midiChannels[i]?.patch?.isDrum ? i : -1)).filter((i) => i >= 0);
+    return { voices, echo: window.__echo, drums: drums(humanPerformer.assistSynth) };
+  });
+  check(got.voices.length === 5, '載入後有 5 個 voice（鋼琴 2、弓弦 2、打擊 1）', problems, JSON.stringify(got.voices.map((v) => v.id)));
+  for (const v of got.voices) {
+    const mine = got.echo.filter((e) => e.label === 'assist' && e.ch === v.channel);
+    const firstOn = mine.findIndex((e) => e.t === 'on');
+    const before = firstOn < 0 ? [] : mine.slice(0, firstOn);
+    const lastCc = (n) => before.filter((e) => e.t === 'cc' && e.cc === n).at(-1)?.value;
+    const lastProgram = before.filter((e) => e.t === 'pc').at(-1)?.program;
+    const want = { volume: v.baseVolume, pan: v.init?.pan ?? 64, reverb: v.init?.reverb ?? 0, chorus: v.init?.chorus ?? 0 };
+    const ok = firstOn >= 0 && lastProgram === v.program && lastCc(7) === want.volume && lastCc(10) === want.pan && lastCc(91) === want.reverb && lastCc(93) === want.chorus;
+    check(ok, `worklet 在 ${v.id}（輸出 ch${v.channel}）第一個 noteOn 之前收到 program ${v.program} 與 CC7／10／91／93＝${want.volume}／${want.pan}／${want.reverb}／${want.chorus}`, problems,
+      JSON.stringify({ 第一個noteOn位置: firstOn, program: lastProgram, cc7: lastCc(7), cc10: lastCc(10), cc91: lastCc(91), cc93: lastCc(93) }));
+    const ons = mine.filter((e) => e.t === 'on').length;
+    check(ons === v.noteCount, `${v.id} 的 noteOn 在 worklet 端都發聲了（${v.noteCount} 顆）`, problems, `實際 ${ons}`);
+  }
+  const drumVoice = got.voices.find((v) => v.percussionKit);
+  check(drumVoice?.channel === 9 && JSON.stringify(got.drums) === '[9,25,41,57]', '打擊 voice 在 channel 9，且載入後 worklet 的打擊配置仍是 GM（9／25／41／57）', problems, JSON.stringify({ channel: drumVoice?.channel, drums: got.drums }));
+}
+
 // 試聽基本操作（選好範例、演奏還沒播過的 ready 狀態開始）：♪ 進入試聽 → 時間真的往前走 → ❚❚ 暫停
 // （時間停住）→ ▶ 續播（從暫停處繼續，不是從頭）→ 再暫停 → ↻ 重播（回到第一個音附近）→ ♪ 離開，
 // 回到演奏「已載入、還沒播過」。這也是第一次在 AudioContext 還沒恢復時用到官方 Sequencer：時間會動
@@ -296,6 +370,8 @@ async function driveAppToPlaying(page, problems) {
   await expectTransport(page, 'ready', problems);
 
   await drivePreviewControls(page, problems);
+  await checkWorkletReadback(page, problems);
+  await loadLocalFile(page, { name: 'canon-violin-cello.mid', mimeType: 'audio/midi', buffer: readFileSync(SAMPLE_MIDI) }); // 換回範例樂譜，後面的流程照舊
 
   console.log('▶ 把第一個聲部指派給演奏者 1…');
   await page.locator('.score-part-id').first().selectOption('1');

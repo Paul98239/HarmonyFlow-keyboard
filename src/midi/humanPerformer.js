@@ -195,7 +195,7 @@ function makeVoice(spec, slot, notes, kind, channel) {
   const baseVolume = spec.init?.volume ?? GM_DEFAULT_VOLUME;
   return {
     id: spec.id, partId: spec.partId, slot, kind, channel, notes,
-    program: spec.program ?? 0, bank: spec.bank, init: spec.init ?? null,
+    program: spec.program ?? 0, bank: spec.bank, init: spec.init ?? null, percussionKit: !!spec.percussionKit,
     baseVolume,             // 真人音量＝檔案的原音量（init 的 CC7，沒有就 100）
     autopilotVolume: Math.round(baseVolume * AUTOPILOT_VOLUME_RATIO), // 代打音量，見 AUTOPILOT_VOLUME_RATIO
     cursor: 0,              // 下一個還沒處理（發聲或靜音略過）的音符在 notes 裡的位置

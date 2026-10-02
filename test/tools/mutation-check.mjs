@@ -123,6 +123,13 @@ const MUTATIONS = [
     expect: ['兩個小提琴 Part'] },
   { name: 'parser：part 名稱取第一個 voice（不是音符最多的）', target: PARSER, suites: ['midi-parser'], edits: [['    const main = [...part.voices].sort((a, b) => b.noteCount - a.noteCount || a.channel - b.channel)[0];', '    const main = part.voices[0];']],
     expect: ['part 名稱取音符最多的 voice'] },
+  // ── 可播放性（嚴格假合成器：初始狀態先於 noteOn、打擊槽、值域、成對、沒有卡音）──
+  { name: '可播放性：初始化不送 program（noteOn 之前缺 program）', suites: ['playability'], edits: [['      synth.programChange(channel, voice.program || 0);\n', '']],
+    expect: ['整首自動播放可以播放'] },
+  { name: '可播放性：打擊 voice 配到旋律 channel', suites: ['playability'], edits: [['    if (v.percussionKit) {\n      if (!kitChannel.has', '    if (false) {\n      if (!kitChannel.has']],
+    expect: ['輸出 channel 配置', '整首自動播放可以播放'] },
+  { name: '可播放性：收音時不送 noteOff（曲末卡音，嚴格合成器也要抓到）', suites: ['playability'], edits: [['for (let i = 0; i < queue.length; i++) {', 'for (let i = 0; i < 0; i++) {'], ['        try { synth?.noteOff(voice.channel, pitch); } catch (err) {}\n        queue.shift();', '        queue.shift();']],
+    expect: ['整首自動播放可以播放', '兩位演奏者'] },
   // ── voice 化（排程器以 voice 為單位）──
   { name: 'voice 化：同一個 part 的 voice 用 partId 當 key（互相覆蓋）', edits: [['voices.set(spec.id, makeVoice(spec, assignments.get(spec.partId), notesByVoice.get(spec.id) || [], \'human\', channel));', 'voices.set(spec.partId, makeVoice(spec, assignments.get(spec.partId), notesByVoice.get(spec.id) || [], \'human\', channel));']],
     expect: ['voice 化：一個 part 兩個 voice'] },
@@ -176,6 +183,8 @@ const MUTATIONS = [
     expect: ['離開試聽：官方 Sequencer 已停'] },
   { name: '進入試聽不結束演奏（排程器繼續跑）', target: SYNTH, suites: ['smoke'], edits: [["  if (!SequencerClass) throw engineError('音源引擎缺少 Sequencer');\n  flushPreviousSong();\n", "  if (!SequencerClass) throw engineError('音源引擎缺少 Sequencer');\n"]],
     expect: ['進入試聽＝演奏進度歸零'] },
+  { name: 'worklet 回讀：初始化的 CC7 沒送到 worklet（只剩 program）', suites: ['smoke'], edits: [['      synth.controllerChange(channel, 7, voice.baseVolume);\n', '']],
+    expect: ['worklet 在'] },
   { name: '開機補完 channel 後不重設合成器（channel 16 以上預設是打擊）', target: SYNTH, suites: ['smoke'], edits: [['        s.reset();\n      }', '      }']],
     expect: ['開機後'] },
   { name: '試聽失敗時畫面沒有提示', target: PLAYER, suites: ['smoke'], edits: [["      notice: PREVIEW_NOTICE[err.kind] ?? `試聽失敗：${source.name}`,\n", '']],

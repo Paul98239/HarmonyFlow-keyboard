@@ -1,7 +1,9 @@
 // ============================================================
 //  library-scan.mjs — 曲庫全掃：用整個遠端 MIDI 曲庫驗證排程器（手動執行，不進 CI，純 Node）
 //
-//  三種掃描（--only=autoplay,perform,scenarios，預設全跑）：
+//  四種掃描（--only=parse,autoplay,perform,scenarios，預設全跑）：
+//    parse      每首歌解析與聲部切分：沒有例外、至少 1 個 part、每個 voice 都分得到輸出 channel、警告分類統計、
+//               多聲部（可指派）的歌有幾首；〈蝸牛與黃鸝鳥〉必須切成「長笛、大鋼琴」（使用者用原始 MuseScore 檔確認過的金標準）。
 //    autoplay   每首歌整首自動播放（沒有人被指派）：每顆音都發聲、每個 noteOn 一個 noteOff（「成對」以音為單位，
 //               原檔用 Note Off 還是 velocity 0 的 Note On 結束都一樣）、起訖時間誤差 ≤ 一個排程 tick（12ms）。
 //    perform    多聲部歌曲 × 3 種揮手風格（準時／慢 25％＋抖動 15％／快 20％＋抖動 20％），指派音符最多的聲部：
@@ -13,18 +15,19 @@
 //  檔案會略過）；也可以用 --dir 指到別的資料夾。--limit=N 只掃前 N 首。
 //
 //  用法：node test/tools/library-scan.mjs --download
-//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=autoplay,perform,scenarios] [--limit=N]
+//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=parse,autoplay,perform,scenarios] [--limit=N]
 // ============================================================
 
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { parseMidi, buildBeatGrid } from '../../src/midi/midiParser.js';
+import { HumanPerformer } from '../../src/midi/humanPerformer.js';
 import { autoPlayStats, makeRng, measure, nominalWaves, rankedParts, simulate, startBeatOf } from './sim.mjs';
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'library'));
-const ONLY = new Set(String(args.only || 'autoplay,perform,scenarios').split(','));
+const ONLY = new Set(String(args.only || 'parse,autoplay,perform,scenarios').split(','));
 const LIMIT = Number(args.limit) || Infinity;
 const TICK_TOL_MS = 12.5;                          // 一個排程 tick（12ms）加浮點容差
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -58,8 +61,9 @@ async function download() {
 
 function loadLibrary() {
   if (!existsSync(DIR)) { console.error(`找不到曲庫資料夾 ${DIR}：先執行 --download，或用 --dir 指到放 .mid 的資料夾`); process.exit(1); }
-  const titlesFile = join(DIR, 'titles.json');
-  const titles = existsSync(titlesFile) ? JSON.parse(readFileSync(titlesFile, 'utf8')) : {};
+  const titlesFile = join(DIR, 'titles.json'), reportFile = join(DIR, 'report.json'); // report.json 是舊版掃描留下的 [{id, title}…]，沒有 titles.json 時拿來補歌名
+  const titles = existsSync(titlesFile) ? JSON.parse(readFileSync(titlesFile, 'utf8'))
+    : existsSync(reportFile) ? Object.fromEntries(JSON.parse(readFileSync(reportFile, 'utf8')).map((r) => [r.id, r.title])) : {};
   const songs = [];
   for (const f of readdirSync(DIR).filter((x) => x.endsWith('.mid')).slice(0, LIMIT)) {
     const buf = readFileSync(join(DIR, f)), id = f.replace(/\.mid$/, '');
@@ -67,6 +71,49 @@ function loadLibrary() {
     catch (err) { console.warn(`解析失敗，略過：${id}（${err.message}）`); }
   }
   return songs;
+}
+
+/* ═══════════════════════════════════════════
+   掃描 0：解析與聲部切分
+   ═══════════════════════════════════════════ */
+
+function scanParse(songs, fileCount) {
+  console.log(`\n=== 解析與聲部切分，共 ${songs.length} 首 ===`);
+  let problems = 0;
+  const failed = fileCount - songs.length;
+  console.log(`解析失敗：${failed} 首`);
+  if (failed) problems++;
+  const noPart = songs.filter((s) => !s.score.parts.length);
+  console.log(`沒有任何 part：${noPart.length} 首`);
+  if (noPart.length) problems++;
+  const unplaced = [];
+  const voiceCounts = songs.map((s) => {
+    const hp = new HumanPerformer();
+    const stub = { controllerChange() {}, programChange() {}, noteOn() {}, noteOff() {} };
+    hp.setSynths(stub, stub); // 有合成器才會用滿 64 個 channel（app 裡兩個合成器都補到 64 個）
+    hp.load(s.score, []);
+    if (hp.unplacedVoiceIds.length) unplaced.push(s.title);
+    return s.score.parts.reduce((a, p) => a + p.voices.length, 0);
+  });
+  console.log(`放不下輸出 channel 的 voice：${unplaced.length} 首${unplaced.length ? '（' + unplaced.slice(0, 5).join('、') + '）' : ''}；voice 總數最多 ${Math.max(...voiceCounts)} 個`);
+  if (unplaced.length) problems++;
+  const multi = songs.filter((s) => s.score.parts.length >= 2);
+  console.log(`多聲部（≥2 個 part，可以指派演奏者）：${multi.length} 首／${songs.length} 首；單一 part：${songs.length - multi.length} 首`);
+  const warnKinds = new Map();
+  for (const s of songs) for (const w of s.score.warnings) {
+    const k = w.replace(/\d+(\.\d+)?/g, 'N').slice(0, 48);
+    warnKinds.set(k, (warnKinds.get(k) || 0) + 1);
+  }
+  const top = [...warnKinds].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, n]) => `${n}×「${k}」`).join('；');
+  console.log(`警告：${songs.filter((s) => s.score.warnings.length).length} 首有警告（共 ${[...warnKinds.values()].reduce((a, b) => a + b, 0)} 則）${top ? '；最多的：' + top : ''}`);
+  const snail = songs.find((s) => s.title.includes('蝸牛與黃鸝鳥'));
+  if (snail) {
+    const names = snail.score.parts.map((p) => p.name).join('、');
+    const ok = names === '長笛、大鋼琴' && snail.score.parts[1].voices.length === 2;
+    console.log(`${ok ? '✓' : '✗'} 金標準〈蝸牛與黃鸝鳥〉：${names}（鋼琴 ${snail.score.parts[1]?.voices.length} 個 voice）`);
+    if (!ok) problems++;
+  } else console.log('（曲庫裡沒有〈蝸牛與黃鸝鳥〉，略過金標準檢查）');
+  return problems;
 }
 
 /* ═══════════════════════════════════════════
@@ -214,6 +261,7 @@ const started = Date.now();
 const songs = loadLibrary();
 console.log(`曲庫 ${DIR}：${songs.length} 首`);
 let problems = 0;
+if (ONLY.has('parse')) problems += scanParse(songs, Math.min(LIMIT, readdirSync(DIR).filter((x) => x.endsWith('.mid')).length));
 if (ONLY.has('autoplay')) problems += scanAutoplay(songs);
 if (ONLY.has('perform')) problems += scanPerform(songs);
 if (ONLY.has('scenarios')) problems += scanScenarios(songs);
