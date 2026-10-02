@@ -70,6 +70,7 @@ export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {
   hp.play();
   const seqs = players.map(() => 0), next = players.map(() => 0);
   const beatAtWave = players.map(() => []);           // 每位演奏者每次揮手之後（那個 tick 結束時）的共用拍位，量「有沒有比他數的拍多走」用
+  const beatBeforeWave = players.map(() => []);       // 每次揮手之前（那個 tick 開始時）的共用拍位，量「電腦有沒有搶在他揮手之前放行」用
   const gesture = (id) => {
     const slot = slotOf.get(id);
     return slot ? { present: true, triggerSeq: seqs[slot - 1], slot } : { present: false, triggerSeq: 0, slot: null };
@@ -80,12 +81,13 @@ export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {
   while (clock.ms < endMs) {
     clock.ms += tickMs;
     const delivered = players.map(() => 0);
+    const beatBefore = hp._beatIndex;
     players.forEach((p, i) => { while (next[i] < p.waves.length && clock.ms >= p.waves[next[i]]) { seqs[i]++; next[i]++; delivered[i]++; } });
     hp.tick(clock.ms, gesture);
-    delivered.forEach((n, i) => { for (let j = 0; j < n; j++) beatAtWave[i].push(hp._beatIndex); });
+    delivered.forEach((n, i) => { for (let j = 0; j < n; j++) { beatAtWave[i].push(hp._beatIndex); beatBeforeWave[i].push(beatBefore); } });
     if (hp.isFinished() && players.every((p, i) => next[i] >= p.waves.length)) break;
   }
-  return { hp, records: rec.records, stats: rec.stats, clock, players, beatAtWave };
+  return { hp, records: rec.records, stats: rec.stats, clock, players, beatAtWave, beatBeforeWave };
 }
 
 /* ═══════════════════════════════════════════
@@ -109,20 +111,25 @@ export function startBeatOf(score, beats, partIds) {
  * 逐拍揮手的時間表：第 k 拍的揮手落在「前一拍的揮手 ＋ 前一拍的樂譜長度 × factor × (1 ± jitter)」。
  * 第一下揮手落在起始拍的樂譜時間（leadMs 可以提早或延後）。factorAt(第幾拍, 總拍數) 可以讓速度隨時間變。
  * skipBeats[a, b)：這幾拍不揮手；pause[beat, ms]：揮完這一拍之後停 ms 毫秒（Infinity＝從此不揮）；
- * fromBeat：從這一拍才開始揮（晚進場）；offsetMs：整張時間表平移；skipProb：第 3 拍起每拍有這個機率漏揮。
+ * fromBeat：從這一拍才開始揮（晚進場）；offsetMs：整張時間表平移；skipProb：第 3 拍起每拍有這個機率漏揮；
+ * skipEvery：第 3 拍起每 N 拍漏一拍。回傳的陣列帶兩個欄位：beatOf＝每次揮手對應的相對拍序號、missed＝漏揮的拍與它的名義時間。
  */
 export function nominalWaves(beats, b0, { factor = 1, jitter = 0, rnd = Math.random, leadMs = 0, offsetMs = 0, factorAt = null,
-  skipBeats = null, pause = null, fromBeat = 0, skipProb = 0 } = {}) {
-  const waves = [];
+  skipBeats = null, pause = null, fromBeat = 0, skipProb = 0, skipEvery = 0 } = {}) {
+  const waves = [], beatOf = [], missed = [];
   let t = 12 + Math.max(0, beats[b0].startSeconds * 1000 + leadMs) + offsetMs;
   for (let k = b0; k < beats.length; k++) {
     const rel = k - b0;
-    const skipped = (skipBeats && rel >= skipBeats[0] && rel < skipBeats[1]) || rel < fromBeat || (skipProb && rel >= 2 && rnd() < skipProb);
-    if (!skipped) waves.push(t);
+    const skipped = (skipBeats && rel >= skipBeats[0] && rel < skipBeats[1]) || rel < fromBeat || (skipProb && rel >= 2 && rnd() < skipProb)
+      || (skipEvery && rel >= 2 && rel % skipEvery === 0);
+    if (!skipped) { waves.push(t); beatOf.push(rel); }
+    else if (rel >= fromBeat) missed.push({ rel, t });         // 漏揮（不是晚進場）：記下他本來該揮的名義時間
     const beat = beats[k];
     t += (beat.endSeconds - beat.startSeconds) * 1000 * (factorAt ? factorAt(rel, beats.length - b0) : factor) * (1 + jitter * (rnd() * 2 - 1));
     if (pause && rel === pause[0]) { if (!Number.isFinite(pause[1])) break; t += pause[1]; }
   }
+  waves.beatOf = beatOf;
+  waves.missed = missed;
   return waves;
 }
 
@@ -181,15 +188,27 @@ export function measure(sim, { exempt = () => false, factor = 1, waves = null, b
       if (so.onMs - r.offMs - (succ.startSeconds - r.note.endSeconds) * 1000 * factor > 30) legatoGaps++;
     }
   }
+  const beatOf = waves ? (waves.beatOf || waves.map((_, k) => k)) : [];       // 第 k 次揮手是對第幾拍（相對起始拍）揮的
+  const waveOfBeat = new Map(beatOf.map((rel, k) => [rel, waves[k]]));
   const lag = waves
-    ? records.filter((r) => r.label === 'human' && Math.abs(r.note.startSeconds - hp._beats[r.note.beatIndex].startSeconds) < 1e-6 && waves[r.note.beatIndex - b0] != null)
-      .map((r) => r.onMs - waves[r.note.beatIndex - b0]).sort((a, b) => a - b)
+    ? records.filter((r) => r.label === 'human' && Math.abs(r.note.startSeconds - hp._beats[r.note.beatIndex].startSeconds) < 1e-6 && waveOfBeat.has(r.note.beatIndex - b0))
+      .map((r) => r.onMs - waveOfBeat.get(r.note.beatIndex - b0)).sort((a, b) => a - b)
     : [];
-  // 棘輪：演奏者每拍揮一次（waves 與 b0 給了才量）時，第 k 次揮手之後共用拍位應該剛好是 b0 + k；多出來的拍是代打搶在
-  // 他揮手前走掉的。
-  const ahead = waves ? sim.beatAtWave[0].map((b, k) => b - (b0 + k)).filter((x) => x > 0) : [];
+  // 棘輪：第 k 次揮手是對第 beatOf[k] 拍揮的，揮完共用拍位應該剛好是 b0 + beatOf[k]（漏揮的拍由電腦補，不算多走）；多出來的
+  // 拍是電腦多走掉的（你的揮手比電腦放行晚過頭，被當成下一拍）。「搶先」＝電腦在他揮手之前就把這一拍放行了（揮手本身沒
+  // 推拍，只是遲到，不一定造成棘輪）。
+  const ahead = waves ? sim.beatAtWave[0].map((b, k) => b - (b0 + beatOf[k])).filter((x) => x > 0) : [];
+  const preempted = waves ? sim.beatBeforeWave[0].filter((b, k) => b >= b0 + beatOf[k]).length : 0;
+  // 漏揮補位的時間差：他本來該揮的名義時間 → 那一拍的第一顆真人音實際發聲，晚了拍長的幾分之幾（τ 越大越晚）。
+  const missLag = [];
+  for (const { rel, t } of (waves?.missed || [])) {
+    const b = b0 + rel, first = records.filter((r) => r.label === 'human' && r.note.beatIndex === b && Math.abs(r.note.startSeconds - hp._beats[b].startSeconds) < 1e-6);
+    if (first.length) missLag.push((Math.min(...first.map((r) => r.onMs)) - t) / ((hp._beats[b].endSeconds - hp._beats[b].startSeconds) * 1000 * factor));
+  }
+  missLag.sort((a, b) => a - b);
   return {
-    ratchetWaves: ahead.length, ratchetMax: ahead.length ? Math.max(...ahead) : 0,
+    missLagMed: missLag.length ? +missLag[missLag.length >> 1].toFixed(2) : null,
+    ratchetWaves: ahead.length, ratchetMax: ahead.length ? Math.max(...ahead) : 0, preempted, waveCount: waves ? waves.length : 0,
     total, sounded: records.length, releasedMissing, unreleased,
     unpaired: records.filter((r) => r.offMs == null).length, strayOff: stats.strayOff, badVelocity: stats.badVelocity,
     syncMax: Math.round(syncMax), adjacent, compressed, bursts, legato, legatoGaps,

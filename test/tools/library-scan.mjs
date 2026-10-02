@@ -161,12 +161,18 @@ function buildScenarios(score, rnd) {
   }
   solo('休止期間不揮手（單人，連續 4 拍不揮）', { skipBeats: [6, 10] });
   for (const sec of [0.6, 2, 8]) solo(`停手 ${sec} 秒後回來（單人，第 11 拍）`, { pause: [10, sec * 1000] });
-  // 速度跟隨：factor＝揮手間隔是樂譜拍長的幾倍（<1 快、>1 慢），jitter＝每次間隔隨機偏差的比例。
-  for (const [factor, jitter] of [[0.7, 0.1], [0.85, 0.2], [1.25, 0.2], [1.6, 0.3]]) solo(`穩定速度 ×${factor}、抖動 ${jitter * 100}％（單人）`, { factor, jitter }, true);
+  // 速度跟隨：factor＝揮手間隔是樂譜拍長的幾倍（<1 快、>1 慢），jitter＝每次間隔隨機偏差的比例（±）。
+  for (const factor of [0.7, 1, 1.25, 1.6]) for (const jitter of [0.15, 0.3]) solo(`穩定揮手 ×${factor}、抖動 ±${jitter * 100}％（單人）`, { factor, jitter }, true);
   solo('漸快（單人，揮手間隔從 ×1.4 漸漸縮到 ×0.6）', { factorAt: (k, n) => 1.4 - (0.8 * k) / n }, true);
   solo('漸慢（單人，揮手間隔從 ×0.6 漸漸拉長到 ×1.4）', { factorAt: (k, n) => 0.6 + (0.8 * k) / n }, true);
   solo('突然變快（單人，第 20 拍起揮手間隔從 ×1 變 ×0.5）', { factorAt: (k) => (k < 20 ? 1 : 0.5) }, true);
   solo('突然變慢（單人，第 20 拍起揮手間隔從 ×1 變 ×2）', { factorAt: (k) => (k < 20 ? 1 : 2) }, true);
+  // 漏揮：電腦在「該揮的時間＋τ」替你放行，你下一次準時的揮手不該多推一拍。
+  for (const p of [0.1, 0.3]) solo(`隨機漏揮 ${p * 100}％（單人，抖動 ±10％）`, { skipProb: p, jitter: 0.1 }, true);
+  solo('連續漏 3 拍（單人，第 9～11 拍）', { skipBeats: [8, 11] }, true);
+  solo('每 4 拍漏 1 拍（單人）', { skipEvery: 4 }, true);
+  // 完全停手 N 拍後回來（錯過的拍全由電腦走）。
+  for (const n of [2, 8, 30]) solo(`停手 ${n} 拍後回來（單人，第 11 拍起）`, { skipBeats: [10, 10 + n] }, true);
   return out.map((sc) => ({ ...sc, b0: b0Of(sc.players.flatMap((p) => p.partIds)) }));
 }
 
@@ -186,7 +192,13 @@ function scanScenarios(songs) {
     const bad = runs.filter((r) => r.m.releasedMissing || r.m.unpaired || r.m.strayOff || r.m.badVelocity || r.m.syncMax > r.tol);
     failures += bad.length;
     let line = `${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；放行了卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms；曲末沒被放行的音 ${sum('unreleased')} 顆（${runs.filter((r) => r.m.unreleased).length} 首）`;
-    if (runs[0].track) line += `\n    揮手→發聲 p50 中位 ${median(runs.map((r) => r.m.lagP50))}ms、p99 中位 ${median(runs.map((r) => r.m.lagP99))}ms（最差一首 p99 ${Math.max(...runs.map((r) => r.m.lagP99 ?? 0))}ms）；共用拍位比演奏者數的拍多走：${runs.filter((r) => r.m.ratchetWaves).length} 首（最多 ${Math.max(...runs.map((r) => r.m.ratchetMax))} 拍）；被壓縮 ${sum('compressed')}／${sum('adjacent')}`;
+    if (runs[0].track) {
+      const pre = sum('preempted'), waves = sum('waveCount');
+      line += `\n    揮手→發聲 p50 中位 ${median(runs.map((r) => r.m.lagP50))}ms、p99 中位 ${median(runs.map((r) => r.m.lagP99))}ms（最差一首 p99 ${Math.max(...runs.map((r) => r.m.lagP99 ?? 0))}ms）；`
+        + `電腦搶在揮手前放行 ${(100 * pre / waves).toFixed(1)}％（${pre}／${waves} 次揮手）；共用拍位比演奏者數的拍多走：${runs.filter((r) => r.m.ratchetWaves).length} 首（最多 ${Math.max(...runs.map((r) => r.m.ratchetMax))} 拍）；被壓縮 ${sum('compressed')}／${sum('adjacent')}`;
+      const missLag = median(runs.map((r) => r.m.missLagMed));
+      if (missLag != null) line += `；漏揮的拍由電腦補位，比他本來該揮的時間晚拍長的 ${missLag}`;
+    }
     console.log(line);
     for (const r of bad.slice(0, 3)) console.log('    ', r.s.title, JSON.stringify(r.m));
   }
