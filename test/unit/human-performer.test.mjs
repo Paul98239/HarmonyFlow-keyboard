@@ -1010,7 +1010,7 @@ run('restart() 之後代打要等真人重新揮手過才啟動（不會沿用�
 
 run('restart() 把代打留下的 CC7=85 送回 100（否則會殘留到重播後的真人音）', () => {
   const { hp, log, d } = makeHp(canonScore, [[canonCello.id, 1]]);
-  const voice = hp._voices.get(canonCello.id);
+  const voice = hp._voices.get(canonCello.voices[0].id); // voice 的 key 是 voiceId，不是 part 的 id
   d.tick(); d.wave();
   const cc7 = (from = 0) => log.slice(from).filter((e) => e.t === 'cc' && e.cc === 7 && e.label === 'human').map((e) => e.val);
   while (d.nowMs < 5000 && !cc7().includes(85)) d.tick();

@@ -18,7 +18,7 @@ import { dirname, join, resolve } from 'node:path';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const TARGET = 'src/midi/humanPerformer.js'; // 沒有指定 target 的變異破壞這個檔
-const PREVIEW = 'src/midi/previewPlayer.js', PLAYER = 'src/midi/midiPlayer.js', SYNTH = 'src/midi/synth.js';
+const PREVIEW = 'src/midi/previewPlayer.js', PLAYER = 'src/midi/midiPlayer.js', SYNTH = 'src/midi/synth.js', PARSER = 'src/midi/midiParser.js';
 const ONLY = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7);
 const SKIP_SMOKE = process.argv.includes('--skip-smoke'); // 只跑單元測試抓得到的變異（快）
 const ONLY_SMOKE = process.argv.includes('--only-smoke'); // 只跑要靠瀏覽器測試抓的變異（慢）
@@ -94,6 +94,35 @@ const MUTATIONS = [
     expect: ['第一次取樣之前'] },
   { name: '前奏期間電腦照樣倒數（提早揮的第一下之後前奏被追趕）', edits: [['if (this._autopilotLeftSec != null && this._clockSec >= this._entrySec - EPS) this._autopilotLeftSec -= dt;', 'if (this._autopilotLeftSec != null) this._autopilotLeftSec -= dt;']],
     expect: ['前奏：只在前奏中揮過一次手'] },
+  // ── parser：聲部切分（part／voice）與跟官方對齊（單元測試＋差異測試）──
+  { name: 'parser：同 tick 的速度衝突改回先出現者生效', target: PARSER, suites: ['midi-parser', 'oracle'], edits: [['        last.microsecondsPerQuarter = ev.microsecondsPerQuarter;\n        last.bpm = ev.bpm;\n', '']],
+    expect: ['同 tick 的速度衝突'] },
+  { name: 'parser：音符 channel 不加 port 偏移', target: PARSER, suites: ['midi-parser', 'oracle'], edits: [['    offsets.set(t.index, offsetOfPort.get(port));', '    offsets.set(t.index, 0);']],
+    expect: ['port 絕對 channel', '打擊樂器在 port 1'] },
+  { name: 'parser：port 偏移用 port 的數值而不是出現順序', target: PARSER, suites: ['midi-parser'], edits: [['    if (!offsetOfPort.has(port)) offsetOfPort.set(port, offsetOfPort.size * 16);', '    if (!offsetOfPort.has(port)) offsetOfPort.set(port, port * 16);']],
+    expect: ['port 絕對 channel'] },
+  { name: 'parser：沒指定 port 的軌用 0 而不是最小的已指定 port', target: PARSER, suites: ['midi-parser'], edits: [['  const defaultPort = given.length ? Math.min(...given) : 0;', '  const defaultPort = 0;']],
+    expect: ['port 絕對 channel'] },
+  { name: 'parser：有初始化區塊的 track 也能併入上一組（拿掉 hasInit 條件）', target: PARSER, suites: ['midi-parser'], edits: [['    const canMerge = cur && !s.hasInit\n', '    const canMerge = cur\n']],
+    expect: ['兩台鋼琴同名'] },
+  { name: 'parser：軌名不同也併入上一組（拿掉軌名條件）', target: PARSER, suites: ['midi-parser'], edits: [['      && (!s.track.name || !cur.first.track.name || s.track.name === cur.first.track.name)\n', '']],
+    expect: ['舊檔（沒有初始化區塊'] },
+  { name: 'parser：用了別的 channel 也併入上一組（拿掉 channel 子集條件）', target: PARSER, suites: ['midi-parser'], edits: [['      && [...s.noteChannels].every((ch) => cur.knownChannels.has(ch));', ';']],
+    expect: ['用的是這組沒有的 channel'] },
+  { name: 'parser：單獨的 Program Change 也算初始化區塊（下行譜變成新樂器）', target: PARSER, suites: ['midi-parser'], edits: [["    if (ev.type === 'programChange') {\n      init.program = ev.data1;\n", "    if (ev.type === 'programChange') {\n      init.program = ev.data1;\n      hasInit = true;\n"]],
+    expect: ['〈蝸牛與黃鸝鳥〉的結構'] },
+  { name: 'parser：下行譜不沿用首軌的初始化', target: PARSER, suites: ['midi-parser'], edits: [['      const fromInit = group.first.initByChannel.get(channel) || null;', '      const fromInit = summary.initByChannel.get(channel) || null;']],
+    expect: ['鋼琴兩行譜'] },
+  { name: 'parser：有初始化區塊的 voice 不用 tick 0 的 program', target: PARSER, suites: ['midi-parser'], edits: [['      const program = fromInit?.program ?? st.program;', '      const program = st.program;']],
+    expect: ['就算在第一顆音之前出現也被忽略'] },
+  { name: 'parser：bank 預設不分打擊 channel（一律 121）', target: PARSER, suites: ['midi-parser'], edits: [['      const defaultMsb = vk.channel % 16 === DRUM_CHANNEL ? 120 : 121;', '      const defaultMsb = 121;']],
+    expect: ['沒有初始化區塊的 voice', '打擊樂器在 port 1'] },
+  { name: 'parser：同音高重疊不警告', target: PARSER, suites: ['midi-parser'], edits: [['      if (st.overlaps) {', '      if (false) {']],
+    expect: ['同一個 voice 內同音高重疊'] },
+  { name: 'parser：同名 part 不加序號', target: PARSER, suites: ['midi-parser'], edits: [['    if (sameBase(i) === 1) { part.name = bases[i]; return; }', '    if (true) { part.name = bases[i]; return; }']],
+    expect: ['兩個小提琴 Part'] },
+  { name: 'parser：part 名稱取第一個 voice（不是音符最多的）', target: PARSER, suites: ['midi-parser'], edits: [['    const main = [...part.voices].sort((a, b) => b.noteCount - a.noteCount || a.channel - b.channel)[0];', '    const main = part.voices[0];']],
+    expect: ['part 名稱取音符最多的 voice'] },
   // ── voice 化（排程器以 voice 為單位）──
   { name: 'voice 化：同一個 part 的 voice 用 partId 當 key（互相覆蓋）', edits: [['voices.set(spec.id, makeVoice(spec, assignments.get(spec.partId), notesByVoice.get(spec.id) || [], \'human\', channel));', 'voices.set(spec.partId, makeVoice(spec, assignments.get(spec.partId), notesByVoice.get(spec.id) || [], \'human\', channel));']],
     expect: ['voice 化：一個 part 兩個 voice'] },

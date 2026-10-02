@@ -167,8 +167,8 @@ const FIXTURES = {
   // 速度中途改變（480 tick 處從 120 變 60 BPM）。
   '速度中途改變': smf(1, 480, mtrk(tempoEv(0, 500000), tempoEv(480, 1000000),
     ev(0, 0x90, 60, 100), ev(480, 0x80, 60, 0), ev(0, 0x90, 62, 100), ev(480, 0x80, 62, 0))),
-  // 兩個 track 在 480 tick 各給一個不同的速度（80 BPM 與 60 BPM）；官方取後出現者，
-  // 我們取先出現者（A3）。音符在 960 tick，速度決定它的起音秒數。
+  // 兩個 track 在 480 tick 各給一個不同的速度（80 BPM 與 60 BPM）；官方與我們都取後出現者。
+  // 音符在 960 tick，速度決定它的起音秒數。
   '同 tick 的速度衝突': smf(1, 480,
     mtrk(tempoEv(0, 500000), tempoEv(480, 750000), ev(960, 0x90, 60, 100), ev(480, 0x80, 60, 0)),
     mtrk(tempoEv(480, 1000000), ev(960, 0x90, 64, 100), ev(480, 0x80, 64, 0))),
@@ -218,7 +218,7 @@ for (const name of ['running status 與力度 0 的 note-off', '同音高重疊�
   });
 }
 
-await runKnownDiff('L1 邊界：同 tick 的速度衝突', 'A3 取先出現者、官方取後出現者；WP-4 的 P 改成後者', async () => {
+await run('L1 邊界：同 tick 的速度衝突——後出現者生效（跟官方一致）', async () => {
   const ab = FIXTURES['同 tick 的速度衝突'];
   const { events } = await officialPlayback(ab);
   assertNotesMatch(pairOfficialNotes(events), ourNotesOf(parseMidi(ab)));
@@ -230,7 +230,7 @@ await run('L1 邊界：兩個 MIDI port——音高、力度、時間一致（ch
   assertNotesMatch(pairOfficialNotes(events), ourNotesOf(parseMidi(ab)), { channelOf: (n) => n.ch % 16 });
 });
 
-await runKnownDiff('L1 邊界：兩個 MIDI port——絕對 channel', 'parser 不算 port offset（A8）；官方依 port 出現順序 +16；WP-4 的 P／P2 對齊', async () => {
+await run('L1 邊界：兩個 MIDI port——絕對 channel 也一致（依 port 第一次出現的順序 +16）', async () => {
   const ab = FIXTURES['兩個 MIDI port'];
   const { events } = await officialPlayback(ab);
   assertNotesMatch(pairOfficialNotes(events), ourNotesOf(parseMidi(ab)));

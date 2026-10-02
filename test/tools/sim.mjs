@@ -18,10 +18,10 @@ export function makeRng(seed) {
 }
 
 // 假合成器。排程器先 noteOn 再 cursor++，所以 noteOn 當下 voice.notes[voice.cursor] 就是剛發聲的那一顆；
-// noteOff 依「同聲部同音高先進先出」配回去（跟官方合成器對 note-off 的解讀一致）。
+// noteOff 依「同 voice 同音高先進先出」配回去（跟官方合成器對 note-off 的解讀一致）。
 function makeRecorder(getPerformer, clock) {
-  const records = [];                 // 每顆發聲的音：{ label, partId, note, onMs, offMs }
-  const pending = new Map();          // `${partId}/${音高}` → 還沒收的 records（先進先出）
+  const records = [];                 // 每顆發聲的音：{ label, partId, voiceId, note, onMs, offMs }
+  const pending = new Map();          // `${voiceId}/${音高}` → 還沒收的 records（先進先出；一個 part 底下的 voice 各有各的輸出 channel）
   const stats = { strayOff: 0, badVelocity: 0 };
   let byChannel = null;
   // 打擊聲部一律配到同一個 drum channel，同一個 channel 可能不只一個聲部：用「游標指著的音高」或「還沒收的音」分辨。
@@ -39,15 +39,15 @@ function makeRecorder(getPerformer, clock) {
     noteOn: (ch, key, vel) => {
       const list = candidates(ch, label), v = list.find((x) => x.notes[x.cursor]?.note === key) || list[0], note = v.notes[v.cursor];
       if (!(vel >= 1)) stats.badVelocity++;
-      const rec = { label, partId: v.partId, note, onMs: clock.ms, offMs: null };
+      const rec = { label, partId: v.partId, voiceId: v.id, note, onMs: clock.ms, offMs: null };
       records.push(rec);
-      const k = `${v.partId}/${key}`;
+      const k = `${v.id}/${key}`;
       if (!pending.has(k)) pending.set(k, []);
       pending.get(k).push(rec);
     },
     noteOff: (ch, key) => {
-      const list = candidates(ch, label), v = list.find((x) => pending.get(`${x.partId}/${key}`)?.length) || list[0];
-      const rec = pending.get(`${v.partId}/${key}`)?.shift();
+      const list = candidates(ch, label), v = list.find((x) => pending.get(`${x.id}/${key}`)?.length) || list[0];
+      const rec = pending.get(`${v.id}/${key}`)?.shift();
       if (rec) rec.offMs = clock.ms; else stats.strayOff++;
     },
   });
@@ -94,11 +94,11 @@ export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {
    揮手時間表
    ═══════════════════════════════════════════ */
 
-// 非打擊聲部，依音符數由多到少。
+// 非打擊聲部（part 底下至少有一個旋律 voice），依音符數由多到少。
 export function rankedParts(score) {
   const count = new Map();
   for (const n of score.notes) count.set(n.partId, (count.get(n.partId) || 0) + 1);
-  return score.parts.filter((p) => !p.percussionKit && count.get(p.id)).sort((a, b) => count.get(b.id) - count.get(a.id));
+  return score.parts.filter((p) => !p.voices.every((v) => v.percussionKit) && count.get(p.id)).sort((a, b) => count.get(b.id) - count.get(a.id));
 }
 
 // 這些聲部最早的音所在的拍（跟排程器的起始拍同一個定義）。
@@ -169,7 +169,7 @@ export function measure(sim, { exempt = () => false, factor = 1, waves = null, b
   // 壓縮：同一聲部相鄰兩顆起音相差 ≥ 30ms 的音，實際間隔不到應有的一半（追趕造成）；擠成一團＝同一個 tick。
   let adjacent = 0, compressed = 0, bursts = 0, legato = 0, legatoGaps = 0;
   for (const v of hp._voices.values()) {
-    const mine = records.filter((r) => r.partId === v.partId).sort((a, b) => a.note.startSeconds - b.note.startSeconds || a.onMs - b.onMs);
+    const mine = records.filter((r) => r.voiceId === v.id).sort((a, b) => a.note.startSeconds - b.note.startSeconds || a.onMs - b.onMs);
     let prev = null;
     for (const r of mine) {
       if (prev && r.note.startSeconds - prev.note.startSeconds >= 0.03) {
@@ -180,7 +180,7 @@ export function measure(sim, { exempt = () => false, factor = 1, waves = null, b
       if (!prev || r.note.startSeconds > prev.note.startSeconds) prev = r;
     }
     // 相連音空白：舊音收音到後繼音發聲的時間，比檔案編碼的間隙多出 30ms 以上。
-    const byNote = new Map(records.filter((r) => r.partId === v.partId).map((r) => [r.note, r]));
+    const byNote = new Map(records.filter((r) => r.voiceId === v.id).map((r) => [r.note, r]));
     for (const r of mine) {
       const succ = v.notes[r.note.legatoTo], so = succ && byNote.get(succ);
       if (!so || r.offMs == null) continue;

@@ -5,8 +5,8 @@
 //
 //  典型用法：
 //    const parsed = parseMidi(await file.arrayBuffer());
-//    parsed.parts   // → 這份總譜有哪些聲部（細到 track × channel × program，即「樂器」）
-//    parsed.notes   // → humanPerformer.js 直接拿這份（連同 parts、buildMeasureGrid()）建立聲部
+//    parsed.parts   // → 這份總譜有哪些聲部（MuseScore 的一個樂器＝一個 part，底下是 voice＝譜表 × channel）
+//    parsed.notes   // → humanPerformer.js 直接拿這份（連同 parts、buildBeatGrid()）建立 voice
 //
 //  本模組不碰 Blob／DOM／AudioContext——包成 Blob 是呼叫端的事。
 //
@@ -81,51 +81,11 @@ const CHANNEL_DATA_BYTES = Object.freeze({
 const DEFAULT_TEMPO_US = 500000; // 規格：沒有 FF51 時視為 120 BPM
 const WARNING_LIMIT = 100;
 
-// General MIDI Level 1 音色表（program 0~127），拼法對齊 MMA「General MIDI Level 1
-// Sound Set」官方文件（例：Clavi 而非 Clavinet、SynthStrings 1、Pad 5 (bowed)、
-// Lead 8 (bass + lead)、Electric Bass (pick)、Agogo、Guitar harmonics 小寫 h）。
-// 這裡刻意保留規格的英文原名，不自行翻譯：它是規格的一部分，翻譯屬於顯示層的事。
-// 用途是靠音色編號認出「這個聲部是什麼樂器」（不採信檔案的 track name／instrument name）。
-const GM_PROGRAM_NAMES = Object.freeze([
-  'Acoustic Grand Piano', 'Bright Acoustic Piano', 'Electric Grand Piano', 'Honky-tonk Piano',
-  'Electric Piano 1', 'Electric Piano 2', 'Harpsichord', 'Clavi',
-  'Celesta', 'Glockenspiel', 'Music Box', 'Vibraphone',
-  'Marimba', 'Xylophone', 'Tubular Bells', 'Dulcimer',
-  'Drawbar Organ', 'Percussive Organ', 'Rock Organ', 'Church Organ',
-  'Reed Organ', 'Accordion', 'Harmonica', 'Tango Accordion',
-  'Acoustic Guitar (nylon)', 'Acoustic Guitar (steel)', 'Electric Guitar (jazz)', 'Electric Guitar (clean)',
-  'Electric Guitar (muted)', 'Overdriven Guitar', 'Distortion Guitar', 'Guitar harmonics',
-  'Acoustic Bass', 'Electric Bass (finger)', 'Electric Bass (pick)', 'Fretless Bass',
-  'Slap Bass 1', 'Slap Bass 2', 'Synth Bass 1', 'Synth Bass 2',
-  'Violin', 'Viola', 'Cello', 'Contrabass',
-  'Tremolo Strings', 'Pizzicato Strings', 'Orchestral Harp', 'Timpani',
-  'String Ensemble 1', 'String Ensemble 2', 'SynthStrings 1', 'SynthStrings 2',
-  'Choir Aahs', 'Voice Oohs', 'Synth Voice', 'Orchestra Hit',
-  'Trumpet', 'Trombone', 'Tuba', 'Muted Trumpet',
-  'French Horn', 'Brass Section', 'SynthBrass 1', 'SynthBrass 2',
-  'Soprano Sax', 'Alto Sax', 'Tenor Sax', 'Baritone Sax',
-  'Oboe', 'English Horn', 'Bassoon', 'Clarinet',
-  'Piccolo', 'Flute', 'Recorder', 'Pan Flute',
-  'Blown Bottle', 'Shakuhachi', 'Whistle', 'Ocarina',
-  'Lead 1 (square)', 'Lead 2 (sawtooth)', 'Lead 3 (calliope)', 'Lead 4 (chiff)',
-  'Lead 5 (charang)', 'Lead 6 (voice)', 'Lead 7 (fifths)', 'Lead 8 (bass + lead)',
-  'Pad 1 (new age)', 'Pad 2 (warm)', 'Pad 3 (polysynth)', 'Pad 4 (choir)',
-  'Pad 5 (bowed)', 'Pad 6 (metallic)', 'Pad 7 (halo)', 'Pad 8 (sweep)',
-  'FX 1 (rain)', 'FX 2 (soundtrack)', 'FX 3 (crystal)', 'FX 4 (atmosphere)',
-  'FX 5 (brightness)', 'FX 6 (goblins)', 'FX 7 (echoes)', 'FX 8 (sci-fi)',
-  'Sitar', 'Banjo', 'Shamisen', 'Koto',
-  'Kalimba', 'Bag pipe', 'Fiddle', 'Shanai',
-  'Tinkle Bell', 'Agogo', 'Steel Drums', 'Woodblock',
-  'Taiko Drum', 'Melodic Tom', 'Synth Drum', 'Reverse Cymbal',
-  'Guitar Fret Noise', 'Breath Noise', 'Seashore', 'Bird Tweet',
-  'Telephone Ring', 'Helicopter', 'Applause', 'Gunshot',
-]);
-
 // GM1 打擊樂固定使用第 10 個 MIDI channel（索引 9，不是第 10 個 track）上 program 代表的
 // 是鼓組而非旋律樂器。GM2 §2.4／§3.3.1 允許用 Bank Select（CC0 MSB／CC32 LSB）在任何 channel
 // 上切換：bank 79H(121)＝旋律（channel 9 以外的規格預設值）、bank 78H(120)＝節奏（channel 9
-// 的規格預設值）——collectParts() 的 percussionKit 判定依這條規則走（見下方說明），不是只看
-// channel 號碼；isDrum（＝channel 9）另外保留，是下游對應合成器鼓組 channel 用的獨立語意。
+// 的規格預設值）——voice 的 percussionKit 判定依這條規則走（見 buildPart()），不是只看
+// channel 號碼。這張表只用來檢查鼓組 program 是不是 GM2 附錄 B 定義的編號。
 // 拼法對齊 GM2 規格文件附錄 B「General MIDI 2 Percussion Sound Set」表格標題（PC#1 STANDARD Set、
 // PC#9 ROOM Set…）：全部是「XXX Set」，不是「XXX Kit」；56 號那組官方寫的是縮寫「SFX Set」，
 // 不是「Sound FX」。
@@ -135,7 +95,7 @@ const GM_DRUM_KITS = Object.freeze({
 });
 const DRUM_CHANNEL = 9;
 
-// General MIDI Level 1 音色表的繁體中文對照，索引與 GM_PROGRAM_NAMES 對齊。
+// General MIDI Level 1 音色表的繁體中文對照，索引就是 GM program 編號（0~127）。
 // 分譜清單一律用這份表命名聲部，不採信檔案裡的軌名（FF03）／樂器名（FF04）：那些欄位常常是
 // 其他語言、排版用的分隔線或空白。GM program 是規格明訂、與語言無關的欄位，而且就是音源引擎
 // 實際會奏出的音色。
@@ -180,20 +140,10 @@ const GM_DRUM_KITS_ZH = Object.freeze({
 });
 
 /**
- * GM 音色編號 → 名稱。isDrum 為 true 時查鼓組表（打擊 channel 的 program 意義不同）。
- * 查不到的鼓組編號回傳 Standard Kit：GM2 §2.6 [recommended] 明訂 Bank 78H/00H 選到未定義的
- * program 時，音源實際會播放 Program 1（GM1 Drum Set）——名稱要反映音源真正會發出的聲音。
- */
-export function gmProgramName(program, isDrum = false) {
-  if (!Number.isInteger(program) || program < 0 || program > 127) return '';
-  if (isDrum) return GM_DRUM_KITS[program] || GM_DRUM_KITS[0];
-  return GM_PROGRAM_NAMES[program];
-}
-
-/**
  * GM 音色編號 → 繁體中文名稱。分譜清單的聲部命名一律走這裡（見 GM_PROGRAM_NAMES_ZH
  * 的說明）。查不到（program 超出 0~127）時回傳空字串，由呼叫端決定退路；鼓組編號查不到時
- * 回傳標準鼓組，理由同 gmProgramName()。
+ * 回傳標準鼓組：GM2 §2.6 [recommended] 明訂 Bank 78H/00H 選到未定義的 program 時，音源
+ * 實際會播放 Program 1（GM1 Drum Set）——名稱要反映音源真正會發出的聲音。
  */
 export function gmProgramNameZh(program, isDrum = false) {
   if (!Number.isInteger(program) || program < 0 || program > 127) return '';
@@ -534,16 +484,17 @@ function parseTrack(body, trackIndex, warn) {
           else warn(`track ${trackIndex} 的 tick ${ev.tick}：出現第二個 Device Name（FF 09），RP-019 規定一軌只能有一個，已忽略`);
         }
         else if (type === META.PORT) {
-          if (port === null) port = ev.port ?? null;
+          if (port === null) port = ev.port ?? null; // 之後若又出現不同的值，取最後一個（官方 SpessaSynth 整條軌用最後的 port）
           // FF 21（Port／Cable 編號）其實不在 RP-001 正式定義的 meta event 清單裡（該清單只到
           // FF 00/01-0F/03/04/05/06/07/20/2F/51/54/58/59/7F），是業界（Cakewalk、Cubase 等）
           // 常見但沒有被正式標準化的慣例欄位。RP-019 定義的是 FF 09 Device Name，該文件把
           // Device Name 描述成「取代 cable number（也就是這裡的 FF 21）的更好做法」，隱含同一個
           // 「一軌對應一個裝置」的假設，但這是慣例上的推論，不是 RP-019 對 FF 21 本身的規定
-          // ——中途改變代表這軌違反了這個推論出來的慣例，partIdOf() 不含 port（A8），這種
-          // 檔案裡重複的 channel 號碼可能被誤併成同一聲部。
+          // ——中途改變代表這軌違反了這個推論出來的慣例；整條軌一律用最後的 port 算絕對 channel
+          // （buildPortOffsets()），同一軌內重複的 channel 號碼可能因此被誤併成同一個 voice。
           else if (ev.port !== port) {
-            warn(`track ${trackIndex} 的 tick ${ev.tick}：MIDI Port（FF 21，業界慣例欄位，非 RP-001 正式定義）中途從 ${port} 改成 ${ev.port}，違反「一軌對應一個裝置」的慣例，之後重複的 channel 號碼可能被誤併成同一聲部`);
+            warn(`track ${trackIndex} 的 tick ${ev.tick}：MIDI Port（FF 21，業界慣例欄位，非 RP-001 正式定義）中途從 ${port} 改成 ${ev.port}，違反「一軌對應一個裝置」的慣例，整條軌改用最後的 port`);
+            port = ev.port;
           }
         }
         else if (type === META.END_OF_TRACK) {
@@ -628,8 +579,11 @@ function buildTempoMap(tracks, division, warn) {
     if (!(ev.microsecondsPerQuarter > 0)) continue;
     const last = map[map.length - 1];
     if (last && last.tick === ev.tick) {
+      // 同一個 tick 有多個速度事件：後出現者生效（軌序、事件序在後的），跟官方 SpessaSynth 一致。
       if (last.microsecondsPerQuarter !== ev.microsecondsPerQuarter) {
-        warn(`tick ${ev.tick} 有互相衝突的速度事件（track ${trackIndex} 指定 ${ev.bpm.toFixed(2)} BPM），採用先出現的那一個`);
+        warn(`tick ${ev.tick} 有互相衝突的速度事件（track ${trackIndex} 指定 ${ev.bpm.toFixed(2)} BPM），採用後出現的那一個`);
+        last.microsecondsPerQuarter = ev.microsecondsPerQuarter;
+        last.bpm = ev.bpm;
       }
       continue;
     }
@@ -681,16 +635,86 @@ function buildSignatureList(tracks, type, decorate, fallback) {
 }
 
 /* ═══════════════════════════════════════════
-   解析：音符配對
+   解析：聲部切分（Part／voice）與音符配對
    ═══════════════════════════════════════════ */
 
-// 一個「聲部」＝ track × channel × program 這個組合。這個 id 不含 port（A8）與 bank（A9）：
-// 同一軌內若用 FF21 中途切換 port、channel 號碼重複的兩段會被誤併成同一聲部；同一
-// channel＋program 但中途換過 bank（音色庫內的變體音色，例如同一個 Vibraphone 換成
-// wide 版）的音符也會被當成同一聲部，bank 只用來標註顯示名稱（見 collectParts()），
-// 不影響切分。這兩者在這個專案目前遇到的檔案裡都沒有出現過。
-function partIdOf(trackIndex, channel, program) {
-  return `t${trackIndex}c${channel}p${program}`;
+// 切分規則（一條規則，沒有「是不是 MuseScore 檔」的分支）：
+//   part ＝ MuseScore 的一個樂器（可指派的單位）。MuseScore 匯出時一個譜表一條 track，只有樂器「最上面一行譜」的 track
+//   在 tick 0 對這個樂器的每個 channel 寫初始化區塊（CC121、[Bank]、Program Change、CC7／10／91／93），下面的譜表沒有。
+//   所以依軌序掃描：一條 track 併入「目前這一組」，當且僅當它沒有初始化區塊（hasInit）、軌名跟這組首軌相同（任一方是空
+//   的也算相同）、它的音符 channel 全在這組已知的 channel 內；否則自成新的一組。沒有音符的組（Meta 軌、空軌）不成聲部。
+//   voice ＝ 組內每一個「有音符的 (track, channel)」（一個譜表 × 一個樂器 channel：鋼琴兩行譜是兩個 voice，弓弦的
+//   pizzicato channel 有音時是另一個 voice）。
+//   不推導高階資訊：譜號、旋律／伴奏、Voice 1–4、演奏法、踏板線、動態曲線、反覆記號在 MIDI 裡不存在或不精準，硬推只會
+//   多出誤判，所以不做。已知限制：同一條 track 內的多個 channel 視為同一個樂器的音色層（format 0 的多樂器 GM 檔不會被拆開）。
+
+const CC_BANK_MSB = 0;
+const CC_BANK_LSB = 32;
+const CC_RESET_ALL_CONTROLLERS = 121;
+// 混音器的四個 CC：音量、聲像、殘響、合唱（MuseScore 的 Mixer 面板數值）。
+const MIXER_CC = Object.freeze({ 7: 'volume', 10: 'pan', 91: 'reverb', 93: 'chorus' });
+// 沒有初始化區塊時下游送的 GM 預設值（CC121 依規格不會重設音量與聲像，見 GML-v1 §3.2.5.2）。
+const GM_DEFAULT_MIXER = Object.freeze({ volume: 100, pan: 64, reverb: 0, chorus: 0 });
+
+// 逐軌摘要：有音符的 channel、tick 0 的初始化（每個 channel 的 program／bank／混音 CC，同一個值取最後一次）、
+// hasInit（tick 0 有 CC121 或混音 CC；單獨的 Program Change 不算——MuseScore 下行譜有時只有 Program Change）。
+function summarizeTrack(track) {
+  const noteChannels = new Set();
+  const initByChannel = new Map(); // channel → { program, msb, lsb, volume, pan, reverb, chorus }
+  let hasInit = false;
+  for (const ev of track.events) {
+    if (ev.kind !== 'channel') continue;
+    if (ev.type === 'noteOn' && ev.data2 > 0) noteChannels.add(ev.channel);
+    if (ev.tick !== 0 || (ev.type !== 'programChange' && ev.type !== 'controlChange')) continue;
+    let init = initByChannel.get(ev.channel);
+    if (!init) initByChannel.set(ev.channel, (init = {}));
+    if (ev.type === 'programChange') {
+      init.program = ev.data1;
+    } else if (ev.type === 'controlChange') {
+      const cc = ev.data1;
+      if (cc === CC_RESET_ALL_CONTROLLERS || cc in MIXER_CC) hasInit = true;
+      if (cc === CC_BANK_MSB) init.msb = ev.data2;
+      else if (cc === CC_BANK_LSB) init.lsb = ev.data2;
+      else if (cc in MIXER_CC) init[MIXER_CC[cc]] = ev.data2;
+    }
+  }
+  return { track, noteChannels, initByChannel, hasInit };
+}
+
+// 依軌序把 track 分組（＝part）：規則見上方說明。回傳只含有音符的組，每組 { first, tracks, knownChannels }。
+function groupTracks(summaries) {
+  const groups = [];
+  let cur = null;
+  for (const s of summaries) {
+    const canMerge = cur && !s.hasInit
+      && (!s.track.name || !cur.first.track.name || s.track.name === cur.first.track.name)
+      && [...s.noteChannels].every((ch) => cur.knownChannels.has(ch));
+    if (canMerge) {
+      cur.tracks.push(s);
+      for (const ch of s.noteChannels) cur.knownChannels.add(ch);
+    } else {
+      cur = { first: s, tracks: [s], knownChannels: new Set([...s.initByChannel.keys(), ...s.noteChannels]) };
+      groups.push(cur);
+    }
+  }
+  return groups.filter((g) => g.tracks.some((t) => t.noteChannels.size > 0));
+}
+
+// 每條 track 的 channel 偏移（絕對 channel＝軌內 channel＋偏移），跟官方 SpessaSynth 一致：沒有指定 port（FF21）的 track
+// 用「最小的已指定 port」（都沒有就 0）；依軌序（只看有 channel 事件的軌）第一次出現的 port 配偏移 0、16、32…，
+// 用的是出現順序，不是 port 的數值。
+function buildPortOffsets(tracks) {
+  const withChannels = tracks.filter((t) => t.channels.length);
+  const given = withChannels.filter((t) => t.port !== null).map((t) => t.port);
+  const defaultPort = given.length ? Math.min(...given) : 0;
+  const offsetOfPort = new Map();
+  const offsets = new Map(); // trackIndex → 偏移
+  for (const t of withChannels) {
+    const port = t.port ?? defaultPort;
+    if (!offsetOfPort.has(port)) offsetOfPort.set(port, offsetOfPort.size * 16);
+    offsets.set(t.index, offsetOfPort.get(port));
+  }
+  return offsets;
 }
 
 // Program Change 是 channel 的狀態、跨軌共用，但「跨軌共用」不代表可以照檔案裡的軌道排列
@@ -699,8 +723,8 @@ function partIdOf(trackIndex, channel, program) {
 // Program Change；這軌自己從沒送過時，才查全曲所有軌、同 channel、時間點更早（同 tick 依
 // 軌序決定）的最後一次 Program Change；兩者都沒有就回傳規格預設值 0。
 // 呼叫端必須依「事件在檔案裡出現的順序」使用：換軌時呼叫 resetTrack()，逐一遇到 Program
-// Change 事件時呼叫 noteProgramChange()，查詢在這之間穿插進行——collectNotes()／
-// collectParts() 本來就是這樣逐軌逐事件處理，不需要額外排序。
+// Change 事件時呼叫 noteProgramChange()，查詢在這之間穿插進行——collectNotes() 本來就是這樣
+// 逐軌逐事件處理，不需要額外排序。
 function buildProgramResolver(tracks) {
   const globalByChannel = new Map(); // channel → [{tick, trackIndex, program}]（依 tick、軌序排序）
   for (const track of tracks) {
@@ -739,30 +763,25 @@ function buildProgramResolver(tracks) {
 }
 
 /**
+ * @param {string} partId
+ * @param {string} voiceId
  * @param {number} trackIndex
+ * @param {number} channel  絕對 channel（含 port 偏移）
  * @param {MidiChannelEvent} onEvent
  * @param {number} endTick
- * @param {number} offVelocity
  * @param {(tick:number) => number} tickToSeconds
- * @param {number} program  note-on 當下這個 channel 生效的音色（見 collectNotes 的 currentProgram）
  * @returns {MidiNote}
  */
-function makeNote(trackIndex, onEvent, endTick, offVelocity, tickToSeconds, program) {
+function makeNote(partId, voiceId, trackIndex, channel, onEvent, endTick, tickToSeconds) {
   const startSeconds = tickToSeconds(onEvent.tick);
   const endSeconds = tickToSeconds(endTick);
   return {
-    // 產生這顆音的那個 note-on 事件本身（同一個物件，不是複製）：note 這一層有樂理資訊
-    // （拍點、樂句、和弦），事件那一層才是位元組層級的原始資料。目前沒有任何地方會改寫它
-    // （parseMidi 的輸出都當唯讀），保留這個參照是為了萬一之後需要就地改力度之類的加工時，
-    // 兩層資料能對得起來，不必再重新對應一次。
-    onEvent,
+    partId,
+    voiceId,
     trackIndex,
-    channel: onEvent.channel,
-    program,
-    partId: partIdOf(trackIndex, onEvent.channel, program),
+    channel,
     note: onEvent.data1,
     velocity: onEvent.data2,
-    offVelocity,
     startTick: onEvent.tick,
     endTick,
     durationTicks: endTick - onEvent.tick,
@@ -772,25 +791,40 @@ function makeNote(trackIndex, onEvent, endTick, offVelocity, tickToSeconds, prog
   };
 }
 
-function collectNotes(tracks, tickToSeconds, warn, programResolver) {
+// 逐軌逐事件把 note-on／note-off 配成音，同時記下每個 voice 的統計（第一顆音當下生效的 program／bank、音符數、起訖、
+// 同音高重疊次數）。voiceIndex：`${trackIndex}:${軌內 channel}` → { partId, voiceId, channel（絕對） }。
+function collectNotes(tracks, tickToSeconds, warn, programResolver, voiceIndex) {
   const notes = [];
-  // 逐 channel 追蹤目前生效的音色，用來把每顆音歸到「它響起當下實際在吹奏的樂器」；
-  // 沒有明確 program change 時 GM 規格預設就是 0（Acoustic Grand Piano）。這是分聲部
-  // 除了 track×channel 之外還要看 program 的原因：一個 channel 中途換過音色，
-  // 換過去之後彈的音不該跟換之前混成同一個聲部（見 partIdOf 的說明）。
-  // program 查詢交給 buildProgramResolver()：Program Change 是 channel 的狀態、跨軌共用，
-  // 同一個 channel 可能被拆到好幾軌（一軌設定音色、音符寫在別軌），但「跨軌共用」不代表
-  // 可以照軌道處理順序決定值——要看這顆音那個時間點該 channel 實際生效的值，優先用同一軌
-  // 自己的紀錄，沒有才查全曲時間軸（見 buildProgramResolver() 的說明）。partId 仍然依
-  // partIdOf(track, channel, program) 各自獨立，不受影響——這裡只修正 program 的值本身。
+  const statsByVoice = new Map(); // voiceId → { program, bank, noteCount, startTick, endTick, overlaps }
+  const statsOf = (vk, program, bank) => {
+    let st = statsByVoice.get(vk.voiceId);
+    if (!st) statsByVoice.set(vk.voiceId, (st = { program, bank, noteCount: 0, startTick: Infinity, endTick: 0, overlaps: 0 }));
+    return st;
+  };
+  const emit = (vk, trackIndex, onEv, endTick) => {
+    const note = makeNote(vk.partId, vk.voiceId, trackIndex, vk.channel, onEv, endTick, tickToSeconds);
+    const st = statsByVoice.get(vk.voiceId);
+    st.noteCount++;
+    st.startTick = Math.min(st.startTick, note.startTick);
+    st.endTick = Math.max(st.endTick, note.endTick);
+    notes.push(note);
+  };
+
   for (const track of tracks) {
     programResolver.resetTrack();
+    const runningBank = new Map(); // channel → { msb, lsb }：這一軌到目前為止最後一次送的 Bank Select
     // key = channel * 128 + 音高。同一 key 可能同時有多顆未收尾的音（同音重疊），
     // 以先進先出配對：先響的音先被關掉，這是最貼近演奏直覺的解讀。
     const pending = new Map();
     for (const ev of track.events) {
       if (ev.kind !== 'channel') continue;
       if (ev.type === 'programChange') { programResolver.noteProgramChange(ev.channel, ev.data1); continue; }
+      if (ev.type === 'controlChange' && (ev.data1 === CC_BANK_MSB || ev.data1 === CC_BANK_LSB)) {
+        let b = runningBank.get(ev.channel);
+        if (!b) runningBank.set(ev.channel, (b = { msb: 0, lsb: 0 }));
+        if (ev.data1 === CC_BANK_MSB) b.msb = ev.data2; else b.lsb = ev.data2;
+        continue;
+      }
       const isNoteOn = ev.type === 'noteOn' && ev.data2 > 0;
       // 規格允許用「力度 0 的 note on」代替 note off（可讓整段音符共用 running status），
       // 實務上絕大多數檔案都這樣寫。
@@ -799,11 +833,13 @@ function collectNotes(tracks, tickToSeconds, warn, programResolver) {
 
       const key = ev.channel * 128 + ev.data1;
       if (isNoteOn) {
+        const vk = voiceIndex.get(`${track.index}:${ev.channel}`);
+        // voice 的 program／bank 取「第一顆音響起當下」生效的值（沒有初始化區塊時才會用到，見 buildPart()）。
+        const st = statsOf(vk, programResolver.programAt(ev.channel, ev.tick), runningBank.has(ev.channel) ? { ...runningBank.get(ev.channel) } : null);
         let queue = pending.get(key);
         if (!queue) pending.set(key, (queue = []));
-        // 記下 note-on 那一刻生效的音色，不是 note-off 那一刻的——決定「這是哪個樂器彈的」
-        // 應該看音符開始的當下，中途換音色不該回頭影響已經在響的音符。
-        queue.push({ ev, program: programResolver.programAt(ev.channel, ev.tick) });
+        if (queue.length) st.overlaps++;
+        queue.push({ ev, vk });
         continue;
       }
       const queue = pending.get(key);
@@ -811,246 +847,109 @@ function collectNotes(tracks, tickToSeconds, warn, programResolver) {
         warn(`track ${track.index} 的 tick ${ev.tick}：channel ${ev.channel} 音高 ${ev.data1} 有 note off 卻沒有對應的 note on，已忽略`);
         continue;
       }
-      const { ev: onEv, program } = queue.shift();
-      notes.push(makeNote(track.index, onEv, ev.tick, ev.type === 'noteOff' ? ev.data2 : 0, tickToSeconds, program));
+      const { ev: onEv, vk } = queue.shift();
+      emit(vk, track.index, onEv, ev.tick);
     }
     for (const [key, queue] of pending) {
-      for (const { ev: on, program } of queue) {
+      for (const { ev: on, vk } of queue) {
         warn(`track ${track.index} 的 tick ${on.tick}：channel ${(key / 128) | 0} 音高 ${key % 128} 的 note on 沒有對應的 note off，已在軌尾收尾`);
-        notes.push(makeNote(track.index, on, Math.max(on.tick, track.endTick), 0, tickToSeconds, program));
+        emit(vk, track.index, on, Math.max(on.tick, track.endTick));
       }
     }
   }
   notes.sort(
     (a, b) => a.startTick - b.startTick || a.trackIndex - b.trackIndex || a.channel - b.channel || a.note - b.note
   );
-  return notes;
+  return { notes, statsByVoice };
 }
 
-/* ═══════════════════════════════════════════
-   解析：聲部切分
-   ═══════════════════════════════════════════ */
-
-// 一個「聲部」＝（track, channel, program）這個組合上真的有音符的那一群事件。
-// 細到 channel 而不只看 track：同一軌常同時放同一件樂器的不同奏法（ch0 弓弦／ch1 撥弦／
-// ch2 震音），或把多件樂器塞在同一軌（format 0 更是全部擠在一軌）。只用 track 切會漏掉這層，
-// 只用 channel 切則會把不同軌的同號 channel 混在一起。
-// 還要看 program：同一個 channel 中途換過音色（program change）時，換過去之後彈的音已經是
-// 不同樂器在演奏，不該跟換之前的音混成同一個聲部——這種情況常見於受限在 16 個 channel、
-// 中途借用同一個 channel 切換音色的複雜總譜。
-
-/* ── 聲部的「高低音譜」與「旋律／和聲」判定（啟發式，門檻可調）──
-   MIDI 位元組層級沒有譜號、也沒有「這是主旋律」的欄位，只能從音高分佈與同時發聲數
-   反推。一份鋼琴 MIDI 常是「右手一軌、左手一軌」，切出來只會是「大鋼琴 1／2」，
-   分不出誰是旋律誰是伴奏——這裡補上 clef／role 兩個標籤，命名時用來取代無意義的數字尾碼。
-   這幾個門檻是憑樂理常識挑的；覺得判錯時直接調這裡的常數即可，不影響 parseMidi 的其他輸出。 */
-const CLEF_TREBLE_MEDIAN_MIN = 60; // 中位音高 ≥ 中央 C 才可能是高音譜
-const CLEF_TREBLE_LOW_MIN = 48;    // 且最低音不低於此，否則音域橫跨太廣 → mixed
-const CLEF_BASS_MEDIAN_MAX = 55;   // 中位音高 < 此值才可能是低音譜
-const CLEF_BASS_HIGH_MAX = 67;     // 且最高音不高於此
-const POLY_CHORDAL_MIN = 1.6;      // 平均同時發聲數 ≥ 此值 → 視為和弦／和聲
-const POLY_MONOPHONIC_MAX = 1.25;  // ≤ 此值 → 明確單音；中間是模糊帶，依 clef 傾向
-
-function medianOf(nums) {
-  if (!nums.length) return null;
-  const s = [...nums].sort((a, b) => a - b);
-  const mid = s.length >> 1;
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-}
-
-// 「作響期間的平均同時發聲數」＝ 所有音符的總持續 tick ÷ 聲部的時間跨度。
-// 單音線 ≈ 1（音符首尾相接）、和弦聲部 ≈ 每個和弦的音數。免 sweep-line。
-function polyphonyAverage(sumDurationTicks, spanTicks) {
-  return spanTicks > 0 ? sumDurationTicks / spanTicks : 1;
-}
-
-function classifyClef(medianNote, lowestNote, highestNote) {
-  if (medianNote == null) return null;
-  if (medianNote >= CLEF_TREBLE_MEDIAN_MIN && lowestNote >= CLEF_TREBLE_LOW_MIN) return 'treble';
-  if (medianNote < CLEF_BASS_MEDIAN_MAX && highestNote <= CLEF_BASS_HIGH_MAX) return 'bass';
-  return 'mixed';
-}
-
-function classifyRole(polyphonyAvg, clef) {
-  if (clef == null) return null;
-  if (polyphonyAvg >= POLY_CHORDAL_MIN) return 'harmony';
-  if (polyphonyAvg <= POLY_MONOPHONIC_MAX) return clef === 'bass' ? 'bass' : 'melody';
-  // 模糊帶：偏單音，依 clef 傾向（treble→旋律、bass→低音線、mixed→歸進伴奏最安全）
-  if (clef === 'treble') return 'melody';
-  if (clef === 'bass') return 'bass';
-  return 'harmony';
-}
-
-// 同名聲部（三部小提琴、鋼琴左右手都是「大鋼琴」）用來區分的描述子。
-// clef=bass 且 role=bass 時兩段都是「低音」，去重成單一「低音」。
-const CLEF_LABEL = Object.freeze({ treble: '高音', bass: '低音', mixed: '' });
-const ROLE_LABEL = Object.freeze({ melody: '旋律', harmony: '伴奏', bass: '低音' });
-function partDescriptor(part) {
-  const clefLabel = CLEF_LABEL[part.clef] ?? '';
-  const roleLabel = ROLE_LABEL[part.role] ?? '';
-  const segs = [];
-  if (clefLabel) segs.push(clefLabel);
-  if (roleLabel && roleLabel !== clefLabel) segs.push(roleLabel);
-  return segs.join('·');
-}
-
-/**
- * @param {MidiTrack[]} tracks
- * @param {MidiNote[]} notes
- * @param {(msg:string) => void} warn
- * @returns {MidiPart[]}
- */
-function collectParts(tracks, notes, warn, programResolver) {
-  const stats = new Map();
-  for (const note of notes) {
-    let stat = stats.get(note.partId);
-    if (!stat) {
-      stats.set(note.partId, (stat = {
-        trackIndex: note.trackIndex,
-        channel: note.channel,
-        program: note.program,
-        noteCount: 0,
-        startTick: note.startTick,
-        endTick: note.endTick,
-        lowestNote: note.note,
-        highestNote: note.note,
-        // 下面 clef／role 判定用的暫存，建立 part 物件時會被排除、不外流
-        pitches: [],
-        sumDurationTicks: 0,
-      }));
-    }
-    stat.noteCount++;
-    stat.startTick = Math.min(stat.startTick, note.startTick);
-    stat.endTick = Math.max(stat.endTick, note.endTick);
-    stat.lowestNote = Math.min(stat.lowestNote, note.note);
-    stat.highestNote = Math.max(stat.highestNote, note.note);
-    stat.pitches.push(note.note);
-    stat.sumDurationTicks += note.durationTicks;
-  }
-
-  // 各 (track, channel, program) 的 Bank Select（CC0 MSB / CC32 LSB）。GM2 §3.3.1：Bank
-  // Select 本身不改變聲音，要等後續 Program Change 才生效——這裡的 `running` map 只累積
-  // 「這一軌目前收到的 bank 值」，只有在 Program Change 那一刻才真正寫進 `banks`，就是這個
-  // 生效規則的實作，不需要另外拆 pendingBank／activeBank 兩個欄位。沒有 program change 的
-  // channel 就取整軌看到的最後一組（此時 program 是 GM 預設值 0）——這種情況嚴格來說那個
-  // bank 從未真正生效過，這裡是用「最後一組」硬猜，屬已知的邊緣情況（A9）。這個 map 只收
-  // 「檔案真的送過 Bank Select」的聲部：完全沒送過的聲部在這裡查不到（undefined），刻意跟
-  // 「真的送了 MSB 0」區分開來——GM2 §3.3.1 明訂的規格預設值（channel 9 是 78H/00H，其餘是
-  // 79H/00H）留給 collectParts() 在查不到時才補上，不寫死在這個 map 裡。
-  const banks = new Map(); // id → { msb, lsb }
-  // program 查詢交給 buildProgramResolver()（跟 collectNotes() 共用同一份，見該函式呼叫端），
-  // 理由相同：一軌只送 Bank Select、真正的 Program Change 在別軌（或在更早的時間點）時，
-  // 不能被「檔案裡軌道排列順序」誤導。
-  for (const track of tracks) {
-    programResolver.resetTrack();
-    const running = new Map(); // channel → { msb, lsb }（這一軌目前生效的 bank）
-    for (const ev of track.events) {
-      if (ev.kind !== 'channel') continue;
-      if (ev.type === 'controlChange' && (ev.data1 === 0 || ev.data1 === 32)) {
-        let b = running.get(ev.channel);
-        if (!b) running.set(ev.channel, (b = { msb: 0, lsb: 0 }));
-        if (ev.data1 === 0) b.msb = ev.data2; else b.lsb = ev.data2;
-        continue;
+// 一組 track（part）→ part 物件與底下的 voice。voice 的初始狀態：
+//   · 這組首軌在 tick 0 對這個 channel 有初始化 → 直接採用（program；bank；混音 CC7／10／91／93，缺的補 GM 預設）。
+//     下行譜的 voice 沿用首軌對同一個 channel 的初始化（MuseScore 只在最上行譜寫初始化區塊）。
+//   · 沒有 → program 沿用時間軸查詢（自己軌優先、再查全曲、預設 0；見 buildProgramResolver），bank 取第一顆音之前最後一次
+//     送的 CC0／CC32，混音 init 記 null（下游用 GM 預設）。
+//   · bank 都沒送過時用 GM2 §3.3.1 的規格預設（絕對 channel 的第 10 個 channel 是節奏 bank 120，其餘是旋律 bank 121）；
+//     percussionKit ＝ bank MSB 為 120（GM2 §2.4：任何 channel 送 Bank 78H 都是節奏通道，不限 channel 9）。
+function buildPart(group, partId, statsByVoice, voiceIndex, warn) {
+  const voices = [];
+  for (const summary of group.tracks) {
+    for (const channel of [...summary.noteChannels].sort((a, b) => a - b)) {
+      const vk = voiceIndex.get(`${summary.track.index}:${channel}`);
+      const st = statsByVoice.get(vk.voiceId);
+      const fromInit = group.first.initByChannel.get(channel) || null;
+      const hasBank = fromInit && (fromInit.msb !== undefined || fromInit.lsb !== undefined);
+      const defaultMsb = vk.channel % 16 === DRUM_CHANNEL ? 120 : 121;
+      const bank = hasBank ? { msb: fromInit.msb ?? defaultMsb, lsb: fromInit.lsb ?? 0 } : (st.bank ?? { msb: defaultMsb, lsb: 0 });
+      const program = fromInit?.program ?? st.program;
+      const percussionKit = bank.msb === 120;
+      const hasMixer = fromInit && Object.values(MIXER_CC).some((k) => fromInit[k] !== undefined);
+      const init = hasMixer ? Object.fromEntries(Object.entries(GM_DEFAULT_MIXER).map(([k, d]) => [k, fromInit[k] ?? d])) : null;
+      if (percussionKit && !(program in GM_DRUM_KITS)) {
+        // 這裡只確定「不是 GM2 規格附錄 B 定義的編號」，顯示名稱因此只能退回用「標準鼓組」代替
+        // （見 gmProgramNameZh() 的說明）——但實際播放時會不會也退回標準鼓組，取決於載入的
+        // SoundFont 有沒有另外提供這個編號的鼓組（查證過 GeneralUserGS.sf3 就額外提供了
+        // program 1/2/26/127 這幾組，不會真的退回標準鼓組），這裡不能斷言一定會退回，只能
+        // 提醒顯示名稱不準確。
+        warn(`track ${summary.track.index} 的 channel ${channel}：鼓組 program ${program} 不是 GM2 規格附錄 B 定義的編號，顯示名稱只能用「標準鼓組」代替，實際會播放哪一組鼓聲取決於載入的 SoundFont 有沒有提供這個編號`);
       }
-      if (ev.type !== 'programChange') continue;
-      programResolver.noteProgramChange(ev.channel, ev.data1);
-      const id = partIdOf(track.index, ev.channel, ev.data1);
-      const active = running.get(ev.channel);
-      if (active && !banks.has(id)) banks.set(id, { ...active });
-    }
-    for (const [ch, b] of running) {
-      // 這一軌收到 Bank Select 卻始終沒收到 Program Change 的 channel：用這一軌結束時
-      // 該 channel 實際生效的 program（自己軌優先、沒有才查全曲時間軸）決定要掛到哪個
-      // partId 上——這仍然是硬猜（A9 既有的已知邊緣情況），但依時間軸查詢至少比「檔案裡
-      // 軌道排列順序」準確。
-      const id = partIdOf(track.index, ch, programResolver.programAt(ch, track.endTick));
-      if (!banks.has(id)) banks.set(id, { ...b });
+      if (st.overlaps) {
+        warn(`track ${summary.track.index} 的 channel ${channel}：同音高重疊 ${st.overlaps} 次（依先進先出配對，每個 note-on 配到最早還沒結束的那顆音）`);
+      }
+      voices.push({
+        id: vk.voiceId, partId, trackIndex: summary.track.index, channel: vk.channel, program, bank, percussionKit, init,
+        noteCount: st.noteCount, startTick: st.startTick, endTick: st.endTick,
+      });
     }
   }
-
-  const parts = [];
-  for (const [id, stat] of stats) {
-    // pitches／sumDurationTicks 只是 clef／role 判定的中間值，不放進對外的 part 物件
-    const { pitches, sumDurationTicks, ...statPublic } = stat;
-    const track = tracks[stat.trackIndex];
-    const program = stat.program;
-    // GM2 §3.3.1 明訂的規格預設值：channel 9（人類講的「第 10 軌道」）預設 78H(120)／00H
-    // （節奏 bank），其餘 channel 預設 79H(121)／00H（旋律 bank）——檔案完全沒送過 Bank
-    // Select 時，「這個聲部現在生效的 bank」就是這個規格預設值，不是憑空猜的 0。
-    const defaultMsb = stat.channel === DRUM_CHANNEL ? 120 : 121;
-    const bank = banks.get(id) || { msb: defaultMsb, lsb: 0 };
-    const isDrum = stat.channel === DRUM_CHANNEL;    // 只是 channel 號碼本身，給下游對應合成器打擊 channel 用
-    const percussionKit = bank.msb === 120;          // GM2 §2.4：任何 channel 送 Bank 78H 都是節奏通道，不限 channel 9
-    // 打擊／鼓組聲部沒有音高譜號的概念，clef／role／medianNote 一律 null（命名退回數字尾碼）
-    const medianNote = percussionKit ? null : medianOf(pitches);
-    const polyphonyAvg = polyphonyAverage(sumDurationTicks, stat.endTick - stat.startTick);
-    const clef = percussionKit ? null : classifyClef(medianNote, stat.lowestNote, stat.highestNote);
-    const role = percussionKit ? null : classifyRole(polyphonyAvg, clef);
-    if (percussionKit && !(program in GM_DRUM_KITS)) {
-      // 這裡只確定「不是 GM2 規格附錄 B 定義的編號」，顯示名稱因此只能退回用「標準鼓組」代替
-      // （見 gmProgramName() 的說明）——但實際播放時會不會也退回標準鼓組，取決於載入的
-      // SoundFont 有沒有另外提供這個編號的鼓組（查證過 GeneralUserGS.sf3 就額外提供了
-      // program 1/2/26/127 這幾組，不會真的退回標準鼓組），這裡不能斷言一定會退回，只能
-      // 提醒顯示名稱不準確。
-      warn(`track ${stat.trackIndex} 的 channel ${stat.channel}：鼓組 program ${program} 不是 GM2 規格附錄 B 定義的編號，顯示名稱只能用「標準鼓組」代替，實際會播放哪一組鼓聲取決於載入的 SoundFont 有沒有提供這個編號`);
-    }
-    parts.push({
-      id,
-      ...statPublic,
-      trackName: track.name,
-      instrumentName: track.instrumentName,
-      programs: [program], // 保留陣列形狀給呼叫端相容；分聲部現在本來就是一個 id 對一個 program
-      bank,
-      programName: gmProgramName(program, percussionKit),
-      isDrum,
-      percussionKit,
-      medianNote,
-      polyphonyAvg,
-      clef,
-      role,
-      name: '', // 下面補：要先數過所有聲部才知道哪些音色名需要加描述子／尾碼區分
-    });
-  }
-  parts.sort((a, b) => a.trackIndex - b.trackIndex || a.channel - b.channel);
-
-  // 命名：基底一律用 GM 音色的繁體中文名（不採信檔案裡的軌名／樂器名，見
-  // GM_PROGRAM_NAMES_ZH 的說明）。整份總譜裡有多個聲部共用同一個基底名時
-  // （三部小提琴、或鋼琴左右手都是「大鋼琴」），先試著用「高低音譜＋旋律／和聲」
-  // 的描述子把它們區分開（大鋼琴（高音·旋律）／大鋼琴（低音·伴奏））；描述子
-  // 不足以讓群組裡「每個都不一樣」時，才退回依聲部順序加數字尾碼「 1」「 2」…。
-  // 群組裡只有一個的，什麼後綴都不加。
-  const zhBaseOf = (part) => {
-    let n = gmProgramNameZh(part.program, part.percussionKit)
-      || `聲部 ${part.trackIndex + 1}-${part.channel + 1}`;
-    // 檔案用 Bank Select 選了非 GM 的變體音色（MSB 不是 GM/GM2 的 0/121、也不是鼓組
-    // 的 120）→ GM 名只能當近似，標註實際 bank 讓使用者知道。
-    if (!part.percussionKit && part.bank.msb !== 0 && part.bank.msb !== 121) {
-      n += `（非 GM bank ${part.bank.msb}:${part.bank.lsb}）`;
-    }
-    return n;
+  return {
+    id: partId,
+    name: '', // nameParts() 補：要先數過所有 part 才知道哪些音色名需要加序號
+    noteCount: voices.reduce((sum, v) => sum + v.noteCount, 0),
+    startTick: Math.min(...voices.map((v) => v.startTick)),
+    endTick: Math.max(...voices.map((v) => v.endTick)),
+    voices,
   };
-  const groups = new Map(); // 基底名 → 同名聲部（維持 parts 的排序）
-  for (const part of parts) {
-    const base = zhBaseOf(part);
-    if (!groups.has(base)) groups.set(base, []);
-    groups.get(base).push(part);
-  }
-  for (const [base, group] of groups) {
-    if (group.length === 1) { group[0].name = base; continue; }
-    const descriptors = group.map(partDescriptor);
-    const allDistinct = descriptors.every((d) => d) && new Set(descriptors).size === group.length;
-    // GM 中文表裡有些基底名稱本身就以數字結尾（「弦樂合奏 1」「擊弦貝斯 1」之類），退回數字
-    // 尾碼區分時如果直接疊加空格＋數字，會變成「弦樂合奏 1 1」這種容易誤讀的雙重編號——改用
-    // 括號＋序號，不會跟基底名稱本來就有的數字混在一起。
-    const baseEndsWithDigit = /\d$/.test(base);
-    group.forEach((part, i) => {
-      if (allDistinct) { part.name = `${base}（${descriptors[i]}）`; return; }
-      part.name = baseEndsWithDigit ? `${base}（${i + 1}）` : `${base} ${i + 1}`;
-    });
+}
+
+// 命名：基底名＝part 的主 voice（音符最多，同數取 channel 小者）的 GM 繁中音色名，打擊用鼓組名，查不到才用「聲部 N」；
+// 不採信軌名、不放高低音譜／旋律伴奏／bank 的任何描述。整份總譜有 ≥2 個 part 基底名相同時依 part 順序（＝總譜由上而下）
+// 加序號「 1」「 2」…；基底名本身以數字結尾（「弦樂合奏 1」）改用全形括號「（1）」，免得疊成「弦樂合奏 1 1」這種容易誤讀的雙重編號。
+function nameParts(parts) {
+  const bases = parts.map((part, i) => {
+    const main = [...part.voices].sort((a, b) => b.noteCount - a.noteCount || a.channel - b.channel)[0];
+    return gmProgramNameZh(main.program, main.percussionKit) || `聲部 ${i + 1}`;
+  });
+  const sameBase = (i) => bases.filter((b) => b === bases[i]).length;
+  const seen = new Map();
+  parts.forEach((part, i) => {
+    if (sameBase(i) === 1) { part.name = bases[i]; return; }
+    const n = (seen.get(bases[i]) || 0) + 1;
+    seen.set(bases[i], n);
+    part.name = /\d$/.test(bases[i]) ? `${bases[i]}（${n}）` : `${bases[i]} ${n}`;
+  });
+}
+
+// 整個聲部切分：track 摘要 → 分組（part）→ 配對音符（同時算 voice 統計）→ 組成 part／voice → 命名。
+function collectPartsAndNotes(tracks, tickToSeconds, warn, programResolver) {
+  const portOffsets = buildPortOffsets(tracks);
+  const groups = groupTracks(tracks.map(summarizeTrack));
+  // `${trackIndex}:${軌內 channel}` → { partId, voiceId, channel（絕對） }；part id ＝ p＋首軌序號，voice id ＝ t＋軌序號＋c＋絕對 channel。
+  const voiceIndex = new Map();
+  const partIds = new Map(groups.map((g) => [g, `p${g.first.track.index}`]));
+  for (const group of groups) {
+    for (const summary of group.tracks) {
+      for (const channel of summary.noteChannels) {
+        const abs = channel + (portOffsets.get(summary.track.index) ?? 0);
+        voiceIndex.set(`${summary.track.index}:${channel}`, { partId: partIds.get(group), voiceId: `t${summary.track.index}c${abs}`, channel: abs });
+      }
+    }
   }
 
+  const { notes, statsByVoice } = collectNotes(tracks, tickToSeconds, warn, programResolver, voiceIndex);
+  const parts = groups.map((group) => buildPart(group, partIds.get(group), statsByVoice, voiceIndex, warn));
+  nameParts(parts);
   if (!parts.length) warn('這份檔案裡沒有任何音符，切分不出聲部');
-  return parts;
+  return { parts, notes };
 }
 
 /* ═══════════════════════════════════════════
@@ -1185,14 +1084,12 @@ function validateStructuralConventions(tracks, format, warn) {
 /**
  * 一顆音（note-on 配對到 note-off 之後的結果），由 collectNotes() 產生。
  * @typedef {object} MidiNote
- * @property {MidiChannelEvent} onEvent  產生這顆音的 note-on 事件本身（同一個物件，見 makeNote 的說明）
+ * @property {string} partId  所屬 part（MuseScore 的一個樂器）
+ * @property {string} voiceId  所屬 voice（一個譜表 × 一個樂器 channel）
  * @property {number} trackIndex
- * @property {number} channel
- * @property {number} program  這顆音 note-on 當下這個 channel 生效的音色
- * @property {string} partId  t{trackIndex}c{channel}p{program}
+ * @property {number} channel  絕對 channel：軌內 channel 加上 port 偏移（依 port 第一次出現的順序 +16，跟官方 SpessaSynth 一致）
  * @property {number} note  音高 0~127
- * @property {number} velocity  note-on 當下的力度（onEvent.data2 的快照）
- * @property {number} offVelocity
+ * @property {number} velocity  note-on 的力度
  * @property {number} startTick
  * @property {number} endTick
  * @property {number} durationTicks
@@ -1202,32 +1099,33 @@ function validateStructuralConventions(tracks, format, warn) {
  */
 
 /**
- * 一個聲部 ＝ 一個 (track, channel, program) 組合，由 collectParts() 產生。同一個 channel
- * 中途換過音色時，換過去之後的音符會被視為不同聲部（見 midiParser.js 開頭「聲部切分」的說明）。
- * @typedef {object} MidiPart
- * @property {string} id  t{trackIndex}c{channel}p{program}
+ * 一個 voice ＝ 組內一個「有音符的 (track, channel)」：一個譜表 × 一個樂器 channel（排程單位）。
+ * @typedef {object} MidiVoice
+ * @property {string} id  t{trackIndex}c{絕對 channel}
+ * @property {string} partId
  * @property {number} trackIndex
- * @property {number} channel
+ * @property {number} channel  絕對 channel（含 port 偏移）
+ * @property {number} program  GM program：有初始化區塊用 tick 0 的值，沒有就依時間軸查詢（預設 0）
+ * @property {{msb:number, lsb:number}} bank  Bank Select；檔案從未送過就是 GM2 §3.3.1 的規格預設值
+ *   （第 10 個 channel 為 120/0 節奏，其餘為 121/0 旋律）
+ * @property {boolean} percussionKit  bank MSB 是否為 120（GM2 §2.4：任何 channel 都可以切成節奏通道）
+ * @property {{volume:number, pan:number, reverb:number, chorus:number}|null} init
+ *   tick 0 的混音初始化（CC7／10／91／93，缺的補 GM 預設）；沒有初始化區塊是 null（下游用 GM 預設 100／64／0／0）
  * @property {number} noteCount
  * @property {number} startTick
  * @property {number} endTick
- * @property {number} lowestNote
- * @property {number} highestNote
- * @property {string} trackName  只是 metadata，命名不用它（見 GM_PROGRAM_NAMES_ZH 的說明）
- * @property {string} instrumentName
- * @property {number} program  這個聲部固定使用的音色；沒有明確 program change 就是 GM 預設值 0
- * @property {number[]} programs  相容用的陣列形狀，恆為 [program]（見上）
- * @property {{msb:number, lsb:number}} bank  這個 program change 當下生效的 Bank Select；
- *   檔案從未送過就是 GM2 §3.3.1 的規格預設值（channel 9 為 120/0，其餘為 121/0）
- * @property {string} programName  GM 英文名
- * @property {boolean} isDrum  channel 9（只是 channel 號碼，跟 percussionKit 的判定各自獨立）
- * @property {boolean} percussionKit  這個聲部生效的 Bank Select MSB 是否為 120（GM2 §2.4／
- *   §3.3.1：沒送過 Bank Select 時採用規格預設值，channel 9 為 120、其餘為 121）
- * @property {number|null} medianNote  鼓組為 null
- * @property {number} polyphonyAvg  作響期間的平均同時發聲數
- * @property {'treble'|'bass'|'mixed'|null} clef
- * @property {'melody'|'harmony'|'bass'|null} role
- * @property {string} name  顯示名稱（GM 繁中音色名＋描述子／數字尾碼）
+ */
+
+/**
+ * 一個聲部（part）＝ MuseScore 的一個樂器，可指派的單位；底下有一個以上的 voice（鋼琴兩行譜是兩個 voice）。
+ * 切分規則見 midiParser.js 的「聲部切分」說明。
+ * @typedef {object} MidiPart
+ * @property {string} id  p{首軌的 track 序號}
+ * @property {string} name  GM 繁中音色名（取主 voice 的音色；同名依序加序號）
+ * @property {number} noteCount
+ * @property {number} startTick
+ * @property {number} endTick
+ * @property {MidiVoice[]} voices
  */
 
 /**
@@ -1242,7 +1140,7 @@ function validateStructuralConventions(tracks, format, warn) {
  * @property {TimeSignatureEntry[]} timeSignatures  保證至少一筆、且第一筆在 tick 0
  * @property {KeySignatureEntry[]} keySignatures  同上
  * @property {MidiNote[]} notes  依 startTick 排序
- * @property {MidiPart[]} parts  依 trackIndex、channel 排序
+ * @property {MidiPart[]} parts  依首軌的 track 序號排序（＝總譜由上而下）
  * @property {number} durationTicks
  * @property {number} durationSeconds
  * @property {(tick:number) => number} tickToSeconds  依速度表把 tick 換算成秒
@@ -1332,11 +1230,9 @@ export function parseMidi(input) {
     { sharpsFlats: 0, minor: false }
   );
 
-  // 兩邊都需要「program 依時間軸查詢」的邏輯，共用同一份 resolver 的全曲時間軸（不用各自
-  // 重掃一次全曲的 Program Change 事件），見 buildProgramResolver() 的說明。
+  // program 依時間軸查詢（沒有初始化區塊的 voice 用），見 buildProgramResolver() 的說明。
   const programResolver = buildProgramResolver(tracks);
-  const notes = collectNotes(tracks, tickToSeconds, warn, programResolver);
-  const parts = collectParts(tracks, notes, warn, programResolver);
+  const { parts, notes } = collectPartsAndNotes(tracks, tickToSeconds, warn, programResolver);
   const durationTicks = tracks.reduce((max, t) => Math.max(max, t.endTick), 0);
 
   return {
