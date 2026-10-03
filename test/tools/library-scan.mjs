@@ -30,6 +30,8 @@ const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'l
 const ONLY = new Set(String(args.only || 'parse,autoplay,perform,scenarios').split(','));
 const LIMIT = Number(args.limit) || Infinity;
 const TICK_TOL_MS = 12.5;                          // 一個排程 tick（12ms）加浮點容差
+const GATE_PREEMPT_PCT = 5;                        // 穩定揮手（抖動 ±15％）：電腦搶在揮手前放行的比例上限（％）
+const GATE_MISS_LAG_BEATS = 0.35;                  // 漏揮：補位比「該揮的時間」晚的拍數中位數上限（τ＋量化誤差）
 const PRELUDE_SKEW_TOL_MS = 60;                    // 前奏照原速：揮手間隔剛好等於拍長時估速收斂在 1，容許幾個 tick 的誤差；被追趕衝過去會差好幾秒
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -186,8 +188,8 @@ function buildScenarios(score, rnd) {
   // syncTolMs：同刻音發聲差的容許值。演奏者之間錯開的情境，晚幾十 ms 才揮第一下的人，他拍首的音是補上的（見
   // humanPerformer.js 的合併窗），所以容許值要加上最大的錯開量。
   // track：單人每拍揮一次、沒有漏揮的情境，另外量揮手→發聲的延遲與共用拍位有沒有比演奏者多走。
-  const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS, track = false, preludeSec = null } = {}) => out.push({ name, players, exempt, syncTolMs, track, preludeSec });
-  const solo = (name, o, track = false) => add(name, [A], [{ partIds: [A], waves: waves(b0Of([A]), o) }], { track });
+  const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS, track = false, preludeSec = null, gate = null } = {}) => out.push({ name, players, exempt, syncTolMs, track, preludeSec, gate });
+  const solo = (name, o, track = false, gate = null) => add(name, [A], [{ partIds: [A], waves: waves(b0Of([A]), o) }], { track, gate });
 
   if (beats[b0Of([A])].startSeconds >= 2) solo('前奏提早揮手（第一下揮手落在前奏 30％處）', { leadMs: -beats[b0Of([A])].startSeconds * 700 });
   // 聲部開頭有空白（至少 4 拍，而且空白期間別的聲部有音）：演奏者從第 0 拍就照原速打拍子。前奏中的揮手只估速、不放行拍，
@@ -214,17 +216,26 @@ function buildScenarios(score, rnd) {
   solo('休止期間不揮手（單人，連續 4 拍不揮）', { skipBeats: [6, 10] });
   for (const sec of [0.6, 2, 8]) solo(`停手 ${sec} 秒後回來（單人，第 11 拍）`, { pause: [10, sec * 1000] });
   // 速度跟隨：factor＝揮手間隔是樂譜拍長的幾倍（<1 快、>1 慢），jitter＝每次間隔隨機偏差的比例（±）。
-  for (const factor of [0.7, 1, 1.25, 1.6]) for (const jitter of [0.15, 0.3]) solo(`穩定揮手 ×${factor}、抖動 ±${jitter * 100}％（單人）`, { factor, jitter }, true);
-  solo('漸快（單人，揮手間隔從 ×1.4 漸漸縮到 ×0.6）', { factorAt: (k, n) => 1.4 - (0.8 * k) / n }, true);
-  solo('漸慢（單人，揮手間隔從 ×0.6 漸漸拉長到 ×1.4）', { factorAt: (k, n) => 0.6 + (0.8 * k) / n }, true);
-  solo('突然變快（單人，第 20 拍起揮手間隔從 ×1 變 ×0.5）', { factorAt: (k) => (k < 20 ? 1 : 0.5) }, true);
-  solo('突然變慢（單人，第 20 拍起揮手間隔從 ×1 變 ×2）', { factorAt: (k) => (k < 20 ? 1 : 2) }, true);
+  // gate（量化門檻，不達標就算一筆不符合）：preemptPct＝電腦搶在揮手前放行的比例上限、aheadSongs＝共用拍位比演奏者數的拍多走的歌數上限
+  // （0＝不能有棘輪）、missLag＝漏揮補位晚拍數中位數上限；known＝已知未達標的原因（照樣量、印出來，但不算不符合，要修就移掉）。
+  for (const factor of [0.7, 1, 1.25, 1.6]) for (const jitter of [0.15, 0.3]) {
+    const gate = jitter === 0.15 ? { preemptPct: GATE_PREEMPT_PCT, aheadSongs: 0 } : null;
+    if (gate && factor === 1.25) gate.known = '揮手間隔比估計慢到 1.25 倍＋抖動時，電腦搶先約 10％，少數歌多走 4 拍';
+    if (gate && factor === 1.6) gate.known = '慢 1.6 倍時估計要幾拍才收斂，期間電腦搶先放行，部分歌多走 3 拍';
+    solo(`穩定揮手 ×${factor}、抖動 ±${jitter * 100}％（單人）`, { factor, jitter }, true, gate);
+  }
+  solo('漸快（單人，揮手間隔從 ×1.4 漸漸縮到 ×0.6）', { factorAt: (k, n) => 1.4 - (0.8 * k) / n }, true, { aheadSongs: 0 });
+  solo('漸慢（單人，揮手間隔從 ×0.6 漸漸拉長到 ×1.4）', { factorAt: (k, n) => 0.6 + (0.8 * k) / n }, true, { aheadSongs: 0 });
+  solo('突然變快（單人，第 20 拍起揮手間隔從 ×1 變 ×0.5）', { factorAt: (k) => (k < 20 ? 1 : 0.5) }, true, { aheadSongs: 0 });
+  solo('突然變慢（單人，第 20 拍起揮手間隔從 ×1 變 ×2）', { factorAt: (k) => (k < 20 ? 1 : 2) }, true,
+    { aheadSongs: 0, known: '估計收斂前（約 10 拍）電腦已經多放行 2 拍，這個位移之後不會消失（N2 已知取捨）' });
   // 漏揮：電腦在「該揮的時間＋τ」替你放行，你下一次準時的揮手不該多推一拍。
-  for (const p of [0.1, 0.3]) solo(`隨機漏揮 ${p * 100}％（單人，抖動 ±10％）`, { skipProb: p, jitter: 0.1 }, true);
-  solo('連續漏 3 拍（單人，第 9～11 拍）', { skipBeats: [8, 11] }, true);
-  solo('每 4 拍漏 1 拍（單人）', { skipEvery: 4 }, true);
+  for (const p of [0.1, 0.3]) solo(`隨機漏揮 ${p * 100}％（單人，抖動 ±10％）`, { skipProb: p, jitter: 0.1 }, true,
+    { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0, ...(p === 0.3 ? { known: '連續漏揮多拍時補位相位漂移，漏揮 30％ 的補位約晚 2.7 拍' } : {}) });
+  solo('連續漏 3 拍（單人，第 9～11 拍）', { skipBeats: [8, 11] }, true, { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0 });
+  solo('每 4 拍漏 1 拍（單人）', { skipEvery: 4 }, true, { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0 });
   // 完全停手 N 拍後回來（錯過的拍全由電腦走）。
-  for (const n of [2, 8, 30]) solo(`停手 ${n} 拍後回來（單人，第 11 拍起）`, { skipBeats: [10, 10 + n] }, true);
+  for (const n of [2, 8, 30]) solo(`停手 ${n} 拍後回來（單人，第 11 拍起）`, { skipBeats: [10, 10 + n] }, true, { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0 });
   return out.map((sc) => ({ ...sc, b0: b0Of(sc.players.flatMap((p) => p.partIds)) }));
 }
 
@@ -234,7 +245,7 @@ function scanScenarios(songs) {
     for (const sc of buildScenarios(s.score, makeRng(7))) {
       const m = measure(simulate(s.score, sc.players), { exempt: sc.exempt, ...(sc.track ? { waves: sc.players[0].waves, b0: sc.b0 } : {}), preludeEndSec: sc.preludeSec });
       if (!byName.has(sc.name)) byName.set(sc.name, []);
-      byName.get(sc.name).push({ s, m, tol: sc.syncTolMs, track: sc.track });
+      byName.get(sc.name).push({ s, m, tol: sc.syncTolMs, track: sc.track, gate: sc.gate });
     }
   }
   console.log(`\n=== 情境掃描（每個情境的不變量：放行了的音都發聲、每個 noteOn 一個 noteOff、同刻音同一個 tick）===`);
@@ -251,6 +262,21 @@ function scanScenarios(songs) {
         + `電腦搶在揮手前放行 ${(100 * pre / waves).toFixed(1)}％（${pre}／${waves} 次揮手）；共用拍位比演奏者數的拍多走：${runs.filter((r) => r.m.ratchetWaves).length} 首（最多 ${Math.max(...runs.map((r) => r.m.ratchetMax))} 拍）；被壓縮 ${sum('compressed')}／${sum('adjacent')}`;
       const missLag = median(runs.map((r) => r.m.missLagMed));
       if (missLag != null) line += `；漏揮的拍由電腦補位，比他本來該揮的時間晚拍長的 ${missLag}`;
+    }
+    const gate = runs[0].gate;
+    if (gate) {
+      const waves = sum('waveCount'), pctPre = waves ? (100 * sum('preempted')) / waves : 0, ahead = runs.filter((r) => r.m.ratchetWaves).length;
+      const miss = median(runs.map((r) => r.m.missLagMed));
+      const fails = [];
+      if (gate.preemptPct != null && pctPre > gate.preemptPct) fails.push(`電腦搶在揮手前放行 ${pctPre.toFixed(1)}％ > ${gate.preemptPct}％`);
+      if (gate.aheadSongs != null && ahead > gate.aheadSongs) fails.push(`共用拍位多走的歌 ${ahead} 首 > ${gate.aheadSongs} 首`);
+      if (gate.missLag != null && miss != null && miss > gate.missLag) fails.push(`漏揮補位晚 ${miss} 拍 > ${gate.missLag} 拍`);
+      if (fails.length) {
+        if (gate.known) line += `
+    ⚠ 量化門檻未達標（已知，不算不符合）：${fails.join('；')}。原因：${gate.known}`;
+        else { line += `
+    ✗ 量化門檻未達標：${fails.join('；')}`; failures += 1; }
+      }
     }
     console.log(line);
     for (const r of bad.slice(0, 3)) console.log('    ', r.s.title, JSON.stringify(r.m));

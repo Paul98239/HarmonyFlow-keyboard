@@ -74,7 +74,13 @@ const IDLE_BEATS = 1.5;
 const FOLLOW_WINDOW_BEATS = 0.3;
 // 代打補位：真人揮手之後，電腦預期下一次揮手在「這一拍走完」的時候，再寬限 AUTOPILOT_GRACE_BEATS 拍（τ）還沒揮就替他
 // 放行這一拍；還沒有速度取樣（只揮過一次手）時改寬限 FIRST_SAMPLE_GRACE_BEATS 拍（原譜速度）。
-const AUTOPILOT_GRACE_BEATS = 0.2;
+const AUTOPILOT_GRACE_BEATS = 0.15;
+// 晚到揮手 vs 漏揮：電腦放行了這一拍，而你自己上一次揮手到現在的間隔 ≤ LATE_RESPONSE_BEATS 拍（拍長 ÷ r）——你只是揮
+// 得比電腦預期晚（抖動、剛變慢、估計還沒跟上），這下算對這一拍的回應、不多推一拍；超過就是你漏揮了一拍，這下是下一拍。
+// 光看「離電腦放行多久」（FOLLOW_WINDOW_BEATS）分不開兩者：窗放大會把漏揮之後準時的下一拍吞掉（補位越落越後），窗縮小
+// 揮手一晚就每拍多推一拍（棘輪）。1.7 介於「連續揮手最晚約 1.3 拍（抖動 ±30％）」與「漏揮一拍＝約 2 拍」之間，曲庫模擬
+// 量測的折衷（1.5 壓不住抖動 ±30％，2.0 會把漏揮當成晚到）。這是應用層數字，不是規格。
+const LATE_RESPONSE_BEATS = 1.7;
 const FIRST_SAMPLE_GRACE_BEATS = 2;
 // 前奏提前量：時鐘還沒走進入場拍之前 PRELUDE_ANTICIPATION_BEATS 拍（樂譜時間）時的揮手，視為你在前奏的空白裡打拍子：
 // 不放行拍、不動邊界、不追趕，只標記「你在演奏」並取速度樣本。人通常比拍點早一點揮，所以入場前半拍內的揮手才算
@@ -280,6 +286,8 @@ export class HumanPerformer {
     this._pendingRate = null;      // 暫存的離群速度取樣（見 RATE_OUTLIER）；下一個取樣對得上才套用
     this._lastWave = null;         // 最近一次真人揮手的 { ms 揮手時刻, len 那一拍的樂譜長度 }；取樣用，暫停會清掉
     this._actedBeat = new Map();   // 槽位 → 這位演奏者最近一次動作（放行或跟上）所在的拍
+    this._lastWaveMsBySlot = new Map(); // 槽位 → 這位演奏者最近一次揮手的時刻；判斷晚到揮手 vs 漏揮用（LATE_RESPONSE_BEATS），暫停會清掉
+    this._autoBeat = -1;           // 最近一次由電腦代打放行的拍（之後被真人放行過就不再相等）
     this.unplacedVoiceIds = []; // 輸出 channel 排不進去（旋律 voice 超過 60 個、鼓組超過 4 種）的 voice，這一輪不出聲
     this._playing = false;
     this._lastTickMs = null;   // null＝下一次 tick() 不推進時鐘，只記錄基準
@@ -411,6 +419,7 @@ export class HumanPerformer {
     this._playing = false;
     this._lastTickMs = null;
     this._lastWave = null; // 暫停的時間不是揮手的間隔：恢復後的第一下揮手不跟暫停前的揮手配成一次取樣
+    this._lastWaveMsBySlot = new Map();
     this._pendingRate = null;
     this.silence();
   }
@@ -476,6 +485,8 @@ export class HumanPerformer {
     this._pendingRate = null;
     this._lastWave = null;
     this._actedBeat = new Map();
+    this._lastWaveMsBySlot = new Map();
+    this._autoBeat = -1;
     this._lastTickMs = null;
   }
 
@@ -577,7 +588,10 @@ export class HumanPerformer {
         this._beatHasWave = true;
         this._observeWave(nowMs);
       }
-      for (const slot of waveSlots) this._actedBeat.set(slot, this._beatIndex);
+      for (const slot of waveSlots) {
+        this._actedBeat.set(slot, this._beatIndex);
+        this._lastWaveMsBySlot.set(slot, nowMs);
+      }
       this._tagVolumes(false);
       this._armAutopilot(false);
       return;
@@ -589,6 +603,7 @@ export class HumanPerformer {
       } else {
         // 電腦替沒揮手的人放行這一拍：所有聲部（含揮過手的指派聲部這拍的音符）照樂譜發聲，音量用代打的。
         this._releaseNextBeat();
+        this._autoBeat = this._beatIndex;
         this._lastReleaseMs = nowMs; // 窗從任何一次放行算起：你在窗內才揮的手是對這一拍的回應，不是下一拍
         this._beatHasWave = false;
         this._tagVolumes(true);
@@ -655,10 +670,14 @@ export class HumanPerformer {
     this._catchUpToSec = first ? this._clockSec : beat.startSeconds;
   }
 
-  // 這位演奏者這次揮手是不是「對目前這一拍的回應」（不另外再推一拍）：這一拍剛剛被放行（另一位的揮手或電腦代打）、
-  // 還在窗內（見 FOLLOW_WINDOW_BEATS），而且他自己這一拍還沒動作過。
+  // 這位演奏者這次揮手是不是「對目前這一拍的回應」（不另外再推一拍），而且他自己這一拍還沒動作過。兩種情況算：
+  //  1. 這一拍是電腦代打放行的，而他上一次揮手到現在 ≤ LATE_RESPONSE_BEATS 拍：他只是揮得比電腦預期晚，不是漏揮。
+  //  2. 這一拍剛剛被放行（另一位的揮手或電腦代打），還在窗內（FOLLOW_WINDOW_BEATS）：多人幾乎同時揮手。
   _followsCurrentBeat(slot, nowMs) {
     if (this._lastReleaseMs == null || this._actedBeat.get(slot) === this._beatIndex) return false;
+    const lastMs = this._lastWaveMsBySlot.get(slot);
+    if (this._autoBeat === this._beatIndex && lastMs != null
+      && nowMs - lastMs <= (LATE_RESPONSE_BEATS * this._beatLengthSec() * 1000) / this._playbackRate) return true;
     return nowMs - this._lastReleaseMs <= this._followWindowSec() * 1000;
   }
 
