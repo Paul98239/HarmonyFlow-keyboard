@@ -30,6 +30,7 @@ const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'l
 const ONLY = new Set(String(args.only || 'parse,autoplay,perform,scenarios').split(','));
 const LIMIT = Number(args.limit) || Infinity;
 const TICK_TOL_MS = 12.5;                          // 一個排程 tick（12ms）加浮點容差
+const PRELUDE_SKEW_TOL_MS = 60;                    // 前奏照原速：揮手間隔剛好等於拍長時估速收斂在 1，容許幾個 tick 的誤差；被追趕衝過去會差好幾秒
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ═══════════════════════════════════════════
@@ -185,10 +186,14 @@ function buildScenarios(score, rnd) {
   // syncTolMs：同刻音發聲差的容許值。演奏者之間錯開的情境，晚幾十 ms 才揮第一下的人，他拍首的音是補上的（見
   // humanPerformer.js 的合併窗），所以容許值要加上最大的錯開量。
   // track：單人每拍揮一次、沒有漏揮的情境，另外量揮手→發聲的延遲與共用拍位有沒有比演奏者多走。
-  const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS, track = false } = {}) => out.push({ name, players, exempt, syncTolMs, track });
+  const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS, track = false, preludeSec = null } = {}) => out.push({ name, players, exempt, syncTolMs, track, preludeSec });
   const solo = (name, o, track = false) => add(name, [A], [{ partIds: [A], waves: waves(b0Of([A]), o) }], { track });
 
   if (beats[b0Of([A])].startSeconds >= 2) solo('前奏提早揮手（第一下揮手落在前奏 30％處）', { leadMs: -beats[b0Of([A])].startSeconds * 700 });
+  // 聲部開頭有空白（至少 4 拍，而且空白期間別的聲部有音）：演奏者從第 0 拍就照原速打拍子。前奏中的揮手只估速、不放行拍，
+  // 前奏的音要照原速發聲。指派的是第一個符合條件的聲部（不一定是音符最多的那個，那個常常是從頭就有音）。
+  const late = rankedParts(score).find((p) => b0Of([p.id]) >= 4 && score.notes.some((n) => n.partId !== p.id && n.startSeconds < beats[b0Of([p.id])].startSeconds));
+  if (late) add('前奏打拍子（單人，聲部開頭有空白，從第 0 拍起照原速揮）', [late.id], [{ partIds: [late.id], waves: waves(0) }], { preludeSec: beats[b0Of([late.id])].startSeconds });
   if (B) {
     const ids = [A, B], b0 = b0Of(ids);
     add('一人兩個聲部', ids, [{ partIds: ids, waves: waves(b0, { jitter: 0.1 }) }]);
@@ -227,7 +232,7 @@ function scanScenarios(songs) {
   const byName = new Map();
   for (const s of songs.filter((x) => rankedParts(x.score).length >= 1)) {
     for (const sc of buildScenarios(s.score, makeRng(7))) {
-      const m = measure(simulate(s.score, sc.players), { exempt: sc.exempt, ...(sc.track ? { waves: sc.players[0].waves, b0: sc.b0 } : {}) });
+      const m = measure(simulate(s.score, sc.players), { exempt: sc.exempt, ...(sc.track ? { waves: sc.players[0].waves, b0: sc.b0 } : {}), preludeEndSec: sc.preludeSec });
       if (!byName.has(sc.name)) byName.set(sc.name, []);
       byName.get(sc.name).push({ s, m, tol: sc.syncTolMs, track: sc.track });
     }
@@ -236,9 +241,10 @@ function scanScenarios(songs) {
   let failures = 0;
   for (const [name, runs] of byName) {
     const sum = (key) => runs.reduce((a, r) => a + r.m[key], 0);
-    const bad = runs.filter((r) => r.m.releasedMissing || r.m.unpaired || r.m.strayOff || r.m.badVelocity || r.m.syncMax > r.tol);
+    const bad = runs.filter((r) => r.m.releasedMissing || r.m.unpaired || r.m.strayOff || r.m.badVelocity || r.m.syncMax > r.tol || r.m.preludeSkewMax > PRELUDE_SKEW_TOL_MS);
     failures += bad.length;
     let line = `${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；放行了卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms；曲末沒被放行的音 ${sum('unreleased')} 顆（${runs.filter((r) => r.m.unreleased).length} 首）`;
+    if (runs[0].m.preludeSkewMax != null) line += `\n    前奏的音實際發聲時間與樂譜時間的最大差 ${Math.max(...runs.map((r) => r.m.preludeSkewMax))}ms（門檻 ${PRELUDE_SKEW_TOL_MS}ms）`;
     if (runs[0].track) {
       const pre = sum('preempted'), waves = sum('waveCount');
       line += `\n    揮手→發聲 p50 中位 ${median(runs.map((r) => r.m.lagP50))}ms、p99 中位 ${median(runs.map((r) => r.m.lagP99))}ms（最差一首 p99 ${Math.max(...runs.map((r) => r.m.lagP99 ?? 0))}ms）；`

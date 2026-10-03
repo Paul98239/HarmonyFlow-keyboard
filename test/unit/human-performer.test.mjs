@@ -170,11 +170,11 @@ run('揮得比樂譜快：時鐘追趕，每顆音恰好一次、依序、不擠
   assert(onNotes(log, 'human').length === 6, `指派聲部的 6 顆音都該發聲，實際 ${onNotes(log, 'human').length}`);
 });
 
-run('前奏：第一下揮手不追趕——電腦輔助照原速播完前奏，真人的第一個音等樂譜時鐘走到那裡才發聲', () => {
-  // a0 每拍一顆；p0 的第一個音在拍 4（2.0s）。演奏者 0.3s 就提早揮手。
+run('前奏：入場前半拍內的第一下揮手預先放行入場拍、不追趕——電腦輔助照原速播完前奏，真人的第一個音等時鐘走到那裡才發聲', () => {
+  // a0 每拍一顆；p0 的第一個音在拍 4（2.0s）。演奏者在 1.85s（入場前 0.15s，落在前半拍＝0.25s 的提前量內）提早揮手。
   const { log, d } = makeHp(buildBeatScore({ p0: [4, 5], a0: [0, 1, 2, 3, 4, 5] }), [['p0', 1]]);
-  d.tick(); d.runMs(276); d.wave();
-  d.runMs(2500);
+  d.tick(); d.runMs(1836); d.wave();
+  d.runMs(1000);
   for (let b = 0; b < 4; b++) {
     assert(Math.abs(onMs(log, 52 + b, 'assist') - (b * 500 + 12)) <= TICK_MS,
       `前奏第 ${b} 拍應該照原速在 ${b * 500 + 12}ms 發聲（不被提早的揮手追趕），實際 ${onMs(log, 52 + b, 'assist')}ms`);
@@ -628,10 +628,40 @@ run('真正的變速（變快一倍）：連續兩個同向的離群取樣一起
   assert(near(hp._playbackRate, want, want * 0.1), `5 次揮手之後估計應該在 ${want.toFixed(3)} 的 ±10％ 內，實際 ${hp._playbackRate}`);
 });
 
+run('前奏：你的聲部開頭有空白，從第 0 拍就跟著拍子揮手——前奏照原速播、拍位不動，入場拍那一下才放行', () => {
+  // p0 的第一個音在拍 8（4.0s）；a0 每拍一顆。演奏者從 12ms 起每 500ms 揮一次（拍 0..7 都在打拍子）。
+  // 舊行為：每一下揮手都放行入場拍之後的一拍，邊界被推到好幾拍之後，時鐘用 6 倍追趕把前奏衝過去、p0 在你揮第 4 下時就出聲。
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [8, 9], a0: everyBeat(12) }), [['p0', 1]]);
+  d.tick();
+  const stamps = [];
+  for (let k = 0; k < 8; k++) { runTo(d, 12 + k * 500 - TICK_MS); stamps.push(d.wave()); }   // 第 0..7 拍的揮手（都在前奏）
+  runTo(d, 3900);
+  assert(hp._beatIndex === 8, `前奏的揮手不該推進拍位，實際拍 ${hp._beatIndex}`);
+  assert(onNotes(log, 'human').length === 0, `你的聲部還沒到入場拍，不該出聲，實際 ${onNotes(log, 'human')}`);
+  for (let b = 0; b < 8; b++) {
+    assert(Math.abs(onMs(log, 52 + b, 'assist') - (b * 500 + 12)) <= TICK_MS,
+      `前奏第 ${b} 拍應該照原速在 ${b * 500 + 12}ms 發聲（不被前奏的揮手追趕），實際 ${onMs(log, 52 + b, 'assist')}ms`);
+  }
+  assert(Math.abs(hp._playbackRate - 1) < 0.05, `前奏的揮手拿來估速，每 500ms 一拍的估計應該約等於 1，實際 ${hp._playbackRate}`);
+  const entryWave = (() => { runTo(d, 3990); return d.wave(); })();                          // 入場拍那一下（4.0s 附近）
+  d.runMs(100);
+  const human = onMs(log, 40, 'human');
+  assert(human !== undefined && human >= 4000 && human <= entryWave + TICK_MS, `入場拍那一下揮手之後真人的第一個音才發聲，實際 ${human}ms（揮手 ${entryWave}ms）`);
+});
+
+run('前奏：前奏中的揮手拿來估速——你比原譜慢，前奏就跟著你的速度，不是 1 倍', () => {
+  // 每 600ms 揮一次（樂譜每拍 500ms，r 該趨近 0.833），p0 的第一個音在拍 10（5.0s，樂譜時間）。
+  const { hp, d } = makeHp(buildBeatScore({ p0: [10, 11], a0: everyBeat(14) }), [['p0', 1]]);
+  d.tick();
+  for (let k = 0; k < 7; k++) { d.wave(); d.runMs(588); }
+  assert(hp._beatIndex === 10, `前奏的揮手不該推進拍位，實際拍 ${hp._beatIndex}`);
+  assert(hp._playbackRate > 0.8 && hp._playbackRate < 0.88, `估計應該朝 0.833 走，實際 ${hp._playbackRate}`);
+});
+
 run('前奏：只在前奏中揮過一次手，電腦的倒數要等樂譜時鐘走進起始拍才開始，不會在前奏還沒播完就替你走拍', () => {
-  // a0 每拍一顆；p0 的第一個音在拍 6（3.0s）。演奏者 0.3s 揮了第一下就沒再揮。2 拍的寬限從時鐘走進拍 6 起算。
+  // a0 每拍一顆；p0 的第一個音在拍 6（3.0s）。演奏者約 2.78s（時鐘 2.76s，入場前 0.24s，剛好在半拍＝0.25s 的提前量內）揮了第一下就沒再揮。2 拍的寬限從時鐘走進拍 6 起算。
   const { hp, log, d } = makeHp(buildBeatScore({ p0: [6, 7, 8, 9, 10, 11], a0: everyBeat(13) }), [['p0', 1]]);
-  d.tick(); d.runMs(276); d.wave();
+  d.tick(); d.runMs(2760); d.wave();
   runTo(d, 2600);
   assert(hp._beatIndex === 6, `前奏還沒播完，電腦不該替你走拍，實際拍 ${hp._beatIndex}`);
   for (let b = 0; b < 6; b++) {

@@ -144,8 +144,9 @@ const percentile = (sorted, p) => (sorted.length ? Math.round(sorted[Math.min(so
  *   exempt(voice, note)：這顆音不要求一定發聲（例如晚進場的演奏者，他揮第一下之前走過的音本來就是靜音）
  *   factor：演奏者相對樂譜的速度倍率（量「壓縮」與相連音空白用，速度會變時不要傳）
  *   waves／b0：單人模擬時，量「揮手→發聲」延遲用（第 k 拍的揮手是 waves[k - b0]）
+ *   preludeEndSec：前奏結束的樂譜時間（入場拍的起點）；給了就量前奏的音有沒有照原速（× factor）發聲，見 preludeSkewMax
  */
-export function measure(sim, { exempt = () => false, factor = 1, waves = null, b0 = 0 } = {}) {
+export function measure(sim, { exempt = () => false, factor = 1, waves = null, b0 = 0, preludeEndSec = null } = {}) {
   const { hp, records, stats } = sim;
   const frontier = hp._frontierSec;
   const sounded = new Set(records.map((r) => r.note));
@@ -206,7 +207,13 @@ export function measure(sim, { exempt = () => false, factor = 1, waves = null, b
     if (first.length) missLag.push((Math.min(...first.map((r) => r.onMs)) - t) / ((hp._beats[b].endSeconds - hp._beats[b].startSeconds) * 1000 * factor));
   }
   missLag.sort((a, b) => a - b);
+  // 前奏照原速：入場拍之前的音（電腦輔助聲部）實際發聲時間跟「樂譜時間 × factor」的最大差。前奏中的揮手只該拿來估速、
+  // 不該放行拍，否則放行邊界被推到好幾拍之後，時鐘會用追趕速度把前奏衝過去（這個值會是好幾秒）。
+  const preludeSkewMax = preludeEndSec == null ? null : Math.round(Math.max(0, ...records
+    .filter((r) => r.label === 'assist' && r.note.startSeconds < preludeEndSec - 1e-6)
+    .map((r) => Math.abs(r.onMs - r.note.startSeconds * 1000 * factor))));
   return {
+    preludeSkewMax,
     missLagMed: missLag.length ? +missLag[missLag.length >> 1].toFixed(2) : null,
     ratchetWaves: ahead.length, ratchetMax: ahead.length ? Math.max(...ahead) : 0, preempted, waveCount: waves ? waves.length : 0,
     total, sounded: records.length, releasedMissing, unreleased,

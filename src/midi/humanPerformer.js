@@ -16,7 +16,8 @@
 //      之後每一步等剛走進那一拍的真實時間（拍長 ÷ r）。倒數依 tick 的 dt 遞減，暫停期間不算停手；時鐘還在前奏時
 //      不倒數。你完全停手＝音樂自己照估計速度播到曲末。
 //  剛載入時放行邊界在起始拍的拍首（所有指派聲部最早的音所在的那一拍）：電腦輔助聲部先播前奏（還沒有取過樣，
-//  r＝1＝原譜速度），第一次揮手放行起始拍。沒有人被指派（或沒有拍格線，SMPTE）時 B＝∞，整首照時間連續自動播放。
+//  r＝1＝原譜速度），時鐘離起始拍還有半拍以上時的揮手只標記「你在演奏」並取速度樣本（見 PRELUDE_ANTICIPATION_BEATS），
+//  入場前半拍內的第一下揮手才放行起始拍。沒有人被指派（或沒有拍格線，SMPTE）時 B＝∞，整首照時間連續自動播放。
 //
 //  發聲：每個 tick 先收掉時鐘走過結尾的音，再放出「已放行、時鐘也走到」的音，最後再收一次（同一個 tick 內起音
 //  又結束的短音）。從未被自己的演奏者揮過手的指派聲部維持靜音；揮過手的聲部，別人放行的拍它的音照樣發聲
@@ -75,6 +76,11 @@ const FOLLOW_WINDOW_BEATS = 0.3;
 // 放行這一拍；還沒有速度取樣（只揮過一次手）時改寬限 FIRST_SAMPLE_GRACE_BEATS 拍（原譜速度）。
 const AUTOPILOT_GRACE_BEATS = 0.2;
 const FIRST_SAMPLE_GRACE_BEATS = 2;
+// 前奏提前量：時鐘還沒走進入場拍之前 PRELUDE_ANTICIPATION_BEATS 拍（樂譜時間）時的揮手，視為你在前奏的空白裡打拍子：
+// 不放行拍、不動邊界、不追趕，只標記「你在演奏」並取速度樣本。人通常比拍點早一點揮，所以入場前半拍內的揮手才算
+// 對入場拍的第一下（預先放行）；再早的揮手若也算，就會把你數的前奏拍當成入場拍之後的拍，邊界被推到好幾拍之後，
+// 時鐘用追趕速度把前奏衝過去。
+const PRELUDE_ANTICIPATION_BEATS = 0.5;
 // 相連音的「小間隙」門檻 θ ＝ ticksPerQuarter / LEGATO_GAP_DIVISOR（480 tpq 時 30 tick）：音符結尾到同一個聲部
 // 下一個起音點的間隙 ≤ θ 才算相連的音。MuseScore 把相連音符寫成「記譜長度 − 1 tick」（間隙固定 1 tick），真正的
 // 最短休止（三十二分休止）≥ 60 tick，θ 落在兩者中間的空檔；用 tick 不用秒，跟速度無關。
@@ -552,6 +558,13 @@ export class HumanPerformer {
     }
 
     if (waveSlots.size) {
+      if (this._inPrelude()) {
+        // 前奏的空白裡打拍子：不放行任何拍（見 PRELUDE_ANTICIPATION_BEATS）。voice.triggered 上面已經標過；取樣用「時鐘
+        // 現在所在那一拍」的長度（前奏可能跟入場拍不同速），讓前奏之後的速度跟你打的拍子一致。不武裝代打：
+        // 沒有第一下真正的放行之前，電腦不替你走拍。
+        this._observeWave(nowMs, this._beatLengthAtClockSec());
+        return;
+      }
       let release = false;
       for (const slot of waveSlots) if (!this._followsCurrentBeat(slot, nowMs)) release = true;
       if (release) {
@@ -599,9 +612,9 @@ export class HumanPerformer {
   // 揮手之間真實過的秒數（＝你走完一拍花的時間；用上一拍的長度，樂譜自己變速時才對得上）。中間若隔著電腦替你放行的
   // 拍，分子不把那幾拍算進去：漏揮一次會變成「一拍的長度 ÷ 兩拍的時間」＝慢一半的離群取樣，由 _applySample 處理，
   // 這樣你真的變慢（連續離群）才學得到，偶爾漏揮不會被當成變慢。代打放行本身不取樣。
-  _observeWave(nowMs) {
+  _observeWave(nowMs, lenSec = this._beatLengthSec()) {
     const last = this._lastWave;
-    this._lastWave = { ms: nowMs, len: this._beatLengthSec() };
+    this._lastWave = { ms: nowMs, len: lenSec };
     if (!last) return;
     const sample = rateSample(last.len, (nowMs - last.ms) / 1000);
     if (sample === null) return;
@@ -697,6 +710,19 @@ export class HumanPerformer {
   _beatLengthSec() {
     const beat = this._beats[this._beatIndex];
     return beat.endSeconds - beat.startSeconds;
+  }
+
+  // 還在前奏：第一下放行還沒發生，而且時鐘離入場拍還有半拍以上（入場拍的長度算，樂譜時間：人提早的是「真實時間半拍」，
+  // 時鐘以 r 前進，換成樂譜時間 r 剛好消掉）。
+  _inPrelude() {
+    return !this._released && this._clockSec < this._entrySec - PRELUDE_ANTICIPATION_BEATS * this._beatLengthSec();
+  }
+
+  // 時鐘現在所在那一拍的樂譜長度（只給前奏用；從入場拍往前找，前奏通常不長，找幾步就到）。
+  _beatLengthAtClockSec() {
+    let i = this._beatIndex;
+    while (i > 0 && this._beats[i].startSeconds > this._clockSec + EPS) i--;
+    return this._beats[i].endSeconds - this._beats[i].startSeconds;
   }
 
   // 時鐘停格多久就把還在響的音全部收掉，見 IDLE_MS。有代打補位之後，只有第一下揮手之前（前奏結尾）會停格這麼久，
