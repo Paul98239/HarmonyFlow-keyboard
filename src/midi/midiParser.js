@@ -15,8 +15,8 @@
 //  這三樣加起來足以把任何一個 tick 精確還原成「第幾拍、第幾秒」，`buildTempoMap()`／
 //  `makeTickToSeconds()`／`buildMeasureGrid()`／`buildBeatGrid()` 這條鏈是確定性計算，不是
 //  推導。規格沒有寫進檔案的是格線上的「音樂意義」：小節線本身、弱起、強弱、swing、複拍子
-//  的實際律動——這些只能由應用層推導，而推導必然帶假設，本模組只在明確標示假設（A1～A13，
-//  散在各函式的 JSDoc／註解裡）的地方才做這類啟發式推導，其餘一律照規格算出來的數字為準。
+//  的實際律動——這些只能由應用層推導，而推導必然帶假設，本模組只在明確標示假設（CLAUDE.md「拍子從哪裡來」的假設表，
+//  A 開頭的項目，散在各函式的 JSDoc／註解裡）的地方才做這類啟發式推導，其餘一律照規格算出來的數字為準。
 // ============================================================
 
 /* ═══════════════════════════════════════════
@@ -627,7 +627,8 @@ function buildSignatureList(tracks, type, decorate, fallback) {
   const out = [];
   for (const { ev } of collectMeta(tracks, type)) {
     const last = out[out.length - 1];
-    if (last && last.tick === ev.tick) continue; // 同 tick 只取先出現的
+    // 同一個 tick 有多個拍號／調號：後出現者生效（軌序、事件序在後的），跟速度表（buildTempoMap）與官方 SpessaSynth 一致。
+    if (last && last.tick === ev.tick) { out[out.length - 1] = decorate(ev); continue; }
     out.push(decorate(ev));
   }
   if (!out.length || out[0].tick !== 0) out.unshift({ tick: 0, ...fallback });

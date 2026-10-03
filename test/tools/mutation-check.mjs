@@ -105,6 +105,8 @@ const MUTATIONS = [
   // ── parser：聲部切分（part／voice）與跟官方對齊（單元測試＋差異測試）──
   { name: 'parser：同 tick 的速度衝突改回先出現者生效', target: PARSER, suites: ['midi-parser', 'oracle'], edits: [['        last.microsecondsPerQuarter = ev.microsecondsPerQuarter;\n        last.bpm = ev.bpm;\n', '']],
     expect: ['同 tick 的速度衝突'] },
+  { name: 'parser：同 tick 的拍號／調號改回先出現者生效', target: PARSER, suites: ['midi-parser', 'oracle'], edits: [['if (last && last.tick === ev.tick) { out[out.length - 1] = decorate(ev); continue; }', 'if (last && last.tick === ev.tick) continue;']],
+    expect: ['同 tick 的拍號與調號衝突'] },
   { name: 'parser：音符 channel 不加 port 偏移', target: PARSER, suites: ['midi-parser', 'oracle'], edits: [['    offsets.set(t.index, offsetOfPort.get(port));', '    offsets.set(t.index, 0);']],
     expect: ['port 絕對 channel', '打擊樂器在 port 1'] },
   { name: 'parser：port 偏移用 port 的數值而不是出現順序', target: PARSER, suites: ['midi-parser'], edits: [['    if (!offsetOfPort.has(port)) offsetOfPort.set(port, offsetOfPort.size * 16);', '    if (!offsetOfPort.has(port)) offsetOfPort.set(port, port * 16);']],

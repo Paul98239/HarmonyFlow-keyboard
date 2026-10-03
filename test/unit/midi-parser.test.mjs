@@ -4,7 +4,7 @@
 //  沒有測試框架，跟 test/browser/smoke-test.mjs 同一套風格：run()／assert() 是整個專案
 //  唯一的測試慣例。用法：node test/unit/midi-parser.test.mjs
 //
-//  聲部切分（Part／voice）的規則見 midiParser.js 的 collectParts() 說明；這裡的手工檔模仿 MuseScore
+//  聲部切分（Part／voice）的規則見 midiParser.js 的 groupTracks() 說明；這裡的手工檔模仿 MuseScore
 //  匯出器的軌佈局：一個譜表一條 track，只有樂器最上行譜的 track 在 tick 0 對樂器的每個 channel 寫初始化區塊
 //  （CC121、[Bank]、Program Change、CC7、CC10、CC91、CC93）。
 // ============================================================
@@ -284,6 +284,20 @@ run('同 tick 的速度衝突：後出現者生效（跟官方一致）', () => 
   ]));
   // tick 0~480 以 120 BPM（0.5s）；tick 480 起後出現的 60 BPM（1s／四分音符）生效，tick 960 起音＝0.5 + 1 = 1.5s
   assert(Math.abs(parsed.notes[0].startSeconds - 1.5) < 1e-9, `起音應為 1.5s（後出現者生效），實際 ${parsed.notes[0].startSeconds}`);
+});
+
+run('同 tick 的拍號與調號衝突：後出現者生效（跟速度表、官方一致），不重複列出同一個 tick', () => {
+  const timeSig = (nn, dd, deltaTick = 0) => ({ deltaTick, bytes: [0xff, 0x58, 4, nn, dd, 24, 8] });
+  const keySig = (sf) => ({ deltaTick: 0, bytes: [0xff, 0x59, 2, sf, 0] });
+  const parsed = parseMidi(midiFile([
+    track([timeSig(4, 2), timeSig(3, 2, 480), keySig(1), { deltaTick: 480, bytes: [0x90, 60, 100] }, { deltaTick: 480, bytes: [0x80, 60, 0] }]),
+    track([timeSig(6, 3, 480), keySig(2)]), // tick 480 的拍號與 tick 480 的調號都是這一軌後出現
+  ]));
+  const at480 = parsed.timeSignatures.filter((t) => t.tick === 480);
+  assert(at480.length === 1 && at480[0].numerator === 6 && at480[0].denominator === 8, `tick 480 只該有一筆 6/8（後出現者），實際 ${JSON.stringify(at480)}`);
+  assert(parsed.timeSignatures.length === 2, `tick 0 與 tick 480 各一筆，實際 ${parsed.timeSignatures.length} 筆`);
+  const keys480 = parsed.keySignatures.filter((k) => k.tick === 480 || k.tick === 0);
+  assert(keys480.at(-1).sharpsFlats === 2, `同 tick 的調號後出現者生效（2 個升記號），實際 ${JSON.stringify(parsed.keySignatures)}`);
 });
 
 run('port 絕對 channel：依軌序第一次出現的 port 各 +16，沒有指定 port 的軌用最小的已指定 port', () => {
