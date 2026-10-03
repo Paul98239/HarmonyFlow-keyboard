@@ -19,12 +19,12 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { parseMidi } from '../../src/midi/midiParser.js';
-import { HumanPerformer } from '../../src/midi/humanPerformer.js';
+import { HumanPerformer, CHANNELS_PER_PORT, DEFAULT_PORTS } from '../../src/midi/humanPerformer.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TICK_MS = 12;
-const TOTAL_CHANNELS = 64;
-const DRUM_SLOTS = [9, 25, 41, 57];
+const TOTAL_CHANNELS = CHANNELS_PER_PORT * DEFAULT_PORTS; // 合成器開機補到的 channel 數，跟排程器同一個來源
+const DRUM_SLOTS = Array.from({ length: DEFAULT_PORTS }, (_, p) => p * CHANNELS_PER_PORT + 9);
 const MIXER = [7, 10, 91, 93];
 
 function run(name, fn) {

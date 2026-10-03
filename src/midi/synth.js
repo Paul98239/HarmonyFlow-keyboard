@@ -14,7 +14,7 @@
 //  固定不掛額外 gain，是這個音量對比的基準，不會跟著被調小聲。
 // ============================================================
 
-import { HumanPerformer } from './humanPerformer.js';
+import { HumanPerformer, CHANNELS_PER_PORT, DEFAULT_PORTS, portsNeeded } from './humanPerformer.js';
 import { PreviewPlayer } from './previewPlayer.js';
 
 /* ═══════════════════════════════════════════
@@ -38,13 +38,11 @@ const CC_BANK_SELECT_LSB = 32;
 const CC_ALL_SOUND_OFF = 120;
 const CC_RESET_ALL_CONTROLLERS = 121;
 const CC_ALL_NOTES_OFF = 123;
-const CHANNELS_PER_PORT = 16;
 const DRUM_CHANNEL_OFFSET = 9;
 // WorkletSynthesizer 預設只建 16 個 channel（1 個 MIDI port）；總譜聲部數超過這個數字時，
 // 多出來的聲部會完全分不到輸出 channel、整段靜音（已用國旗歌 24 個旋律聲部實測重現）。
-// spessasynth_lib 支援用 addNewChannel() 動態加開，對應 MIDI 多 port 的慣例——這裡固定
-// 補到 4 個 port 份（64 個 channel），對真實總譜的複雜度留足夠的餘裕，不用依每首歌動態調整。
-const TOTAL_CHANNELS = CHANNELS_PER_PORT * 4;
+// spessasynth_lib 支援用 addNewChannel() 動態加開，對應 MIDI 多 port 的慣例。模仿官方 Sequencer：開機先補到
+// DEFAULT_PORTS 個 port（humanPerformer.js 的單一來源），歌曲需要更多時在 load() 依 portsNeeded() 補，只增不減。
 
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
 const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（電腦輔助軌固定是 1.0 基準，沒有額外
@@ -62,6 +60,8 @@ let audioCtx, synth, masterGain;
 let synthHuman, humanGain;
 let isReady = false;
 let initPromise = null;
+// 兩個合成器目前各有幾個 port 的 channel（兩個永遠一樣多）。自己計數，不讀 midiChannels.length（見 channelCountOf()）。
+let portCount = DEFAULT_PORTS;
 let isSongLoaded = false;
 let isProcessingPlay = false;
 let lastGateTarget = -1;
@@ -84,10 +84,22 @@ export const humanPerformer = new HumanPerformer();
 // addNewChannel()，這個陣列的 length 最終會多算成兩筆，跟 worklet 端真正建立的 channel 數
 // 對不上（實測：呼叫 48 次後 length 變成 112，不是 64；對只存在 64 個的 worklet 端送出
 // channel ≥64 的 controllerChange 會讓 worklet 丟出 Uncaught TypeError，因為它自己的
-// channel 陣列裡那個索引是 undefined）。兩個合成器一律固定補到 TOTAL_CHANNELS，這裡直接
-// 回傳這個數字即可，不必也不能信任 s.midiChannels.length。
+// channel 陣列裡那個索引是 undefined）。所以 channel 數只能自己計數（portCount），不必也不能信任
+// s.midiChannels.length。
 function channelCountOf(s) {
-  return s ? TOTAL_CHANNELS : CHANNELS_PER_PORT;
+  return s ? portCount * CHANNELS_PER_PORT : CHANNELS_PER_PORT;
+}
+
+// 補 channel 到至少 ports 個 port（只增不減，跟官方 Sequencer 的 addNewMIDIPort 一樣），補完整個合成器重設一次
+// （原因見 initEngine() 的註解：動態新增的 channel 預設是打擊）。呼叫者要在送任何初始 patch 之前呼叫。
+function ensurePorts(ports) {
+  if (!synth || !synthHuman || ports <= portCount) return;
+  for (const s of [synth, synthHuman]) {
+    for (let i = portCount * CHANNELS_PER_PORT; i < ports * CHANNELS_PER_PORT; i++) s.addNewChannel();
+    s.reset();
+  }
+  portCount = ports;
+  humanPerformer.setPortCount(portCount);
 }
 function isDrumChannelIndex(ch) {
   return ch % CHANNELS_PER_PORT === DRUM_CHANNEL_OFFSET;
@@ -153,9 +165,9 @@ export async function initEngine() {
       if (synth.isReady) await synth.isReady;
       if (synthHuman.isReady) await synthHuman.isReady;
 
-      // 兩個合成器都補到 TOTAL_CHANNELS，見上方常數註解＋channelCountOf() 的註解（呼叫過
+      // 兩個合成器都補到 DEFAULT_PORTS 個 port，見上方常數註解＋channelCountOf() 的註解（呼叫過
       // addNewChannel() 之後，s.midiChannels.length 已查證不可信任，所以這裡固定呼叫
-      // TOTAL_CHANNELS - CHANNELS_PER_PORT 次，不去讀那個 length）。刻意放在 soundBank 載入
+      // (DEFAULT_PORTS - 1) × CHANNELS_PER_PORT 次，不去讀那個 length）。刻意放在 soundBank 載入
       // 完成之後才呼叫：spessasynth_core 對每個動態新增的 channel 會自動先設成打擊 channel
       // 並立刻查一次預設音色（見 createMIDIChannel() 原始碼），這個查詢在 soundBank 還沒
       // 載入時一定查不到，會在 console 噴「No preset found for DRUM:0! Did you forget to
@@ -165,8 +177,10 @@ export async function initEngine() {
       // 還沒有任何 soundBank 就一定會觸發。這則警告本身不影響功能（每個聲部實際的音色仍然是
       // _applyInitialPatch() 之後另外送的 bank／program 決定），純粹是時機問題，把
       // addNewChannel() 挪到 soundBank 載入完成之後即可避開。
+      portCount = DEFAULT_PORTS;
+      humanPerformer.setPortCount(portCount);
       for (const s of [synth, synthHuman]) {
-        for (let i = CHANNELS_PER_PORT; i < TOTAL_CHANNELS; i++) s.addNewChannel();
+        for (let i = CHANNELS_PER_PORT; i < portCount * CHANNELS_PER_PORT; i++) s.addNewChannel();
         // spessasynth_core 的 createMIDIChannel() 會把動態新增的 channel 預設設成打擊 channel（已用 worklet 回讀實測：
         // channel 16～63 全是打擊），旋律聲部超過 15 個的歌，channel 16 以上的聲部就會用鼓組發聲。整個合成器重設一次
         // 會把每個 channel 設回 GM 配置（只有每個 port 的 channel 9 是打擊）。訊息有順序，這個 reset 一定排在上面
@@ -226,6 +240,7 @@ export async function load(score, assignments) {
     if (!ok) throw new Error('音源庫載入失敗');
   }
   flushPreviousSong();
+  ensurePorts(portsNeeded(score, assignments)); // 聲部多到 4 個 port 放不下的歌才會補；補完一定在送初始 patch 之前
   humanPerformer.load(score, assignments);
   isSongLoaded = true;
 }

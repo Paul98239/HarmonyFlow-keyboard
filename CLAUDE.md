@@ -54,12 +54,12 @@ midiPlayer.warmUpMidiEngine()])` 並行推進視覺與音源兩條軌道 → `se
 | `src/vision/vision.js` | 攝影機狀態機、WebGL、MediaPipe、繪製、手勢接線、舞台提示、`setPoseCountListener` | — |
 | `src/vision/tracking.js` | `PersonTracker`（槽位配對，純依位置）、`AdaptivePoseFilter`、`buildDetection` | ✓ |
 | `src/vision/gesture.js` | `ArcDetector`（拋物線手勢 → 離散的有效觸發訊號）、`clamp01` | ✓ |
-| `src/midi/synth.js` | spessasynth 合成器：兩個合成器（電腦輔助聲部 `synth`／真人聲部 `synthHuman`）、humanGain 閘門＋音量凸顯；演奏不用 Sequencer，直接接收 `humanPerformer.js` 送來的個別 note 事件；試聽才用官方 `Sequencer`（`startPreview()` 等，走 `synth`）；`flushPreviousSong()` 是演奏與試聽共用的清場；兩個合成器各補到 64 個 channel 後要 `reset()` 一次——動態新增的 channel 預設是打擊 channel（worklet 回讀實測），不重設的話旋律聲部超過 15 個的歌，channel 16 以上會用鼓組發聲 | ✓ |
+| `src/midi/synth.js` | spessasynth 合成器：兩個合成器（電腦輔助聲部 `synth`／真人聲部 `synthHuman`）、humanGain 閘門＋音量凸顯；演奏不用 Sequencer，直接接收 `humanPerformer.js` 送來的個別 note 事件；試聽才用官方 `Sequencer`（`startPreview()` 等，走 `synth`）；`flushPreviousSong()` 是演奏與試聽共用的清場；兩個合成器模仿官方 Sequencer 依需要補 port（每個 port 16 個 channel，只增不減）：開機補到 `DEFAULT_PORTS`（4 個 port＝64 個 channel），歌曲需要更多時 `load()` 依 `portsNeeded()`（旋律 voice 每個 port 15 個、每種鼓組佔一個 port 的打擊槽）補；每次補完都要 `reset()` 一次——動態新增的 channel 預設是打擊 channel（worklet 回讀實測），不重設的話旋律聲部超過 15 個的歌，channel 16 以上會用鼓組發聲；channel 數只能自己計數（lib 的 `addNewChannel()` 會讓 `midiChannels.length` 雙重 push），常數 `CHANNELS_PER_PORT`／`DEFAULT_PORTS` 的單一來源是 `humanPerformer.js` | ✓ |
 | `src/midi/previewPlayer.js` | 試聽：官方 Sequencer 的薄包裝（Sequencer 由 `synth.js` 注入）——等非同步載入結果（同名 songChange／midiError／逾時／被中斷）、暫停／續播／從頭／停止、`loopCount` 關循環 | ✓ |
 | `src/midi/midiPlayer.js` | 播放器：`playerStore`、選歌／播放／試聽／指派／人數動作、手勢 hook、兩個 tick ＋ 四段畫面（pill／頂端進度條／曲庫／選檔與分譜） | — |
 | `src/midi/midiApi.js` | 遠端 MIDI 曲庫 client（分類／搜尋／下載），純資料 | ✓ |
 | `src/midi/midiParser.js` | SMF 解析／重新編碼、GM 繁中命名、聲部切分（part／voice，見「聲部」）、`buildMeasureGrid()`／`buildBeatGrid()` 小節與拍格線 | ✓ |
-| `src/midi/humanPerformer.js` | 排程器（以 voice 為單位：parser 的 part 底下一個以上的 voice，指派以 part 為單位、排程發聲與輸出 channel 以 voice 為單位；打擊 voice 依鼓組 program 分到 9／25／41／57；每個 voice 載入時送 bank／program 與 CC7／10／91／93）：單一樂譜時鐘 S＋放行邊界 B、依揮手（真人或代打）逐拍放行、發聲／收音（先進先出）、相連音撐住與停格釋放、追趕、揮手速度估計（`rateSample()`／`smoothRate()` 兩個純函式）、重設／重播、`getPositionSeconds()` | ✓ |
+| `src/midi/humanPerformer.js` | 排程器（以 voice 為單位：parser 的 part 底下一個以上的 voice，指派以 part 為單位、排程發聲與輸出 channel 以 voice 為單位；打擊 voice 依鼓組 program 分到每個 port 的 channel 9（預設 4 個 port＝9／25／41／57）；每個 voice 載入時送 bank／program 與 CC7／10／91／93）：單一樂譜時鐘 S＋放行邊界 B、依揮手（真人或代打）逐拍放行、發聲／收音（先進先出）、相連音撐住與停格釋放、追趕、揮手速度估計（`rateSample()`／`smoothRate()` 兩個純函式）、重設／重播、`getPositionSeconds()` | ✓ |
 
 ## 拍子從哪裡來：規格 vs 假設
 

@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parseMidi } from '../../src/midi/midiParser.js';
-import { HumanPerformer, rateSample, smoothRate } from '../../src/midi/humanPerformer.js';
+import { HumanPerformer, DEFAULT_PORTS, portsNeeded, rateSample, smoothRate } from '../../src/midi/humanPerformer.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CANON_PATH = join(__dirname, '../../src/assets/canon-violin-cello.mid');
@@ -1234,6 +1234,32 @@ run('輸出 channel 用完：多出來的 voice 回報在 unplacedVoiceIds（列
   const score = buildVoiceScore(Array.from({ length: 62 }, (_, i) => ({ id: `p${i}`, voices: [{ id: `v${i}`, notes: [0] }] })));
   const { hp } = makeVoiceHp(score, [], { play: false });
   assert(hp._voices.size === 60 && hp.unplacedVoiceIds.join() === 'v60,v61', `64 個 channel 扣掉 4 個打擊槽剩 60 個，實際 ${hp._voices.size} 個、unplaced ${hp.unplacedVoiceIds}`);
+});
+
+run('portsNeeded：旋律 voice 每個 port 15 個、每種鼓組佔一個 port 的打擊槽，指派與未指派兩個池子各自算，不低於預設 4 個 port', () => {
+  const melodic = (n, prefix = 'p') => Array.from({ length: n }, (_, i) => ({ id: `${prefix}${i}`, voices: [{ id: `${prefix}v${i}`, notes: [0] }] }));
+  const kits = (n) => Array.from({ length: n }, (_, i) => ({ id: `k${i}`, voices: [{ id: `kit${i}`, kit: i * 8, notes: [0] }] }));
+  assert(DEFAULT_PORTS === 4, `預設 port 數是 4（開機補的），實際 ${DEFAULT_PORTS}`);
+  assert(portsNeeded(buildVoiceScore(melodic(60)), []) === 4, '60 個旋律 voice 剛好 4 個 port');
+  assert(portsNeeded(buildVoiceScore(melodic(61)), []) === 5, '61 個旋律 voice 要 5 個 port');
+  assert(portsNeeded(buildVoiceScore(melodic(150)), []) === 10, '150 個旋律 voice 要 10 個 port');
+  assert(portsNeeded(buildVoiceScore([...kits(6), ...melodic(3)]), []) === 6, '6 種鼓組要 6 個 port（每個 port 只有一個打擊槽）');
+  const two = buildVoiceScore(melodic(40));
+  assert(portsNeeded(two, new Map(two.parts.slice(0, 20).map((p) => [p.id, 1]))) === 4, '20 個指派＋20 個未指派分在兩個合成器，各用不到 4 個 port');
+  assert(portsNeeded(null, []) === 4 && portsNeeded(buildVoiceScore(melodic(1)), []) === 4, '沒有樂譜或很簡單的樂譜也是預設 4 個 port');
+});
+
+run('port 數變多之後（setPortCount）：62 個旋律 voice 全部分得到輸出 channel，最多用到第 5 個 port，都不落在打擊槽', () => {
+  const log = [], clock = { ms: 0 };
+  const hp = new HumanPerformer();
+  hp.setSynths(makeFakeSynth(log, 'assist', clock), makeFakeSynth(log, 'human', clock));
+  const score = buildVoiceScore(Array.from({ length: 62 }, (_, i) => ({ id: `p${i}`, voices: [{ id: `v${i}`, notes: [0] }] })));
+  hp.setPortCount(portsNeeded(score, []));
+  hp.load(score, new Map());
+  const channels = [...hp._voices.values()].map((v) => v.channel);
+  assert(hp._voices.size === 62 && hp.unplacedVoiceIds.length === 0, `5 個 port 放得下 62 個旋律 voice，實際 ${hp._voices.size} 個、unplaced ${hp.unplacedVoiceIds}`);
+  assert(new Set(channels).size === 62 && Math.max(...channels) < 80 && Math.max(...channels) >= 64, `channel 各不相同、用到第 5 個 port（64～79），實際最大 ${Math.max(...channels)}`);
+  assert(channels.every((c) => c % 16 !== 9), '旋律 voice 不落在任何 port 的打擊槽');
 });
 
 run('baseVolume：真人用 voice 的原音量（init 的 CC7），代打是原音量 × 0.845（約等於電腦輔助軌）；重播送回原音量', () => {

@@ -50,13 +50,13 @@ export const DEFAULT_PERFORMER_CONFIG = Object.freeze({
   drumChannel: 9, // MIDI 規格：第 10 個 channel（索引 9）是打擊
 });
 
-const CHANNELS_PER_PORT = 16;
-// synth.js 固定把兩個合成器都補到這個數字（見該檔案 channelCountOf() 的註解：呼叫
-// addNewChannel() 之後，synth 物件自己回報的 midiChannels.length 已查證不可信任，兩個檔案
-// 因此都改成直接用這個寫死的數字，不去讀 synth.midiChannels.length）。humanPerformer.js
-// 不能反過來 import synth.js（見檔頭 import 方向，會形成循環），只能靠註解手動同步，跟
-// AUTOPILOT_VOLUME_CC／HUMAN_EMPHASIS_GAIN 的既有做法一致。
-const TOTAL_CHANNELS = CHANNELS_PER_PORT * 4;
+// channel 的單一來源（synth.js 也從這裡 import，不再各寫一份）。模仿官方 SpessaSynth Sequencer：一個 port 16 個 channel，
+// 依需要的 port 數往上補、只增不減（官方 assignMIDIPort／addNewMIDIPort），每個 port 的 channel 9 是打擊。DEFAULT_PORTS 是
+// 合成器開機就補到的 port 數；歌曲需要更多時由 synth.js 的 load() 依 portsNeeded() 補，再用 setPortCount() 告訴排程器。
+// 不能讀 synth.midiChannels.length 當 channel 數（lib 的 addNewChannel() 會雙重 push，見 synth.js），所以數字只由這裡與
+// synth.js 自己計數。
+export const CHANNELS_PER_PORT = 16;
+export const DEFAULT_PORTS = 4;
 
 /* ═══════════════════════════════════════════
    應用層常數——不是規格
@@ -153,8 +153,8 @@ export function smoothRate(rate, sample) {
    ═══════════════════════════════════════════ */
 
 // 這個合成器上可用的旋律輸出 channel＝跳過每個 port 的打擊槽（ch % 16 === drumChannel）。
-function melodicChannelsFor(synth, drumChannel) {
-  const total = synth ? TOTAL_CHANNELS : CHANNELS_PER_PORT;
+function melodicChannelsFor(synth, drumChannel, ports) {
+  const total = synth ? ports * CHANNELS_PER_PORT : CHANNELS_PER_PORT;
   const out = [];
   for (let ch = 0; ch < total; ch++) {
     if (ch % CHANNELS_PER_PORT !== drumChannel) out.push(ch);
@@ -163,9 +163,9 @@ function melodicChannelsFor(synth, drumChannel) {
 }
 
 // 這個合成器上的打擊輸出 channel＝每個 port 的打擊槽（9／25／41／57）：合成器只有一個 port 時只有 drumChannel 一個。
-function drumChannelsFor(synth, drumChannel) {
-  const ports = synth ? TOTAL_CHANNELS / CHANNELS_PER_PORT : 1;
-  return Array.from({ length: ports }, (_, p) => p * CHANNELS_PER_PORT + drumChannel);
+function drumChannelsFor(synth, drumChannel, ports) {
+  const n = synth ? ports : 1;
+  return Array.from({ length: n }, (_, p) => p * CHANNELS_PER_PORT + drumChannel);
 }
 
 // 幫一組 voice 各自分配一個輸出 channel，避免兩個原本共用同一個原始 channel 的 voice 打架。旋律 voice 依序拿
@@ -220,10 +220,25 @@ function makeVoice(spec, slot, notes, kind, channel) {
   };
 }
 
+// 這首歌至少需要幾個 port 的 channel（不低於 DEFAULT_PORTS）：旋律 voice 每個 port 有 15 個、打擊 voice 每種鼓組 program 佔一個
+// port 的打擊槽，指派與未指派兩個池子（兩個合成器）各自算，取較大的。assignments 同 load()：Map 或 [partId, 槽位][]。
+export function portsNeeded(score, assignments) {
+  const assignMap = assignments instanceof Map ? assignments : new Map(assignments || []);
+  const pools = [{ melodic: 0, kits: new Set() }, { melodic: 0, kits: new Set() }]; // [指派, 未指派]
+  for (const part of score?.parts || []) {
+    const pool = pools[assignMap.has(part.id) ? 0 : 1];
+    for (const spec of voiceSpecsOf(part)) {
+      if (spec.percussionKit) pool.kits.add(spec.program); else pool.melodic++;
+    }
+  }
+  const melodicPerPort = CHANNELS_PER_PORT - 1; // 每個 port 扣掉打擊槽
+  return Math.max(DEFAULT_PORTS, ...pools.map((p) => Math.max(Math.ceil(p.melodic / melodicPerPort), p.kits.size)));
+}
+
 // 指派聲部只配 humanSynth 的 channel、未指派聲部只配 assistSynth 的 channel——指派聲部沒被演奏者揮過手就是
 // 靜音，不需要幫它在 assistSynth 上保留一條代打用的 channel。兩個池子各自獨立，配額用完的聲部回報在 unplaced，
 // 這一輪不會出聲。
-function buildVoices(score, assignments, assistSynth, humanSynth, cfg) {
+function buildVoices(score, assignments, assistSynth, humanSynth, cfg, ports) {
   const voices = new Map(); // voiceId → voice
   const unplaced = [];
 
@@ -241,9 +256,9 @@ function buildVoices(score, assignments, assistSynth, humanSynth, cfg) {
   }
 
   const { byVoiceId: humanCh, unplaced: u1 } =
-    allocateChannels(assignedSpecs, melodicChannelsFor(humanSynth, cfg.drumChannel), drumChannelsFor(humanSynth, cfg.drumChannel));
+    allocateChannels(assignedSpecs, melodicChannelsFor(humanSynth, cfg.drumChannel, ports), drumChannelsFor(humanSynth, cfg.drumChannel, ports));
   const { byVoiceId: assistCh, unplaced: u2 } =
-    allocateChannels(assistSpecs, melodicChannelsFor(assistSynth, cfg.drumChannel), drumChannelsFor(assistSynth, cfg.drumChannel));
+    allocateChannels(assistSpecs, melodicChannelsFor(assistSynth, cfg.drumChannel, ports), drumChannelsFor(assistSynth, cfg.drumChannel, ports));
   unplaced.push(...u1, ...u2);
 
   for (const spec of assignedSpecs) {
@@ -267,6 +282,7 @@ export class HumanPerformer {
     this.cfg = { ...DEFAULT_PERFORMER_CONFIG, ...config };
     this.assistSynth = null;   // 電腦輔助聲部的合成器（未指派聲部）
     this.humanSynth = null;    // 真人聲部合成器（被指派聲部）
+    this.ports = DEFAULT_PORTS; // 合成器目前有幾個 port（每個 16 個 channel）；synth.js 補 channel 之後用 setPortCount() 更新
     this._score = null;
     this._beats = [];          // buildBeatGrid() 的結果；空陣列＝無法算拍（SMPTE division）
     this._voices = new Map();  // voiceId → voice
@@ -296,6 +312,10 @@ export class HumanPerformer {
   setSynths(assistSynth, humanSynth) {
     this.assistSynth = assistSynth;
     this.humanSynth = humanSynth;
+  }
+
+  setPortCount(ports) {
+    this.ports = ports;
   }
 
   _synthOf(voice) {
@@ -328,7 +348,7 @@ export class HumanPerformer {
     const assignMap = !this._beats.length ? new Map()
       : assignments instanceof Map ? assignments : new Map(assignments || []);
 
-    const { voices, unplaced } = buildVoices(score, assignMap, this.assistSynth, this.humanSynth, this.cfg);
+    const { voices, unplaced } = buildVoices(score, assignMap, this.assistSynth, this.humanSynth, this.cfg, this.ports);
     this._voices = voices;
     this.unplacedVoiceIds = unplaced;
 

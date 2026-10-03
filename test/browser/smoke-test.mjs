@@ -350,12 +350,37 @@ async function checkChannelLayout(page, problems) {
   }
 }
 
+// 歌曲需要的 port 比開機補的多（62 個旋律 voice 要 5 個 port）：載入時 synth.js 依需要補 channel 並重設，worklet 的打擊配置
+// 要變成 5 個 port 的 channel 9（9／25／41／57／73），其餘（含新補的 64～79）是旋律；62 個 voice 全部分得到輸出 channel。
+async function checkChannelGrowth(page, problems) {
+  console.log('▶ 歌曲需要更多 port：載入 62 個旋律 voice 的樂譜，檢查 channel 依需要補、打擊配置…');
+  const got = await page.evaluate(async () => {
+    const { humanPerformer, load } = await import('/src/midi/synth.js');
+    const parts = Array.from({ length: 62 }, (_, i) => ({ id: `p${i}`, trackIndex: i, channel: i % 16, program: 0, bank: { msb: 121, lsb: 0 }, percussionKit: false, init: null, noteCount: 1,
+      voices: [{ id: `v${i}`, program: 0, bank: { msb: 121, lsb: 0 }, percussionKit: false, init: null, noteCount: 1 }] }));
+    const notes = parts.map((p, i) => ({ partId: p.id, voiceId: `v${i}`, trackIndex: i, channel: i % 16, note: 60, velocity: 90, startTick: 0, endTick: 480, startSeconds: 0, endSeconds: 0.5, durationSeconds: 0.5 }));
+    const score = { parts, notes, ticksPerQuarter: 480, durationTicks: 1920, durationSeconds: 2, tickToSeconds: (t) => t / 960,
+      timeSignatures: [{ tick: 0, numerator: 4, denominator: 4, clocksPerClick: 24, thirtySecondNotesPer24Clocks: 8 }] };
+    await load(score, []);
+    await new Promise((r) => setTimeout(r, 800)); // worklet 的狀態回報是非同步的
+    const drumsOf = (syn) => Array.from({ length: 80 }, (_, i) => (syn.midiChannels[i]?.patch?.isDrum ? i : -1)).filter((i) => i >= 0);
+    const channels = [...humanPerformer._voices.values()].map((v) => v.channel);
+    return { assist: drumsOf(humanPerformer.assistSynth), human: drumsOf(humanPerformer.humanSynth), voices: channels.length, maxChannel: Math.max(...channels), unplaced: humanPerformer.unplacedVoiceIds.length };
+  });
+  check(got.voices === 62 && got.unplaced === 0, '62 個旋律 voice 全部分得到輸出 channel（不再有 60 個的上限）', problems, JSON.stringify(got));
+  check(got.maxChannel >= 64 && got.maxChannel < 80, '有 voice 落在新補的 channel 64～79', problems, `最大 channel ${got.maxChannel}`);
+  for (const label of ['assist', 'human']) {
+    check(JSON.stringify(got[label]) === '[9,25,41,57,73]', `補 channel 之後 ${label} 合成器只有每個 port 的 channel 9 是打擊（9／25／41／57／73）`, problems, `實際打擊 channel：${got[label]}`);
+  }
+}
+
 // 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → （試聽基本操作）→ 把第一個聲部指派給演奏者 1
 // → 按播放 → 暫停 → 重播，沿途逐一斷言四顆鈕的狀態。跟真實使用者操作路徑一致（見 index.html 的
 // data-field／data-action），不繞過 UI 直接呼叫內部函式（只有「載入中」「播完」兩種難以自然走到的狀態例外）。
 async function driveAppToPlaying(page, problems) {
   await expectTransport(page, 'idle', problems);
   await checkChannelLayout(page, problems);
+  await checkChannelGrowth(page, problems);
 
   console.log('▶ 選現場人數＝1…');
   await page.selectOption('#poseCountSelect', '1');

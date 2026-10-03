@@ -98,6 +98,8 @@ const MUTATIONS = [
     expect: ['你揮得晚但仍連續'] },
   { name: '間隔門檻放到 9 拍（漏揮也被當成晚到，揮手吞掉一拍）', edits: [['const LATE_RESPONSE_BEATS = 1.7;', 'const LATE_RESPONSE_BEATS = 9;']],
     expect: ['你隔了快 2 拍才揮'] },
+  { name: 'portsNeeded 永遠只回預設 port 數（歌曲需要更多也不補）', edits: [['return Math.max(DEFAULT_PORTS, ...pools.map', 'return DEFAULT_PORTS || Math.max(DEFAULT_PORTS, ...pools.map']],
+    expect: ['portsNeeded：', 'port 數變多之後'] },
   { name: '前奏期間電腦照樣倒數（提早揮的第一下之後前奏被追趕）', edits: [['if (this._autopilotLeftSec != null && this._clockSec >= this._entrySec - EPS) this._autopilotLeftSec -= dt;', 'if (this._autopilotLeftSec != null) this._autopilotLeftSec -= dt;']],
     expect: ['前奏：只在前奏中揮過一次手'] },
   // ── parser：聲部切分（part／voice）與跟官方對齊（單元測試＋差異測試）──
@@ -191,6 +193,8 @@ const MUTATIONS = [
     expect: ['進入試聽＝演奏進度歸零'] },
   { name: 'worklet 回讀：初始化的 CC7 沒送到 worklet（只剩 program）', suites: ['smoke'], edits: [['      synth.controllerChange(channel, 7, voice.baseVolume);\n', '']],
     expect: ['worklet 在'] },
+  { name: '歌曲需要更多 port 時不補 channel（load 不呼叫 ensurePorts）', target: SYNTH, suites: ['smoke'], edits: [['  ensurePorts(portsNeeded(score, assignments));', '  void portsNeeded;']],
+    expect: ['62 個旋律 voice'] },
   { name: '開機補完 channel 後不重設合成器（channel 16 以上預設是打擊）', target: SYNTH, suites: ['smoke'], edits: [['        s.reset();\n      }', '      }']],
     expect: ['開機後'] },
   { name: '試聽失敗時畫面沒有提示', target: PLAYER, suites: ['smoke'], edits: [["      notice: PREVIEW_NOTICE[err.kind] ?? `試聽失敗：${source.name}`,\n", '']],

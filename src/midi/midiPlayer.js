@@ -285,7 +285,7 @@ async function playCurrentSource({ fromStart = false } = {}) {
       // partId → 演奏者槽位的對應才能知道每個指派聲部要問哪個 ID 的手勢狀態。
       await synth.load(s.score, [...s.assignments]);
       if (synth.humanPerformer.unplacedVoiceIds.length) {
-        console.warn('⚠️ 分譜的 voice 超過合成器可用的輸出 channel（旋律 60 個、鼓組 4 種），以下 voice 這一輪不會出聲：',
+        console.warn('⚠️ 分譜的 voice 超過合成器可用的輸出 channel（每個 port 旋律 15 個、鼓組各佔一個，載入時已依歌曲需要補 port），以下 voice 這一輪不會出聲：',
           synth.humanPerformer.unplacedVoiceIds.join('、'));
       }
       await synth.play();
