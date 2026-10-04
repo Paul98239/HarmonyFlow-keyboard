@@ -1,5 +1,5 @@
 // ============================================================
-//  humanPerformer.js — 排程器（純邏輯，無 DOM／CDN）
+//  scheduler.js — 排程器（純邏輯，無 DOM／CDN）
 //
 //  整個合奏共用「一個樂譜時鐘 S」（單位：樂譜秒，跟音符的 startSeconds／endSeconds 同一個座標系）。
 //  揮手不是讓某個聲部跳到某一拍，而是「放行下一拍」：放行邊界 B（`_frontierSec`）＝已放行那一拍的拍尾。
@@ -46,7 +46,7 @@
 
 import { buildBeatGrid } from './midiParser.js';
 
-export const DEFAULT_PERFORMER_CONFIG = Object.freeze({
+export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
   drumChannel: 9, // MIDI 規格：第 10 個 channel（索引 9）是打擊
 });
 
@@ -116,7 +116,7 @@ const EPS = 1e-9;
 // src/midi/midi_tools/midi_utils.ts）處理 Master Volume 時也是同一套平方關係（註解明講「it corresponds to CC volume,
 // so volume is squared」）。反推公式：HUMAN_EMPHASIS_GAIN × (比例)² = 1.0 → 比例 = √(1/1.4) ≈ 0.845，原音量 100 時
 // 就是 85（改版前寫死的 AUTOPILOT_VOLUME_CC）。這個數字只用來對照 synth.js 的 HUMAN_EMPHASIS_GAIN，改動任一邊都要重算
-// 另一邊——兩個檔案之間無法用 import 連動（humanPerformer.js 不能反過來 import synth.js，會形成循環），跟這個專案裡
+// 另一邊——兩個檔案之間無法用 import 連動（scheduler.js 不能反過來 import synth.js，會形成循環），跟這個專案裡
 // vision.js 的 EMIT_HEARTBEAT_MS 與 midiPlayer.js 的 GATE_STALE_MS 互相對照的既有寫法一致，只能靠註解手動同步。只調 CC7
 // （音量），不動 note-on velocity（觸鍵力度）——這是兩種不同的 MIDI 概念，velocity 只在 note-on 當下決定一次，CC7 是
 // 疊加在已經送出的音符之上的獨立音量調整。
@@ -275,11 +275,11 @@ function buildVoices(score, assignments, assistSynth, humanSynth, cfg, ports) {
 }
 
 /* ═══════════════════════════════════════════
-   HumanPerformer
+   Scheduler
    ═══════════════════════════════════════════ */
-export class HumanPerformer {
+export class Scheduler {
   constructor(config = {}) {
-    this.cfg = { ...DEFAULT_PERFORMER_CONFIG, ...config };
+    this.cfg = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
     this.assistSynth = null;   // 電腦輔助聲部的合成器（未指派聲部）
     this.humanSynth = null;    // 真人聲部合成器（被指派聲部）
     this.ports = DEFAULT_PORTS; // 合成器目前有幾個 port（每個 16 個 channel）；synth.js 補 channel 之後用 setPortCount() 更新
@@ -478,7 +478,7 @@ export class HumanPerformer {
   }
 
   // 把播放狀態整個退回「剛 load() 完」的樣子：stop() 與 restart() 共用這一個函式。之後任何新增的
-  // 狀態欄位都要在這裡重設（test/unit/human-performer.test.mjs 有一個整體快照比對，忘了重設會
+  // 狀態欄位都要在這裡重設（test/unit/scheduler.test.mjs 有一個整體快照比對，忘了重設會
   // 直接失敗）。呼叫端負責先收音（pause()）與決定要不要接著播放。
   _resetPlayback() {
     for (const voice of this._voices.values()) {

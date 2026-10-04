@@ -21,7 +21,7 @@ src/
                   系統控制列、面板開合、事件代理、render 排程
   vision/         攝影機／WebGL／MediaPipe（vision.js）＋ 純邏輯的多人追蹤（tracking.js）與揮手手勢（gesture.js）
   midi/           spessasynth 合成器（synth.js）、播放器狀態＋動作＋畫面（midiPlayer.js）、雲端曲庫 client（midiApi.js）
-                  ＋ 純邏輯的 SMF 解析與聲部切分（midiParser.js）、排程器（humanPerformer.js：單一樂譜時鐘、揮手放行下一拍、
+                  ＋ 純邏輯的 SMF 解析與聲部切分（midiParser.js）、排程器（scheduler.js：單一樂譜時鐘、揮手放行下一拍、
                   代打補位）、試聽（previewPlayer.js：官方 Sequencer 的薄包裝）
   styles.css      唯一的樣式檔（@layer base／ui／states）
   assets/         MediaPipe 模型（.task）與 soundfont（.sf3），進 git

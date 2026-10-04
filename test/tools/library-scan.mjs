@@ -22,7 +22,7 @@ import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { parseMidi, buildBeatGrid } from '../../src/midi/midiParser.js';
-import { HumanPerformer } from '../../src/midi/humanPerformer.js';
+import { Scheduler } from '../../src/midi/scheduler.js';
 import { autoPlayStats, makeRng, measure, nominalWaves, rankedParts, simulate, startBeatOf } from './sim.mjs';
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
@@ -91,7 +91,7 @@ function scanParse(songs, fileCount) {
   if (noPart.length) problems++;
   const unplaced = [];
   const voiceCounts = songs.map((s) => {
-    const hp = new HumanPerformer();
+    const hp = new Scheduler();
     const stub = { controllerChange() {}, programChange() {}, noteOn() {}, noteOff() {} };
     hp.setSynths(stub, stub); // 有合成器才會用滿 64 個 channel（app 裡兩個合成器都補到 64 個）
     hp.load(s.score, []);
@@ -186,7 +186,7 @@ function buildScenarios(score, rnd) {
   const waves = (b0, o = {}) => nominalWaves(beats, b0, { rnd, ...o });
   const out = [];
   // syncTolMs：同刻音發聲差的容許值。演奏者之間錯開的情境，晚幾十 ms 才揮第一下的人，他拍首的音是補上的（見
-  // humanPerformer.js 的合併窗），所以容許值要加上最大的錯開量。
+  // scheduler.js 的合併窗），所以容許值要加上最大的錯開量。
   // track：單人每拍揮一次、沒有漏揮的情境，另外量揮手→發聲的延遲與共用拍位有沒有比演奏者多走。
   const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS, track = false, preludeSec = null, gate = null } = {}) => out.push({ name, players, exempt, syncTolMs, track, preludeSec, gate });
   const solo = (name, o, track = false, gate = null) => add(name, [A], [{ partIds: [A], waves: waves(b0Of([A]), o) }], { track, gate });

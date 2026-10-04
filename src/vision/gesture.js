@@ -2,12 +2,12 @@
 //  gesture.js — 手勢偵測（純邏輯，無 DOM／CDN 依賴）
 //
 //  只有一種偵測器：`ArcDetector`，拋物線手勢（手同時有橫向位移＋垂直方向先下沉再回升），
-//  回升那一刻（確認反轉）觸發 `triggerSeq` +1，交給 `midi/humanPerformer.js` 當「前進一步」
+//  回升那一刻（確認反轉）觸發 `triggerSeq` +1，交給 `midi/scheduler.js` 當「前進一步」
 //  的觸發訊號（純觸發，不輸出音量）。不依賴肩膀高度，手在胸口、腰間動都可以觸發；開口大小、
 //  左右方向都不限，只看「有沒有這個下沉再回升的相對形狀」。
 //
-//  `triggerSeq` 只是離散的「有沒有新觸發」訊號：`humanPerformer.js` 收到一次新的 triggerSeq
-//  就放行下一拍，並用兩次觸發的間隔估計演奏者的速度（見 humanPerformer.js 的 rateSample()）——
+//  `triggerSeq` 只是離散的「有沒有新觸發」訊號：`scheduler.js` 收到一次新的 triggerSeq
+//  就放行下一拍，並用兩次觸發的間隔估計演奏者的速度（見 scheduler.js 的 rateSample()）——
 //  這個模組本身完全不管速度，只負責偵測「有沒有一次有效的拋物線」。
 //
 //  vision.js 每幀從鎖定骨架取出左右手腕／肘／肩座標，每個槽位左右手各一個 ArcDetector；
@@ -26,7 +26,7 @@ export const DEFAULT_ARC_CONFIG = Object.freeze({
   minShoulderWidth: 0.04,   // 肩寬的下限，避免遠處偵測到的極小肩寬把比值放大到離譜
   staleMs: 320,             // 距上一次餵值超過這麼久 → 視為剛回到鏡頭，這一段動作作廢重來
   reversalNoiseFloor: 0.05, // Y 方向死區（肩寬單位）：從谷底回升要超過這個幅度才算「確認回升」
-  // 這兩個門檻比較嚴格（原本 0.08／0.10）：拿掉 humanPerformer.js 的快慢範圍限制之後，
+  // 這兩個門檻比較嚴格（原本 0.08／0.10）：拿掉 scheduler.js 的快慢範圍限制之後，
   // 每一次判定成立都會立刻前進一步、播出下一個音，沒有緩衝空間，門檻調嚴一點降低誤觸發。
   minDepthRatio: 0.15,      // 這段下沉至少要多深（肩寬單位）才算一次有效拋物線
   minXSpanRatio: 0.18,      // 下沉期間至少要有這麼多橫向位移（肩寬單位），用來跟「純上下抖」區分開
@@ -35,7 +35,7 @@ export const DEFAULT_ARC_CONFIG = Object.freeze({
 /**
  * 拋物線手勢：手同時有橫向位移＋垂直方向先下沉（image y 變大）再回升。
  * 不看肩膀高度、不限開口大小、不限左右方向，只認這個相對形狀，純粹當一個離散的「觸發」訊號
- * （不輸出音量／深度——手勢的音量／表情這輪先不做，見 humanPerformer.js 的說明）。
+ * （不輸出音量／深度——手勢的音量／表情這輪先不做，見 scheduler.js 的說明）。
  *
  * 判斷邏輯（單一狀態機，逐幀更新最高點／最低點）：
  *  - 追蹤目前這一段動作的「起點高度」（peak，Y 最小值）與「目前已知的最低點」（trough，Y 最大值）。

@@ -1,7 +1,7 @@
 // ============================================================
 //  mutation-check.mjs — 變異檢查：故意把排程器弄壞，看指定的測試會不會變紅（手動執行，不進 CI，純 Node）
 //
-//  做法：把 src／測試複製到暫存資料夾，在複製出來的原始檔（預設 humanPerformer.js，也可以用 target 指定別的檔）
+//  做法：把 src／測試複製到暫存資料夾，在複製出來的原始檔（預設 scheduler.js，也可以用 target 指定別的檔）
 //  套用一個「一行的破壞」，跑測試，檢查「指定的那幾個測試」有沒有失敗。不會動到工作目錄裡的任何檔案。沒有任何
 //  指定測試變紅＝這個行為沒有被保護。suites 可以含 'smoke'：用同一支瀏覽器測試（test/browser/smoke-test.mjs）
 //  跑被破壞的複本（HF_ROOT），每個要一分多鐘，所以只放確實要靠瀏覽器才抓得到的破壞。
@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const TARGET = 'src/midi/humanPerformer.js'; // 沒有指定 target 的變異破壞這個檔
+const TARGET = 'src/midi/scheduler.js'; // 沒有指定 target 的變異破壞這個檔
 const PREVIEW = 'src/midi/previewPlayer.js', PLAYER = 'src/midi/midiPlayer.js', SYNTH = 'src/midi/synth.js', PARSER = 'src/midi/midiParser.js';
 const ONLY = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7);
 const SKIP_SMOKE = process.argv.includes('--skip-smoke'); // 只跑單元測試抓得到的變異（快）
@@ -27,13 +27,13 @@ const ONLY_SMOKE = process.argv.includes('--only-smoke'); // 只跑要靠瀏覽�
 // suites：要跑哪些測試檔（預設只跑排程器的單元測試）；target：破壞哪個檔（預設排程器）。
 const MUTATIONS = [
   { name: 'FIFO 改回以音高為鍵（同音高的新音蓋掉舊音）', edits: [['queue.push({ endSec: n.endSeconds, legatoTo: n.legatoTo });', 'queue.length = 0; queue.push({ endSec: n.endSeconds, legatoTo: n.legatoTo });']],
-    expect: ['同音高重疊（先進先出）', 'canon 完美演奏者'], suites: ['human-performer', 'oracle'] },
+    expect: ['同音高重疊（先進先出）', 'canon 完美演奏者'], suites: ['scheduler', 'oracle'] },
   { name: '收音改回「發聲後各自倒數真實秒數」', edits: [
     ['queue.push({ endSec: n.endSeconds, legatoTo: n.legatoTo });', 'queue.push({ endSec: n.durationSeconds, startedMs: this._lastTickMs, legatoTo: n.legatoTo });'],
     ['queue[0].endSec <= this._clockSec + EPS', '(this._lastTickMs - queue[0].startedMs) / 1000 >= queue[0].endSec - EPS']],
     expect: ['收音依樂譜時鐘'] },
   { name: '放行邊界改成含等號（邊界上的音在放行前就發聲）', edits: [['if (n.startSeconds > S + EPS || n.startSeconds >= B) break;', 'if (n.startSeconds > S + EPS || n.startSeconds > B) break;']],
-    expect: ['放行邊界是排他的', 'L3 同步'], suites: ['human-performer', 'oracle'] },
+    expect: ['放行邊界是排他的', 'L3 同步'], suites: ['scheduler', 'oracle'] },
   { name: '拿掉追趕（時鐘直接跳到揮手的目標）', edits: [['this._clockSec = Math.min(this._clockSec + dt * this._playbackRate * catchUp, this._frontierSec);', 'this._clockSec = Math.min(Math.max(this._clockSec + dt * this._playbackRate, this._catchUpToSec), this._frontierSec);']],
     expect: ['揮得比樂譜快'] },
   { name: '拿掉停格釋放（停格太久也不收音）', edits: [['if (this._stallSec > this._idleThresholdSec()) this._noteOffAll();', '/* 變異：沒有停格釋放 */']],
@@ -57,7 +57,7 @@ const MUTATIONS = [
   { name: '收音時不送 noteOff（暫停與停格釋放只清紀錄）', edits: [['for (let i = 0; i < queue.length; i++) {', 'for (let i = 0; i < 0; i++) {']],
     expect: ['暫停會收掉所有還在響的音', '固定種子的整體不變量壓力測試'] },
   { name: '送出 velocity 0 的 noteOn', edits: [['synth?.noteOn(voice.channel, n.note, n.velocity);', 'synth?.noteOn(voice.channel, n.note, 0);']],
-    expect: ['canon 完美演奏者', '固定種子的整體不變量壓力測試', '不送 velocity 0 的 noteOn'], suites: ['human-performer', 'oracle'] },
+    expect: ['canon 完美演奏者', '固定種子的整體不變量壓力測試', '不送 velocity 0 的 noteOn'], suites: ['scheduler', 'oracle'] },
   // ── 速度跟隨 ──
   { name: '速度倍率固定 1（不跟著揮手速度）', edits: [['this._playbackRate = smoothRate(r, sample);', 'this._playbackRate = 1;']],
     expect: ['揮得比樂譜快 26％', '電腦照估計的速度替你走', '終局照最後一次估計'] },
@@ -257,7 +257,7 @@ try {
       mutated = mutated.replace(find, () => replace);
     }
     writeFileSync(join(tmp, target), mutated);
-    const failed = (m.suites || ['human-performer']).flatMap((suite) => runSuite(tmp, suite));
+    const failed = (m.suites || ['scheduler']).flatMap((suite) => runSuite(tmp, suite));
     writeFileSync(join(tmp, target), originalOf(target)); // 還原，下一個變異從乾淨的複本開始
     const caught = m.expect.filter((k) => failed.some((f) => f.includes(k)));
     if (!caught.length) bad++;

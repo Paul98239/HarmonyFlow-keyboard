@@ -1,5 +1,5 @@
 // ============================================================
-//  human-performer.test.mjs — src/midi/humanPerformer.js 的回歸測試（純 Node，無瀏覽器）
+//  scheduler.test.mjs — src/midi/scheduler.js 的回歸測試（純 Node，無瀏覽器）
 //
 //  沒有測試框架，跟 test/browser/smoke-test.mjs 同一套風格：run()／assert() 是整個專案
 //  唯一的測試慣例。假 synth 只實作 controllerChange／programChange／noteOn／noteOff，並替每個
@@ -12,7 +12,7 @@
 //  Note Off，也可能是 velocity 0 的 Note On，parser 都配成同一顆音）；排程器送給合成器的 noteOn 與
 //  noteOff 次數要相同、一一對應，而且絕不送 velocity 0 的 noteOn（合成器會把它當成 note-off）。
 //
-//  用法：node test/unit/human-performer.test.mjs
+//  用法：node test/unit/scheduler.test.mjs
 // ============================================================
 
 import { readFileSync } from 'node:fs';
@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parseMidi } from '../../src/midi/midiParser.js';
-import { HumanPerformer, DEFAULT_PORTS, portsNeeded, rateSample, smoothRate } from '../../src/midi/humanPerformer.js';
+import { Scheduler, DEFAULT_PORTS, portsNeeded, rateSample, smoothRate } from '../../src/midi/scheduler.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CANON_PATH = join(__dirname, '../../src/assets/canon-violin-cello.mid');
@@ -66,7 +66,7 @@ function makeDriver(hp, slotOf, clock) {
 
 function makeHp(score, assignments, { play = true } = {}) {
   const log = [], clock = { ms: 0 };
-  const hp = new HumanPerformer();
+  const hp = new Scheduler();
   hp.setSynths(makeFakeSynth(log, 'assist', clock), makeFakeSynth(log, 'human', clock));
   hp.load(score, new Map(assignments));
   const d = makeDriver(hp, Object.fromEntries(assignments), clock);
@@ -1137,7 +1137,7 @@ function makeLoggingSynth(log, label, clock) {
 }
 function makeVoiceHp(score, assignments, { play = true } = {}) {
   const log = [], clock = { ms: 0 };
-  const hp = new HumanPerformer();
+  const hp = new Scheduler();
   hp.setSynths(makeLoggingSynth(log, 'assist', clock), makeLoggingSynth(log, 'human', clock));
   hp.load(score, new Map(assignments));
   const d = makeDriver(hp, Object.fromEntries(assignments), clock);
@@ -1251,7 +1251,7 @@ run('portsNeeded：旋律 voice 每個 port 15 個、每種鼓組佔一個 port 
 
 run('port 數變多之後（setPortCount）：62 個旋律 voice 全部分得到輸出 channel，最多用到第 5 個 port，都不落在打擊槽', () => {
   const log = [], clock = { ms: 0 };
-  const hp = new HumanPerformer();
+  const hp = new Scheduler();
   hp.setSynths(makeFakeSynth(log, 'assist', clock), makeFakeSynth(log, 'human', clock));
   const score = buildVoiceScore(Array.from({ length: 62 }, (_, i) => ({ id: `p${i}`, voices: [{ id: `v${i}`, notes: [0] }] })));
   hp.setPortCount(portsNeeded(score, []));
@@ -1362,7 +1362,7 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者（�
         check(balance.get(k) >= 0, `${k} 沒有對應的 noteOn 就 noteOff`);
       },
     });
-    hp = new HumanPerformer();
+    hp = new Scheduler();
     hp.setSynths(fake('assist'), fake('human'));
     hp.load(score, new Map(assignments));
     hp.play();

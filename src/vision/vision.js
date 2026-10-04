@@ -45,7 +45,7 @@ const TAU = Math.PI * 2;
 // 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（跟 ArcDetector 門檻、ID 標籤字級
 // 同一套慣例），人離鏡頭遠近不同時偏移比例才會一致，不用固定 px。
 const CHIN_OFFSET_RATIO = 0.18;
-// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（現在 humanPerformer.js 是拍級
+// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（現在 scheduler.js 是拍級
 // 事件驅動、沒有背景時鐘，停頓幾秒——例如正在對著一顆長音不動——是完全正常的演奏節奏，門檻
 // 故意放寬，不再是主要機制）；真正負責「換手」體驗的是 HAND_STILL_RADIUS／HAND_STILL_MS：
 // 鎖定的手連續待在一個小範圍內夠久就視為靜止（藏起來的手通常也是靜止的），比「多久沒觸發」
@@ -63,9 +63,9 @@ const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續�
 let tracker = new PersonTracker({ maxUsers: CONFIG.maxUsers });
 
 // 手勢：每個鎖定槽位左右手各一個 ArcDetector（拋物線手勢 → 換音符的觸發，見
-// humanPerformer.js；不輸出音量）。每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號
-// （→ humanPerformer 的前進許可）」＋「這一幀真的在場的槽位」，經 setPerformanceStateListener
-// 註冊的回呼送給播放器（midi/midiPlayer.js）。這裡只送離散的觸發序號，播放速度由 humanPerformer.js 依兩次觸發的間隔估計。
+// scheduler.js；不輸出音量）。每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號
+// （→ scheduler 的前進許可）」＋「這一幀真的在場的槽位」，經 setPerformanceStateListener
+// 註冊的回呼送給播放器（midi/midiPlayer.js）。這裡只送離散的觸發序號，播放速度由 scheduler.js 依兩次觸發的間隔估計。
 const MP_LEFT_WRIST = 15, MP_RIGHT_WRIST = 16;
 const MP_LEFT_ELBOW = 13, MP_RIGHT_ELBOW = 14;
 const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;
@@ -81,7 +81,7 @@ const arcLastSeqBySlot = Array.from({ length: CONFIG.maxUsers },
     left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined,
     stillAnchor: null, stillSinceMs: undefined,
   }));
-// 注意：combinedSeq 刻意不在這裡歸零。humanPerformer.js 靠它「有沒有變」判斷有沒有新觸發，
+// 注意：combinedSeq 刻意不在這裡歸零。scheduler.js 靠它「有沒有變」判斷有沒有新觸發，
 // 歸零會讓下一次比對誤判成一次新事件、平白多彈一個音（實測發現：走出鏡頭超過 SLOT_RELEASE_MS、
 // 按重置骨架 ID、改現場人數都會呼叫到這裡）。combinedSeq 單調遞增、永不重置。
 const resetSlotDetectors = (arcSlot, lastSeq) => {
@@ -124,7 +124,7 @@ function performanceStatesDiffer(a, b) {
 }
 
 // 只在 arcTriggerSeqBySlot 有意義變化時才送，免得每幀都打一次——但再久也一定會送一次（心跳），
-// 因為「沒有變化」跟「沒有訊號」是兩件事。midi/humanPerformer.js 用「多久沒有新的 triggerSeq」
+// 因為「沒有變化」跟「沒有訊號」是兩件事。midi/scheduler.js 用「多久沒有新的 triggerSeq」
 // 判斷要不要切成電腦代打模式；有了心跳，「還有沒有訊號」只由這裡決定，看門狗才恢復成字面意思：
 // 真的沒有幀在跑（分頁切走、迴圈停掉）。
 function emitGesturePerformanceState(state, nowMs) {
@@ -372,7 +372,7 @@ function updateSlotArc(arcDet, track, nowMs) {
 // 之後只認那隻手的觸發——避免另一隻閒置手被模型猜出來後在畫面上飄移、湊出假拋物線造成誤觸發
 // （實測發現的問題）。鎖定的手連續不可見、連續 HAND_LOCK_RELEASE_MS 沒有新觸發（保險絲）、
 // 或連續 HAND_STILL_MS 幾乎沒在動（主要機制，見上方常數註解），才放開讓使用者換手。
-// combinedSeq 是槽位自己的累加計數，供 midi/humanPerformer.js 判斷「有沒有新事件」。state
+// combinedSeq 是槽位自己的累加計數，供 midi/scheduler.js 判斷「有沒有新事件」。state
 // 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
 function combineArcTriggers(state, arc, nowMs) {
   const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, shoulderWidth } = arc;

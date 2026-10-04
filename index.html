@@ -23,7 +23,7 @@
   <link rel="modulepreload" href="./src/midi/synth.js">
   <link rel="modulepreload" href="./src/midi/midiPlayer.js">
   <link rel="modulepreload" href="./src/midi/midiParser.js">
-  <link rel="modulepreload" href="./src/midi/humanPerformer.js">
+  <link rel="modulepreload" href="./src/midi/scheduler.js">
   <link rel="modulepreload" href="./src/midi/previewPlayer.js">
   <link rel="modulepreload" href="./src/midi/midiApi.js">
   <link rel="modulepreload" href="./src/vision/vision.js">
@@ -49,10 +49,10 @@
        控制項的行為經 data-action（click）／data-field（change／input）委派到 #top-center-stack（src/ui.js）。
        #topProgressBar 是獨立於 #top-center-stack 之外的第三個 #app-shell 直接子元素：唯讀播放
        進度，跨滿 #camera-frame 寬度、貼齊視窗頂邊，不可互動、不顯示任何時間文字，見下方元素
-       本身的註解與 src/midi/humanPerformer.js 的 getPositionSeconds()。 -->
+       本身的註解與 src/midi/scheduler.js 的 getPositionSeconds()。 -->
   <div id="app-shell" inert>
     <!-- 頂端進度條：純視覺、跨滿攝影機外框寬度、不可互動、不顯示任何時間文字。進度是播放頭在
-         原譜的第幾秒換算成比例（humanPerformer.getPositionSeconds() / score.durationSeconds）
+         原譜的第幾秒換算成比例（scheduler.getPositionSeconds() / score.durationSeconds）
          ——沒人觸發時完全靜止、有觸發時會跳，這是拍級事件驅動的誠實呈現，不做補間動畫。用
          <progress> 而不是可互動控制項：天生唯讀、不接點擊／拖曳、不會被 Tab 聚焦。要回到開頭用
          播放列的重播鈕；拖曳跳到任意時間點目前不做（要連動共用拍位與各聲部的接手狀態，工程量偏大）。 -->

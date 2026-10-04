@@ -7,7 +7,7 @@
 //  而且絕不送 velocity 0 的 noteOn（合成器會把它當成 note-off）。
 // ============================================================
 
-import { HumanPerformer } from '../../src/midi/humanPerformer.js';
+import { Scheduler } from '../../src/midi/scheduler.js';
 
 export const TICK_MS = 12;
 
@@ -62,7 +62,7 @@ export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {
   const clock = { ms: 0 };
   let hp;
   const rec = makeRecorder(() => hp, clock);
-  hp = new HumanPerformer();
+  hp = new Scheduler();
   hp.setSynths(rec.assist, rec.human);
   const slotOf = new Map();
   players.forEach((p, i) => p.partIds.forEach((id) => slotOf.set(id, i + 1)));

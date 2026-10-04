@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { BasicMIDI, SpessaLog, SpessaSynthProcessor, SpessaSynthSequencer } from 'spessasynth_core';
 import { parseMidi } from '../../src/midi/midiParser.js';
-import { HumanPerformer } from '../../src/midi/humanPerformer.js';
+import { Scheduler } from '../../src/midi/scheduler.js';
 
 // 官方函式庫在沒有音色庫時會對每個 channel 印「No preset found」，這裡用不到音色庫，關掉雜訊。
 SpessaLog.setLogLevel(false, false, false);
@@ -241,7 +241,7 @@ await run('L1 邊界：兩個 MIDI port——絕對 channel 也一致（依 port
    ═══════════════════════════════════════════ */
 
 // 假合成器：記下排程器送出的事件與「當下的假時間」。noteOn 發生的那一刻 voice.cursor 還指在這顆音上
-// （humanPerformer.js 先 noteOn 再 cursor++），所以能直接記下它對應樂譜裡的哪一顆音。
+// （scheduler.js 先 noteOn 再 cursor++），所以能直接記下它對應樂譜裡的哪一顆音。
 function makeRecordingSynths(clock, getPerformer) {
   const log = [];
   const make = (label) => ({
@@ -261,7 +261,7 @@ function autoPlay(score) {
   const clock = { now: 0 };
   let hp;
   const { log, assist, human } = makeRecordingSynths(clock, () => hp);
-  hp = new HumanPerformer();
+  hp = new Scheduler();
   hp.setSynths(assist, human);
   hp.load(score, new Map());
   hp.play();
@@ -277,7 +277,7 @@ function perform(score, assignedPartIds, speed) {
   const clock = { now: 0 };
   let hp;
   const { log, assist, human } = makeRecordingSynths(clock, () => hp);
-  hp = new HumanPerformer();
+  hp = new Scheduler();
   hp.setSynths(assist, human);
   hp.load(score, new Map(assignedPartIds.map((id) => [id, 1])));
   hp.play();

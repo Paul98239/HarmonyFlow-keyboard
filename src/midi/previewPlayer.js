@@ -2,7 +2,7 @@
 //  previewPlayer.js — 試聽：官方 SpessaSynth Sequencer 的薄包裝。純邏輯：無 DOM、不 import CDN。
 //
 //  試聽不經過我們的 parser（midiParser.js），位元組原樣交給官方 Sequencer 自己解析、自己排程，播放
-//  整個在 AudioWorklet 裡進行，不走 humanPerformer.js 的主執行緒 tick——所以即使我們的 parser 解析失敗
+//  整個在 AudioWorklet 裡進行，不走 scheduler.js 的主執行緒 tick——所以即使我們的 parser 解析失敗
 //  試聽仍可用，聽感也能拿來跟演奏對照。這裡只做三件事：
 //   1) 官方載入是非同步的，等結果（songChange／midiError／逾時／被中斷）；
 //   2) 提供播放列需要的最小控制（暫停／續播／從頭／停止）與狀態（時間／長度／播完）；

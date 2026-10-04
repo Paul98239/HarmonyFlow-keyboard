@@ -2,19 +2,19 @@
 //  synth.js — spessasynth 合成器：兩個合成器（電腦輔助聲部 synth／真人聲部 synthHuman）、humanGain
 //  閘門＋音量凸顯。純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
 //
-//  演奏不用 Sequencer：兩個合成器都只接收 humanPerformer.js（排程器）送來的個別
-//  noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。試聽才用官方 Sequencer
+//  演奏不用 Sequencer：兩個合成器都只接收 scheduler.js（排程器）送來的個別
+//  noteOn／noteOff／初始 program 設定，見 scheduler.js 檔頭說明。試聽才用官方 Sequencer
 //  （previewPlayer.js 包裝，走電腦輔助那個合成器 synth），跟演奏互斥：兩者共用 synth 的 channel，
 //  任何一邊開始之前都先 flushPreviousSong() 把另一邊停掉。
 //
 //  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值；沒被自己的演奏者
-//  揮過手的聲部就是靜音（見 humanPerformer.js 的說明）。沒被指派的聲部固定走 synth，跟指派
+//  揮過手的聲部就是靜音（見 scheduler.js 的說明）。沒被指派的聲部固定走 synth，跟指派
 //  聲部共用同一個樂譜時鐘，同一刻的音同時發聲。humanGain 開啟時的目標值刻意設在 1.0 以上
 //  （`HUMAN_EMPHASIS_GAIN`），讓使用者控制的聲部整體比電腦輔助的聲部更突出；電腦輔助那一軌
 //  固定不掛額外 gain，是這個音量對比的基準，不會跟著被調小聲。
 // ============================================================
 
-import { HumanPerformer, CHANNELS_PER_PORT, DEFAULT_PORTS, portsNeeded } from './humanPerformer.js';
+import { Scheduler, CHANNELS_PER_PORT, DEFAULT_PORTS, portsNeeded } from './scheduler.js';
 import { PreviewPlayer } from './previewPlayer.js';
 
 /* ═══════════════════════════════════════════
@@ -42,12 +42,12 @@ const DRUM_CHANNEL_OFFSET = 9;
 // WorkletSynthesizer 預設只建 16 個 channel（1 個 MIDI port）；總譜聲部數超過這個數字時，
 // 多出來的聲部會完全分不到輸出 channel、整段靜音（已用國旗歌 24 個旋律聲部實測重現）。
 // spessasynth_lib 支援用 addNewChannel() 動態加開，對應 MIDI 多 port 的慣例。模仿官方 Sequencer：開機先補到
-// DEFAULT_PORTS 個 port（humanPerformer.js 的單一來源），歌曲需要更多時在 load() 依 portsNeeded() 補，只增不減。
+// DEFAULT_PORTS 個 port（scheduler.js 的單一來源），歌曲需要更多時在 load() 依 portsNeeded() 補，只增不減。
 
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
 const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（電腦輔助軌固定是 1.0 基準，沒有額外
                                   // gain）：使用者控制的聲部整體調大聲，凸顯真人正在演奏的部分；
-                                  // 實測後可能還要繼續調整。改這個值時，humanPerformer.js 的
+                                  // 實測後可能還要繼續調整。改這個值時，scheduler.js 的
                                   // AUTOPILOT_VOLUME_CC 要重算（該檔案的常數註解有完整公式）——
                                   // 兩個檔案不能互相 import 形成循環，只能靠這兩則註解手動同步。
 
@@ -70,9 +70,9 @@ let lastGateTarget = -1;
 // 狀態，下一次 flushPreviousSong() 要多做一次完整重設。
 let SequencerClass, previewPlayer = null, previewUsed = false;
 
-// 拍級事件驅動排程器（humanPerformer.js）：驅動 synth（未指派聲部，反應式播放）與
+// 拍級事件驅動排程器（scheduler.js）：驅動 synth（未指派聲部，反應式播放）與
 // synthHuman（指派聲部，接手才發聲），由播放器的 12ms 排程 tick 呼叫 tick()。
-export const humanPerformer = new HumanPerformer();
+export const scheduler = new Scheduler();
 
 /* ═══════════════════════════════════════════
    MIDI 引擎核心
@@ -99,7 +99,7 @@ function ensurePorts(ports) {
     s.reset();
   }
   portCount = ports;
-  humanPerformer.setPortCount(portCount);
+  scheduler.setPortCount(portCount);
 }
 function isDrumChannelIndex(ch) {
   return ch % CHANNELS_PER_PORT === DRUM_CHANNEL_OFFSET;
@@ -135,7 +135,7 @@ export async function initEngine() {
       // 真人聲部的第二個合成器。走 humanGain（預設靜音，開啟時刻意比電腦輔助軌大聲，見
       // HUMAN_EMPHASIS_GAIN）→ 同一個 compressor，跟電腦輔助軌共用同一段動態處理。
       synthHuman = new WorkletSynthesizer(audioCtx);
-      humanPerformer.setSynths(synth, synthHuman);
+      scheduler.setSynths(synth, synthHuman);
       const compressor = audioCtx.createDynamicsCompressor();
       compressor.threshold.value = -18;
       compressor.knee.value = 6;
@@ -178,7 +178,7 @@ export async function initEngine() {
       // _applyInitialPatch() 之後另外送的 bank／program 決定），純粹是時機問題，把
       // addNewChannel() 挪到 soundBank 載入完成之後即可避開。
       portCount = DEFAULT_PORTS;
-      humanPerformer.setPortCount(portCount);
+      scheduler.setPortCount(portCount);
       for (const s of [synth, synthHuman]) {
         for (let i = CHANNELS_PER_PORT; i < portCount * CHANNELS_PER_PORT; i++) s.addNewChannel();
         // spessasynth_core 的 createMIDIChannel() 會把動態新增的 channel 預設設成打擊 channel（已用 worklet 回讀實測：
@@ -198,7 +198,7 @@ export async function initEngine() {
       audioCtx = undefined;
       synth = undefined;
       synthHuman = undefined;
-      humanPerformer.setSynths(null, null);
+      scheduler.setSynths(null, null);
       masterGain = undefined;
       humanGain = undefined;
       isReady = false;
@@ -211,7 +211,7 @@ export async function initEngine() {
 // 換歌／換指派／進出試聽前的清場：收掉排程器、試聽與殘響，bank／program 歸零（鼓組 channel 跳過：
 // 那裡的 program 是鼓組編號，不是旋律音色）。
 export function flushPreviousSong() {
-  humanPerformer.stop();
+  scheduler.stop();
   previewPlayer?.stop();
   isSongLoaded = false;
   // 官方 Sequencer 載入與跳時間時會自己重設合成器、依那首歌改各 channel 的音色／音量／聲像；
@@ -241,7 +241,7 @@ export async function load(score, assignments) {
   }
   flushPreviousSong();
   ensurePorts(portsNeeded(score, assignments)); // 聲部多到 4 個 port 放不下的歌才會補；補完一定在送初始 patch 之前
-  humanPerformer.load(score, assignments);
+  scheduler.load(score, assignments);
   isSongLoaded = true;
 }
 
@@ -250,25 +250,25 @@ export async function play() {
   isProcessingPlay = true;
   try {
     if (audioCtx.state === 'suspended') await audioCtx.resume();
-    humanPerformer.play();
+    scheduler.play();
   } finally { isProcessingPlay = false; }
 }
 // 從頭重播（重播鍵、播完後按 ▶）：跟 play() 一樣先確保 AudioContext 已恢復（使用者手勢），
-// 再交給排程器重設並接著播——重設的內容見 humanPerformer.js 的 _resetPlayback()。
+// 再交給排程器重設並接著播——重設的內容見 scheduler.js 的 _resetPlayback()。
 export async function restart() {
   if (isProcessingPlay || !isSongLoaded) return;
   isProcessingPlay = true;
   try {
     if (audioCtx.state === 'suspended') await audioCtx.resume();
-    humanPerformer.restart();
+    scheduler.restart();
   } finally { isProcessingPlay = false; }
 }
 export function pause() {
-  humanPerformer.pause(); // 收掉所有正在響的音；每個聲部的播放進度都保留，下次播放從原處繼續
+  scheduler.pause(); // 收掉所有正在響的音；每個聲部的播放進度都保留，下次播放從原處繼續
 }
 export function isLoaded() { return isSongLoaded; }
-export function isPaused() { return !isSongLoaded || !humanPerformer.isPlaying(); }
-export function isFinished() { return isSongLoaded && humanPerformer.isFinished(); }
+export function isPaused() { return !isSongLoaded || !scheduler.isPlaying(); }
+export function isFinished() { return isSongLoaded && scheduler.isFinished(); }
 
 /* ═══════════════════════════════════════════
    試聽（官方 Sequencer，見 previewPlayer.js）

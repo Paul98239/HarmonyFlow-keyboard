@@ -16,7 +16,7 @@
 //  selectionSignature，下一次按頂端播放鍵時 playCurrentSource() 才用新的指派重新載入。
 //  指派是持久設定，不隨追蹤雜訊變動：下拉列「無／演奏者 1~N」，N ＝ 系統控制 bar 選的「現場人數」
 //  （playerCount，還沒選是 0 → 只有「無」），不因當下偵測到幾人而增減。
-//  指派聲部的實際演奏＝揮手放行下一拍（見 humanPerformer.js）：整個合奏——指派聲部與電腦輔助的聲部——
+//  指派聲部的實際演奏＝揮手放行下一拍（見 scheduler.js）：整個合奏——指派聲部與電腦輔助的聲部——
 //  共用一個樂譜時鐘，時鐘以跟著揮手間隔估計的速度前進、碰到放行邊界就停格等下一次揮手，每次有效拋物線手勢放行下一拍；
 //  只有「曾被自己的演奏者真實觸發過」的聲部才出聲，別人放行（或代打放行）的拍它的音照樣發聲，停手超過短暫
 //  門檻後由代打暫時續走、只填空拍。完全沒有人指派時整份照時間連續自動播放。
@@ -49,7 +49,7 @@ function formatTime(sec) {
 const PLAYER_COUNT = 4;      // 可指派的演奏者 ID 數上限（對齊 vision.js 的 CONFIG.maxUsers）；
                              // 實際列幾個由系統控制 bar 的「現場人數」決定（見 setPlayerCount）
 
-// 真人聲部的排程 tick 週期（humanPerformer.js 共用位置推進與發聲判斷的驅動頻率）。
+// 真人聲部的排程 tick 週期（scheduler.js 共用位置推進與發聲判斷的驅動頻率）。
 const SCHEDULER_TICK_MS = 12;
 // 播完偵測／humanGate 補算的 UI tick 週期。
 const UI_TICK_MS = 200;
@@ -129,9 +129,9 @@ function selectionSignature(score, assignments) {
 const allPartIds = () => playerStore.state.parts.map((p) => p.id);
 // 目前確實存在於 score 又被指派出去的聲部 id。
 const assignedPartIds = () => allPartIds().filter((id) => playerStore.state.assignments.has(id));
-// humanPerformer.tick() 每個 tick 問一次：這個聲部指派的演奏者 ID 現在的手勢狀態
+// scheduler.tick() 每個 tick 問一次：這個聲部指派的演奏者 ID 現在的手勢狀態
 // （在場與否、拋物線觸發的累加計數、目前指派到的槽位）。多回報 slot 是讓
-// humanPerformer.js 能偵測「指派中途變了」（改指派、或人數變小被動清掉指派），
+// scheduler.js 能偵測「指派中途變了」（改指派、或人數變小被動清掉指派），
 // 避免把換槽位那一刻誤判成一次真的觸發。
 const gestureFor = (partId) => {
   const slot = playerStore.state.assignments.get(partId) ?? null;
@@ -183,7 +183,7 @@ function loadScore(arrayBuffer, label) {
     }
     playerStore.set({ score, parts: score.parts });
   } catch (err) {
-    // score 保持 clearScore() 設的 null／[]：humanPerformer.load(null, ...) 會直接回傳、
+    // score 保持 clearScore() 設的 null／[]：scheduler.load(null, ...) 會直接回傳、
     // 不建立任何聲部——分譜解析失敗不會擋住「播放」這個動作本身，但也沒有整份自動播放這條
     // 退路可用（synth.js 已經不用 spessasynth 的 Sequencer，見該檔案頭），實際結果是靜音。
     console.warn(`⚠️ ${label} 分譜解析失敗，無法播放`, err);
@@ -253,7 +253,7 @@ function clearSource() {
    播放（本地／雲端共用同一套邏輯）
    ═══════════════════════════════════════════ */
 // 「目前引擎裡在播的到底是什麼」的簽章：來源身分 + 分譜／指派狀態。兩者都相同才能直接續播，
-// 任一項不同都要重新交給 humanPerformer.load() 重建聲部與拍格線。
+// 任一項不同都要重新交給 scheduler.load() 重建聲部與拍格線。
 const buildPlaybackSignature = (source) =>
   `${sourceIdentity(source)}::${selectionSignature(playerStore.state.score, playerStore.state.assignments)}`;
 
@@ -274,19 +274,19 @@ async function playCurrentSource({ fromStart = false } = {}) {
   try {
     const signature = buildPlaybackSignature(s.source);
     if (signature === lastPlayedSignature) {
-      // 引擎裡就是這份組合：重播鍵、或播完後按 ▶ 從頭來（排程器重設，見 humanPerformer.js 的
+      // 引擎裡就是這份組合：重播鍵、或播完後按 ▶ 從頭來（排程器重設，見 scheduler.js 的
       // restart()），其餘只是續播。
       await (fromStart || s.finished ? synth.restart() : synth.play());
     } else {
       // 簽章不同（換歌或改過指派）：完整重新載入，本來就從頭播。
       // 「處理中」只由 ▶ 的 ⋯ 表達，不改寫歌名。本地檔案幾乎瞬間就好，延遲 120ms 再顯示 ⋯。
       loadingIndicatorTimer = setTimeout(() => playerStore.set({ transport: 'loading' }), LOADING_INDICATOR_DELAY_MS);
-      // 傳快照（[partId, slot][]），不要傳活的 Map——humanPerformer.js 的 buildVoices() 需要
+      // 傳快照（[partId, slot][]），不要傳活的 Map——scheduler.js 的 buildVoices() 需要
       // partId → 演奏者槽位的對應才能知道每個指派聲部要問哪個 ID 的手勢狀態。
       await synth.load(s.score, [...s.assignments]);
-      if (synth.humanPerformer.unplacedVoiceIds.length) {
+      if (synth.scheduler.unplacedVoiceIds.length) {
         console.warn('⚠️ 分譜的 voice 超過合成器可用的輸出 channel（每個 port 旋律 15 個、鼓組各佔一個，載入時已依歌曲需要補 port），以下 voice 這一輪不會出聲：',
-          synth.humanPerformer.unplacedVoiceIds.join('、'));
+          synth.scheduler.unplacedVoiceIds.join('、'));
       }
       await synth.play();
       lastPlayedSignature = signature;
@@ -445,20 +445,20 @@ function uiTick() {
   // 沒有新的手勢狀態進來，也會在 200ms 內把 humanGain 收到正確位置（synth.js 那邊 target 去重）。
   updateHumanGate();
 
-  // 唯讀進度：演奏時位置來自 humanPerformer（原譜座標），不是真實經過時間——沒人觸發就會停住不動；
+  // 唯讀進度：演奏時位置來自 scheduler（原譜座標），不是真實經過時間——沒人觸發就會停住不動；
   // 試聽時是官方 Sequencer 的 currentTime（連續前進）。
   // 用「跟目前 store 值的差距夠不夠大」節流，不是整數秒（沒有文字要顯示，不需要卡在整數）：
   // 差距小於 0.05s（畫面上幾乎看不出來的寬度變化）就不寫，避免每 200ms 都排一輪全區塊 render。
-  const pos = inPreview ? synth.previewTime() : synth.isLoaded() ? synth.humanPerformer.getPositionSeconds() : 0;
+  const pos = inPreview ? synth.previewTime() : synth.isLoaded() ? synth.scheduler.getPositionSeconds() : 0;
   if (Math.abs(pos - playerStore.state.positionSeconds) > 0.05) {
     playerStore.set({ positionSeconds: pos });
   }
 }
 
 // 真人聲部的排程 tick：把每個指派聲部目前的手勢狀態（在場／觸發計數）交給
-// humanPerformer.tick()，由它判斷有沒有新揮手、要不要放行下一拍（見 humanPerformer.js）。
+// scheduler.tick()，由它判斷有沒有新揮手、要不要放行下一拍（見 scheduler.js）。
 function schedulerTick() {
-  if (synth.isLoaded() && !synth.isPaused()) synth.humanPerformer.tick(performance.now(), gestureFor);
+  if (synth.isLoaded() && !synth.isPaused()) synth.scheduler.tick(performance.now(), gestureFor);
 }
 
 // main.js 呼叫一次；不靠 import 副作用啟動。
@@ -720,7 +720,7 @@ function renderLibraryPicker({ player }) {
 // 分譜清單每一列就是「聲部名（GM 音色的繁體中文名）＋一個下拉（無／演奏者 1~N）」，由 index.html 的
 // <template id="tpl-part-row"> clone，聲部名用 textContent 填（來自檔案內容，不當 HTML）。列只在 parts 參照或
 // playerCount 變了才重建，每次 render 都校正各下拉的值與 is-mine。ID 只是槽位編號的顯示提示，畫面上不額外
-// 標示在不在場——不在場就是沒有新觸發，交給 humanPerformer.js 判斷該靜音還是接手，指派本身留著。
+// 標示在不在場——不在場就是沒有新觸發，交給 scheduler.js 判斷該靜音還是接手，指派本身留著。
 const localInput = document.getElementById('localMidiInput');
 const localFileName = document.getElementById('localMidiFileName');
 const scorePartSection = document.getElementById('scorePartSection');

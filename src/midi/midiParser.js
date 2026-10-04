@@ -6,7 +6,7 @@
 //  典型用法：
 //    const parsed = parseMidi(await file.arrayBuffer());
 //    parsed.parts   // → 這份總譜有哪些聲部（MuseScore 的一個樂器＝一個 part，底下是 voice＝譜表 × channel）
-//    parsed.notes   // → humanPerformer.js 直接拿這份（連同 parts、buildBeatGrid()）建立 voice
+//    parsed.notes   // → scheduler.js 直接拿這份（連同 parts、buildBeatGrid()）建立 voice
 //
 //  本模組不碰 Blob／DOM／AudioContext——包成 Blob 是呼叫端的事。
 //
@@ -1255,7 +1255,7 @@ export function parseMidi(input) {
 }
 
 /* ═══════════════════════════════════════════
-   小節格線：多人合奏共用同步用（humanPerformer.js）。不塞進 parseMidi() 的回傳值。
+   小節格線：多人合奏共用同步用（scheduler.js）。不塞進 parseMidi() 的回傳值。
    ═══════════════════════════════════════════ */
 
 /**

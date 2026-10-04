@@ -19,7 +19,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { parseMidi } from '../../src/midi/midiParser.js';
-import { HumanPerformer, CHANNELS_PER_PORT, DEFAULT_PORTS } from '../../src/midi/humanPerformer.js';
+import { Scheduler, CHANNELS_PER_PORT, DEFAULT_PORTS } from '../../src/midi/scheduler.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TICK_MS = 12;
@@ -102,7 +102,7 @@ function setup(score, assignments) {
   const checkClaimed = (channel) => {
     for (const v of hp._voices.values()) if (v.kind === 'human' && v.channel === channel && !v.triggered) violations.push(`指派聲部 ${v.id} 還沒被揮過手就發聲了`);
   };
-  hp = new HumanPerformer();
+  hp = new Scheduler();
   hp.setSynths(wrap(assist, 'assist'), wrap(human, 'human'));
   hp.load(score, new Map(assignments));
   return { hp, assist, human, violations, clock };
