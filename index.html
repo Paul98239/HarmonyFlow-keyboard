@@ -60,20 +60,22 @@
       <!-- 播放 pill：四顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽，互相防呆：哪顆能按由 midiPlayer.js 的
            transportButtonState() 依播放狀態決定，不能按的就 disabled）＋歌名（完整顯示、不用省略號
            截斷）。♪ 是進出試聽（官方 Sequencer）的開關，試聽中黃底；試聽中 ▶ ❚❚ ↻ 作用在試聽。
-           is-empty＝還沒有能播放的歌（idle／載入中），控制列的淡化條件靠它。 -->
+           is-empty＝還沒有能播放的歌（idle／載入中），控制列的淡化條件靠它。
+           按鈕的 icon 是 inline SVG、不是字型字元：圖畫在 24×24 的座標裡、重心對齊 (12,12)，viewBox
+           把它放在按鈕正中央，置中由向量座標保證，不受字型與像素取整影響（細節見 styles.css 的 .tb-icon）。 -->
       <div id="toolbar-playback" class="toolbar-playback is-empty">
         <div id="transport-group" class="tb-transport" role="group" aria-label="播放控制">
           <button id="btnPlay" class="btn tb-btn tb-play" type="button" data-action="play" disabled aria-label="播放">
-            <span class="tb-icon" aria-hidden="true"></span>
+            <svg class="tb-icon" viewBox="-12 -12 48 48" aria-hidden="true"><path class="tb-ico-play" d="M7.333 4L7.333 20L21.333 12Z"/><g class="tb-ico-loading"><circle cx="4.5" cy="12" r="2.2"/><circle cx="12" cy="12" r="2.2"/><circle cx="19.5" cy="12" r="2.2"/></g></svg>
           </button>
           <button id="btnPause" class="btn tb-btn tb-pause" type="button" data-action="pause" disabled aria-label="暫停">
-            <span class="tb-icon" aria-hidden="true"></span>
+            <svg class="tb-icon" viewBox="-12 -12 48 48" aria-hidden="true"><path d="M6 5H10.5V19H6ZM13.5 5H18V19H13.5Z"/></svg>
           </button>
           <button id="btnReplay" class="btn tb-btn tb-replay" type="button" data-action="replay" disabled aria-label="重播">
-            <span class="tb-icon" aria-hidden="true"></span>
+            <svg class="tb-icon" viewBox="-12 -12 48 48" aria-hidden="true"><g transform="translate(0.832 0.161)"><path d="M12 5.2A6.8 6.8 0 1 0 18.8 12" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M12 1.6L17.2 5.2L12 8.8Z"/></g></svg>
           </button>
           <button id="btnPreview" class="btn tb-btn tb-preview" type="button" data-action="preview" disabled aria-label="試聽">
-            <span class="tb-icon" aria-hidden="true"></span>
+            <svg class="tb-icon" viewBox="-12 -12 48 48" aria-hidden="true"><g transform="translate(1.006 -1.13)"><ellipse cx="8" cy="18" rx="3.7" ry="2.8" transform="rotate(-20 8 18)"/><path d="M10.6 17.4V3.5H12.6V17.4Z"/><path d="M12.6 3.5C13.4 8 19.5 8.6 19 14C18 10.8 15 10.6 12.6 9.6Z"/></g></svg>
           </button>
         </div>
         <div id="midiStatusText" class="player-status-bar">等待選擇歌曲...</div>

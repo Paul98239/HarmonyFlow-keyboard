@@ -337,6 +337,7 @@ body, html {
   display: flex;
   align-items: center;
   gap: 0.6em;
+  position: relative; z-index: 1;   /* 按鈕的滑鼠提示會往下蓋到控制列上，要疊在它之上（面板 z-index 60 仍更高） */
   width: max-content;
   max-width: min(100vw, 100vh * 16 / 9);
   padding: 0.3em 0.9em;
@@ -566,6 +567,7 @@ body, html {
      試聽中       → ♪ 恆黃底（再按結束試聽），▶ ❚❚ ↻ 照同一組規則作用在試聽 */
 .tb-transport { display: flex; align-items: center; gap: 0.4em; flex-shrink: 0; }
 .tb-btn {
+  position: relative;      /* 給下面的滑鼠提示（::after）定位 */
   flex-shrink: 0;
   width: 2.5em; height: 2.5em;
   display: flex; align-items: center; justify-content: center;
@@ -573,12 +575,42 @@ body, html {
   transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast), transform .1s;
 }
 .tb-btn:active:not(:disabled) { transform: scale(0.94); }
-.tb-icon { display: block; line-height: 1; font-size: 1.05em; }
-.tb-play .tb-icon::before { content: "\25B6"; }                                  /* ▶ */
-.tb-pause .tb-icon::before { content: "\275A\275A"; letter-spacing: -0.12em; }   /* ❚❚ */
-.tb-replay .tb-icon::before { content: "\21BB"; }                                /* ↻ */
-.tb-preview .tb-icon::before { content: "\266A"; }                               /* ♪ */
-.tb-play.is-loading .tb-icon::before { content: "\22EF"; }                       /* ⋯ */
+
+/* icon 是 inline SVG（markup 在 index.html），不用字型字元：字元的位置由字型的 side bearing／ascent
+   決定、還會被對齊到整數像素，不同字級、縮放倍率、作業系統下有約 1 個像素的偏移，沒辦法保證置中；
+   用 CSS mask 貼圖也一樣（遮罩會被光柵化到整數像素）。
+   做法：svg 填滿按鈕（absolute＋inset:0，中心跟按鈕中心重合），viewBox="-12 -12 48 48" 讓 0~24 的圖落在
+   正中央（占按鈕 50%）。每個圖都把「面積重心」（對每個點的位置做面積加權平均，物理上的質心）放在
+   (12,12)：▶ 是三角形，外框置中會視覺偏左，所以用重心；↻、♪ 不對稱，同樣用重心。向量內容以子像素
+   精度反鋸齒，置中誤差只剩按鈕本身的像素取整（實測 DPR 1／1.5／2 為 0，1.25 約 0.26 個像素）。
+   fill: currentColor：is-current 的黑字、disabled 的半透明自動沿用按鈕的狀態。 */
+.tb-icon {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  fill: currentColor;
+}
+/* ▶ 的 svg 同時帶著載入中的 ⋯：平常顯示 ▶、載入中（is-loading）換成 ⋯，只靠 CSS 切換。 */
+.tb-ico-loading { display: none; }
+.tb-play.is-loading .tb-ico-play { display: none; }
+.tb-play.is-loading .tb-ico-loading { display: inline; }
+
+/* 滑鼠移上去顯示按鈕名稱：純 CSS，文字直接讀按鈕的 aria-label（♪ 試聽中 JS 會把它改成「結束試聽」，
+   提示就自動跟著變）。只在有 hover 的裝置、且按鈕可按時顯示（disabled 的 opacity 0.4 會連提示一起
+   變淡，看不清楚）；pointer-events:none 讓提示不會搶走按鈕的 hover。 */
+@media (hover: hover) {
+  .tb-btn::after {
+    content: attr(aria-label);
+    position: absolute; top: calc(100% + 0.65em); left: 50%;
+    transform: translateX(-50%);
+    padding: 0.25em 0.6em; border-radius: var(--radius-sm);
+    background: var(--panel-bg); border: var(--line) solid var(--border-light);
+    box-shadow: var(--shadow-sm);
+    color: var(--text); font-size: 0.85em; font-weight: 700; white-space: nowrap;
+    opacity: 0; pointer-events: none;
+    transition: opacity var(--dur-fast);
+  }
+  .tb-btn:hover:not(:disabled)::after { opacity: 1; }
+}
 
 /* 頂端 pill 的歌名：完整顯示，不用省略號截斷，優先維持單行。--song-title-scale 是「JS 可以直接寫
    的連續量」CSS 變數之一（另外兩個是 --ui-fs、--popup-max-height），由
