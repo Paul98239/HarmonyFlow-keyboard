@@ -286,6 +286,20 @@ run('同 tick 的速度衝突：後出現者生效（跟官方一致）', () => 
   assert(Math.abs(parsed.notes[0].startSeconds - 1.5) < 1e-9, `起音應為 1.5s（後出現者生效），實際 ${parsed.notes[0].startSeconds}`);
 });
 
+run('MuseScore 的空譜表：鋼琴只有一行譜有音、另一行是空的（有初始化區塊或只有軌名），仍是一個 part、一個 voice，初始音量取首軌的', () => {
+  const partsOf = (tracks) => parseMidi(midiFile(tracks)).parts;
+  // 上行譜只有初始化區塊（空）、下行譜有音：voice 只有下行譜那一個，音量 90 取自首軌（上行譜）的初始化區塊
+  const upperEmpty = partsOf([track([nameEv('Piano'), ...initBlock(0, 0, { vol: 90 })]), track([nameEv('Piano'), ...notes(0, [48, 50, 52])])]);
+  assert(upperEmpty.length === 1 && upperEmpty[0].voices.length === 1 && upperEmpty[0].voices[0].init?.volume === 90,
+    `上行譜空、下行譜有音：1 個 part、1 個 voice、音量 90，實際 ${JSON.stringify(upperEmpty.map((p) => [p.name, p.voices.map((v) => [v.id, v.init?.volume])]))}`);
+  // 下行譜整條空軌（只有軌名）：不多出 voice，也不影響後面的長笛
+  const lowerEmpty = partsOf([track([nameEv('Piano'), ...initBlock(0, 0, { vol: 90 }), ...notes(0, [72, 74])]), track([nameEv('Piano')]), track([nameEv('Flute'), ...initBlock(1, 73), ...notes(1, [80])])]);
+  assert(lowerEmpty.length === 2 && lowerEmpty[0].voices.length === 1 && lowerEmpty[1].voices.length === 1, `鋼琴（一個 voice）＋長笛，實際 ${lowerEmpty.length} 個 part`);
+  // 鋼琴兩行譜都空：整個樂器不成 part
+  const bothEmpty = partsOf([track([nameEv('Piano'), ...initBlock(0, 0, { vol: 90 })]), track([nameEv('Piano')]), track([nameEv('Flute'), ...initBlock(1, 73), ...notes(1, [80])])]);
+  assert(bothEmpty.length === 1 && bothEmpty[0].voices.length === 1, `兩行譜都空的鋼琴不成 part，只剩長笛，實際 ${bothEmpty.length} 個 part`);
+});
+
 run('同 tick 的拍號與調號衝突：後出現者生效（跟速度表、官方一致），不重複列出同一個 tick', () => {
   const timeSig = (nn, dd, deltaTick = 0) => ({ deltaTick, bytes: [0xff, 0x58, 4, nn, dd, 24, 8] });
   const keySig = (sf) => ({ deltaTick: 0, bytes: [0xff, 0x59, 2, sf, 0] });
