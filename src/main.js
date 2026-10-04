@@ -7,7 +7,8 @@
 
 import * as midiPlayer from './midi/midiPlayer.js';
 import { initUi, setLoadingStatus, dismissLoading, showError } from './ui.js';
-import { startVision, setPerformanceStateListener, setPoseCountListener } from './vision/vision.js';
+import { startVision, setPoseCountListener } from './vision/vision.js';
+import { startKeyboardTrigger } from './keyboard.js';
 
 async function bootSystem() {
   midiPlayer.startPlayer(); // 200ms UI tick 與 12ms 排程 tick，不靠 import 副作用
@@ -24,8 +25,9 @@ async function bootSystem() {
     midiPlayer.warmUpMidiEngine(),
   ]);
 
-  // 拋物線手勢 → 指派給真人的聲部：vision.js 每幀把各演奏者 ID 的觸發計數／在場清單交給播放器。
-  setPerformanceStateListener(midiPlayer.setGesturePerformanceState);
+  // 觸發來源目前是鍵盤（演奏者 1）：揮手暫時關閉，vision.js 的手勢狀態不接進播放器。
+  // 不能兩條並存——vision 的心跳會把鍵盤的觸發計數蓋回 0。
+  startKeyboardTrigger(midiPlayer.setGesturePerformanceState);
 
   // 視覺初始化失敗時錯誤畫面已經顯示，載入畫面不收、inert 也維持
   if (!visionOk) return;

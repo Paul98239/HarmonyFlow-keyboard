@@ -431,6 +431,75 @@ async function driveAppToPlaying(page, problems) {
   if (!finOk) problems.push(`播完後按 ▶ 沒有從頭播：${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s`);
 }
 
+// 鍵盤觸發（接在 driveAppToPlaying 後面，此時演奏播放中、第一個聲部指派給演奏者 1）：觀察點是排程器的指派聲部
+// （lastSeq＝它看到的觸發累加計數、triggered＝演奏者是否被真實觸發過），在 12ms 的排程 tick 才更新，所以
+// 「沒有變」的斷言前要先等幾個 tick。
+async function driveKeyboardTrigger(page, problems) {
+  console.log('▶ 鍵盤觸發：四排字元鍵＝演奏者 1 的一次觸發，防呆（repeat／組合鍵／打字／下拉 type-ahead）…');
+  const human = () => page.evaluate(() => {
+    const v = [...window.__hf.synth.humanPerformer._voices.values()].find((x) => x.kind === 'human');
+    return { seq: v.lastSeq, triggered: v.triggered };
+  });
+  const settle = () => page.waitForTimeout(150);
+  await page.waitForFunction(() => [...window.__hf.synth.humanPerformer._voices.values()].some((v) => v.kind === 'human' && v.lastSeq !== null), null, { timeout: 5000 });
+  await page.evaluate(() => document.activeElement?.blur());
+
+  let s = await human();
+  check(s.seq === 0 && !s.triggered, '按鍵之前：指派聲部還沒被觸發', problems, JSON.stringify(s));
+  await page.keyboard.press('KeyF');
+  await page.waitForFunction((n) => [...window.__hf.synth.humanPerformer._voices.values()].some((v) => v.kind === 'human' && v.lastSeq === n && v.triggered), s.seq + 1, { timeout: 3000 }).catch(() => {});
+  let t = await human();
+  check(t.seq === s.seq + 1 && t.triggered, '按一下 F：指派聲部的觸發計數 +1、triggered', problems, JSON.stringify(t));
+
+  s = t;
+  await page.keyboard.down('KeyG');
+  await page.keyboard.down('KeyG'); // 第二次 down 沒有 up＝瀏覽器的自動重複（event.repeat）
+  await page.keyboard.up('KeyG');
+  await settle();
+  t = await human();
+  check(t.seq === s.seq + 1, '按住不放的自動重複只算一次', problems, `${s.seq} → ${t.seq}`);
+
+  s = t;
+  await page.keyboard.press('Control+KeyJ');
+  await page.keyboard.press('Alt+KeyJ');
+  await settle();
+  t = await human();
+  check(t.seq === s.seq, 'Ctrl／Alt 組合鍵不觸發', problems, `${s.seq} → ${t.seq}`);
+
+  s = t;
+  await page.keyboard.press('Space');
+  await page.keyboard.press('F5').catch(() => {});
+  await settle();
+  t = await human();
+  check(t.seq === s.seq, '不在四排裡的鍵（Space、F5）不觸發', problems, `${s.seq} → ${t.seq}`);
+
+  s = t;
+  await page.click('#midiSongQuery');
+  await page.keyboard.type('abc');
+  await settle();
+  t = await human();
+  const typed = await page.inputValue('#midiSongQuery');
+  check(t.seq === s.seq && typed === 'abc', '焦點在搜尋欄：打字不觸發、字照常打進欄位', problems, `${s.seq} → ${t.seq}，欄位內容「${typed}」`);
+  await page.fill('#midiSongQuery', '');
+  await page.evaluate(() => document.activeElement?.blur());
+
+  // 焦點在下拉時，字母鍵預設會做 type-ahead 跳選項（選歌下拉一跳就換歌）；用一個臨時的下拉驗證預設行為被擋掉、而且照樣觸發。
+  s = t;
+  const selectedAfter = await page.evaluate(() => {
+    const sel = document.createElement('select');
+    sel.id = 'kbTestSelect';
+    sel.append(new Option('apple'), new Option('banana'));
+    document.body.append(sel);
+    sel.focus();
+    return sel.selectedIndex;
+  });
+  await page.keyboard.press('KeyB');
+  await settle();
+  t = await human();
+  const idx = await page.evaluate(() => { const el = document.getElementById('kbTestSelect'); const i = el.selectedIndex; el.remove(); return i; });
+  check(selectedAfter === 0 && idx === 0 && t.seq === s.seq + 1, '焦點在下拉：type-ahead 被擋掉（選項不跳）、仍算一次觸發', problems, `選項 ${selectedAfter} → ${idx}，計數 ${s.seq} → ${t.seq}`);
+}
+
 // 試聽 vs 演奏（接在 driveAppToPlaying 後面，此時演奏正在播放）：播放中 ♪ 是灰的、暫停後按 ♪ 會
 // 結束演奏進度；試聽中的手勢觸發被忽略、改指派不影響試聽；離開試聽後 ▶ 重新載入、演奏從頭開始。
 async function drivePreviewVsPerformance(page, problems) {
@@ -705,6 +774,7 @@ async function main() {
     await exposeModules(page);
 
     await driveAppToPlaying(page, problems);
+    await driveKeyboardTrigger(page, problems);
     await drivePreviewVsPerformance(page, problems);
     await drivePreviewEndOfSong(page, problems);
     await drivePreviewRaces(page, problems);
