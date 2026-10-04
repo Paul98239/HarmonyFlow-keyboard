@@ -70,9 +70,9 @@ try {
     const J = (window.__jit = { dts: [], echo: [], longTasks: [], last: null, sent: new Map() });
     new PerformanceObserver((list) => { for (const e of list.getEntries()) J.longTasks.push(e.duration); }).observe({ type: 'longtask', buffered: false });
     const origTick = scheduler.tick.bind(scheduler);
-    scheduler.tick = (nowMs, g) => {
+    scheduler.tick = (nowMs) => {
       if (scheduler._playing) { if (J.last != null) J.dts.push(nowMs - J.last); J.last = nowMs; } else J.last = null;
-      return origTick(nowMs, g);
+      return origTick(nowMs);
     };
     const syn = scheduler.assistSynth, origOn = syn.noteOn.bind(syn);
     syn.noteOn = (ch, key, vel, o) => {

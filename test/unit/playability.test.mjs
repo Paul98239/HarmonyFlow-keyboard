@@ -3,11 +3,12 @@
 //
 //  「可以播放」的定義，每一條都有測試：
 //    1. parseMidi() 不丟例外，至少 1 個 part。
-//    2. 每個 voice 都分到輸出 channel（unplacedVoiceIds 空）；打擊 voice 只落在 9／25／41／57，旋律 voice 不落在打擊槽。
-//    3. 每個 voice 的初始狀態（bank、program、CC7／10／91／93）在該 channel 的第一個 noteOn 之前送到合成器。
+//    2. 每個 staff 都分到輸出 channel（unplacedStaffIds 空）；打擊 staff 只落在 9／25／41／57，旋律 staff 不落在打擊槽。
+//    3. 每個 staff 的初始狀態（bank、program、CC7／10／91／93）在該 channel 的第一個 noteOn 之前送到合成器。
 //    4. 整首自動播放（不指派）跑完：每顆解析出來的音恰好一個 noteOn、一個 noteOff，曲末沒有未釋放的音；值域合法
 //       （channel 0～63、音高 0～127、力度 1～127、CC 0～127）。
-//    5. 指派播放（腳本化手勢）跑完同樣沒有卡音，而且沒有未被自己的演奏者揮過手就發聲的指派聲部。
+//    5. 指派播放（腳本化觸發，每個 segment 在樂譜時間按一下，兩位演奏者輪流）跑完同樣沒有卡音，而且指派聲部（真人軌）的音
+//       只在 trigger() 呼叫內發聲（tick() 不放起音）。
 //  第 6 條（worklet 端的 channel 狀態真的等於送出去的值）要真的瀏覽器才看得到，在 test/browser/smoke-test.mjs。
 //
 //  合成器是「嚴格的假合成器」：違規時只記下來、不丟例外（排程器對合成器的呼叫包在 try／catch 裡，丟例外會被吞掉），
@@ -72,11 +73,11 @@ function makeStrictSynth(label, violations, getHp) {
       }
       s.noteOns++;
       s.sounding.set(key, (s.sounding.get(key) || 0) + 1);
-      // 2. 打擊槽只給打擊 voice、打擊 voice 只落在打擊槽
-      const voices = [...getHp()._voices.values()].filter((v) => v.channel === c);
+      // 2. 打擊槽只給打擊 staff、打擊 staff 只落在打擊槽
+      const staves = [...getHp()._staves.values()].filter((v) => v.channel === c);
       const drumSlot = DRUM_SLOTS.includes(c);
-      if (drumSlot && voices.some((v) => !v.percussionKit)) bad(`旋律 voice 落在打擊槽 ch${c}`);
-      if (!drumSlot && voices.some((v) => v.percussionKit)) bad(`打擊 voice 落在非打擊槽 ch${c}`);
+      if (drumSlot && staves.some((v) => !v.percussionKit)) bad(`旋律 staff 落在打擊槽 ch${c}`);
+      if (!drumSlot && staves.some((v) => v.percussionKit)) bad(`打擊 staff 落在非打擊槽 ch${c}`);
     },
     noteOff(c, key) {
       const s = ch(c), n = s.sounding.get(key) || 0;
@@ -90,47 +91,51 @@ function makeStrictSynth(label, violations, getHp) {
 
 function setup(score, assignments) {
   const violations = [], clock = { ms: 0 };
+  const ctx = { inTrigger: false }; // 腳本化觸發在呼叫 trigger() 前後切換，檢查指派聲部是不是在 trigger() 裡發聲
   let hp;
   const assist = makeStrictSynth('assist', violations, () => hp);
   const human = makeStrictSynth('human', violations, () => hp);
   const wrap = (synth, label) => new Proxy(synth, {
     get: (t, k) => (typeof t[k] === 'function' && ['noteOn', 'noteOff'].includes(k)
-      ? (...a) => { if (label === 'human' && k === 'noteOn') checkClaimed(a[0]); return t[k](...a); }
+      ? (...a) => { if (label === 'human' && k === 'noteOn') checkInTrigger(a[0]); return t[k](...a); }
       : t[k]),
   });
-  // 5. 指派聲部沒被自己的演奏者揮過手就不該出聲
-  const checkClaimed = (channel) => {
-    for (const v of hp._voices.values()) if (v.kind === 'human' && v.channel === channel && !v.triggered) violations.push(`指派聲部 ${v.id} 還沒被揮過手就發聲了`);
+  // 5. 指派聲部（真人軌）的音只在 trigger() 呼叫內發聲：tick() 不該放出任何真人軌的起音
+  const checkInTrigger = (channel) => {
+    if (ctx.inTrigger) return;
+    for (const v of hp._staves.values()) if (v.kind === 'human' && v.channel === channel) violations.push(`指派聲部 ${v.id} 不是在 trigger() 裡發聲`);
   };
   hp = new Scheduler();
   hp.setSynths(wrap(assist, 'assist'), wrap(human, 'human'));
   hp.load(score, new Map(assignments));
-  return { hp, assist, human, violations, clock };
+  return { hp, assist, human, violations, clock, ctx };
 }
 
 // 整首自動播放（沒有指派）：跑到播完（或 10 分鐘上限）。
 function autoPlay(score) {
   const env = setup(score, []);
   env.hp.play();
-  const get = () => ({ present: false, triggerSeq: 0, slot: null });
-  for (let ms = 0; ms < 600000 && !env.hp.isFinished(); ms += TICK_MS) env.hp.tick(ms, get);
+  for (let ms = 0; ms < 600000 && !env.hp.isFinished(); ms += TICK_MS) env.hp.tick(ms);
   return env;
 }
 
-// 指派播放：每位演奏者每拍準時揮手一次（模擬完美演奏者），揮到播完。slotOf：partId → 槽位。
+// 指派播放：每個 segment 在樂譜時間準時觸發一次（模擬完美演奏者），由被指派的演奏者輪流按，觸發到播完。
+// assignments：[partId, 槽位][]。
 function assignedPlay(score, assignments) {
   const env = setup(score, assignments);
-  const slotOf = Object.fromEntries(assignments);
-  const seqs = {};
-  const get = (partId) => (partId in slotOf ? { present: true, triggerSeq: seqs[slotOf[partId]] ?? 0, slot: slotOf[partId] } : { present: false, triggerSeq: 0, slot: null });
+  const slots = [...new Set(assignments.map(([, slot]) => slot))];
+  const segs = env.hp._segments;
   env.hp.play();
-  let ms = 0;
-  env.hp.tick(ms, get);
-  const beatMs = (env.hp._beats[0].endSeconds - env.hp._beats[0].startSeconds) * 1000;
-  let nextWave = 0;
+  let ms = 0, i = 0;
+  env.hp.tick(ms);
   for (; ms < 600000 && !env.hp.isFinished(); ms += TICK_MS) {
-    if (ms >= nextWave) { for (const s of new Set(Object.values(slotOf))) seqs[s] = (seqs[s] ?? 0) + 1; nextWave += beatMs; }
-    env.hp.tick(ms, get);
+    while (i < segs.length && ms >= score.midiTicksToSeconds(segs[i].ticks) * 1000) {
+      env.ctx.inTrigger = true;
+      env.hp.trigger(slots[i % slots.length], ms);
+      env.ctx.inTrigger = false;
+      i++;
+    }
+    env.hp.tick(ms);
   }
   return env;
 }
@@ -183,7 +188,7 @@ for (const [label, score] of [['canon 樣本', canonScore], ['MuseScore 形狀�
   run(`${label}：整首自動播放可以播放（初始狀態先於 noteOn、每顆音一個 noteOn 一個 noteOff、沒有卡音、值域合法）`, () => {
     assert(score.parts.length >= 1, `至少 1 個 part，實際 ${score.parts.length}`);
     const { hp, assist, human, violations } = autoPlay(score);
-    assert(hp.unplacedVoiceIds.length === 0, `不該有排不進輸出 channel 的 voice：${hp.unplacedVoiceIds}`);
+    assert(hp.unplacedStaffIds.length === 0, `不該有排不進輸出 channel 的 staff：${hp.unplacedStaffIds}`);
     assert(hp.isFinished(), '自動播放應該播完');
     assert(violations.length === 0, `嚴格合成器記到違規：\n    ${violations.slice(0, 6).join('\n    ')}`);
     assert(assist.totalNoteOns() === noteCountOf(score), `每顆解析出來的音恰好一個 noteOn：預期 ${noteCountOf(score)}，實際 ${assist.totalNoteOns()}`);
@@ -192,24 +197,24 @@ for (const [label, score] of [['canon 樣本', canonScore], ['MuseScore 形狀�
   });
 }
 
-run('MuseScore 形狀的手工譜：part／voice 結構與輸出 channel 配置（鋼琴 2 voice、弓弦 2 voice、打擊在槽 9）', () => {
+run('MuseScore 形狀的手工譜：part／staff 結構與輸出 channel 配置（鋼琴 2 staff、弓弦 2 staff、打擊在槽 9）', () => {
   const score = museScoreShapedScore();
   assert(score.parts.map((p) => p.name).join() === '大鋼琴,小提琴,標準鼓組', `part 應為「大鋼琴、小提琴、標準鼓組」，實際 ${score.parts.map((p) => p.name)}`);
-  assert(score.parts.map((p) => p.voices.length).join() === '2,2,1', `voice 數應為 2、2、1，實際 ${score.parts.map((p) => p.voices.length)}`);
+  assert(score.parts.map((p) => p.staves.length).join() === '2,2,1', `staff 數應為 2、2、1，實際 ${score.parts.map((p) => p.staves.length)}`);
   const { hp } = setup(score, []);
-  const drum = [...hp._voices.values()].find((v) => v.percussionKit);
-  assert(drum && drum.channel === 9, `打擊 voice 的輸出 channel 應為 9（它在檔案裡是 port 1 的絕對 channel 25，但輸出槽另外分配），實際 ${drum?.channel}`);
-  const melodic = [...hp._voices.values()].filter((v) => !v.percussionKit).map((v) => v.channel);
-  assert(melodic.length === 4 && new Set(melodic).size === 4 && melodic.every((c) => c % 16 !== 9), `4 個旋律 voice 各一個非打擊槽的 channel，實際 ${melodic}`);
-  const piano = [...hp._voices.values()].find((v) => v.baseVolume === 90);
-  assert(piano, '鋼琴 voice 的原音量應取自初始化區塊的 CC7（90）');
+  const drum = [...hp._staves.values()].find((v) => v.percussionKit);
+  assert(drum && drum.channel === 9, `打擊 staff 的輸出 channel 應為 9（它在檔案裡是 port 1 的絕對 channel 25，但輸出槽另外分配），實際 ${drum?.channel}`);
+  const melodic = [...hp._staves.values()].filter((v) => !v.percussionKit).map((v) => v.channel);
+  assert(melodic.length === 4 && new Set(melodic).size === 4 && melodic.every((c) => c % 16 !== 9), `4 個旋律 staff 各一個非打擊槽的 channel，實際 ${melodic}`);
+  const piano = [...hp._staves.values()].find((v) => v.baseVolume === 90);
+  assert(piano, '鋼琴 staff 的原音量應取自初始化區塊的 CC7（90）');
 });
 
 /* ═══════════════════════════════════════════
-   5：指派播放（腳本化手勢）
+   5：指派播放（腳本化觸發）
    ═══════════════════════════════════════════ */
 
-run('MuseScore 形狀的手工譜：兩位演奏者（鋼琴、弓弦）每拍準時揮手，跑到播完：沒有卡音、沒有未揮過手就發聲的指派聲部', () => {
+run('MuseScore 形狀的手工譜：兩位演奏者（鋼琴、弓弦）輪流在每個 segment 準時觸發，跑到播完：沒有卡音、指派聲部只在 trigger() 裡發聲', () => {
   const score = museScoreShapedScore();
   const piano = score.parts.find((p) => p.name === '大鋼琴').id, violin = score.parts.find((p) => p.name === '小提琴').id;
   const { hp, assist, human, violations } = assignedPlay(score, [[piano, 1], [violin, 2]]);
@@ -217,11 +222,11 @@ run('MuseScore 形狀的手工譜：兩位演奏者（鋼琴、弓弦）每拍�
   assert(violations.length === 0, `嚴格合成器記到違規：\n    ${violations.slice(0, 6).join('\n    ')}`);
   assert(assist.hanging().length === 0 && human.hanging().length === 0, `曲末不該有未釋放的音：${[...assist.hanging(), ...human.hanging()].slice(0, 5)}`);
   const total = assist.totalNoteOns() + human.totalNoteOns();
-  assert(total === noteCountOf(score), `每顆音恰好發聲一次（鋼琴 2 個 voice 都要出聲）：預期 ${noteCountOf(score)}，實際 ${total}`);
-  assert(human.totalNoteOns() === score.parts.filter((p) => p.id === piano || p.id === violin).reduce((a, p) => a + p.noteCount, 0), '指派聲部（鋼琴 2 個 voice＋弓弦 2 個 voice）的音都走真人軌');
+  assert(total === noteCountOf(score), `每顆音恰好發聲一次（鋼琴 2 個 staff 都要出聲）：預期 ${noteCountOf(score)}，實際 ${total}`);
+  assert(human.totalNoteOns() === score.parts.filter((p) => p.id === piano || p.id === violin).reduce((a, p) => a + p.noteCount, 0), '指派聲部（鋼琴 2 個 staff＋弓弦 2 個 staff）的音都走真人軌');
 });
 
-run('canon 樣本：兩位演奏者每拍準時揮手，跑到播完：沒有卡音、沒有違規', () => {
+run('canon 樣本：兩位演奏者輪流在每個 segment 準時觸發，跑到播完：沒有卡音、沒有違規', () => {
   const [violin, cello] = [canonScore.parts.find((p) => p.name === '小提琴'), canonScore.parts.find((p) => p.name === '大提琴')];
   const { hp, assist, human, violations } = assignedPlay(canonScore, [[violin.id, 1], [cello.id, 2]]);
   assert(hp.isFinished(), '指派播放應該播完');

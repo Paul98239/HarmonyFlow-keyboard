@@ -14,8 +14,8 @@
 //
 //  MediaPipe 姿勢偵測需要畫面裡真的有人形才會產生 landmark，合成測試圖案偵測不到任何姿勢——
 //  沒有 --video 參數時，這支腳本能驗證「選人數／載入樂譜／指派聲部／按播放」整條流程沒有拋出
-//  非預期的錯誤，但測不到代打／手勢觸發的實際行為。要測那些，需要一段真人比出拋物線手勢＋
-//  一段停頓的 .y4m 影片，用 --video <path> 帶進來。
+//  非預期的錯誤，但測不到姿勢偵測的實際行為（觸發來源目前是鍵盤，手勢也沒有接進播放器）。要測姿勢偵測，
+//  需要一段真人比出拋物線手勢的 .y4m 影片，用 --video <path> 帶進來。
 //
 //  用法：node test/browser/smoke-test.mjs [--video <path-to.y4m>] [--duration <ms，預設 8000>]
 // ============================================================
@@ -122,22 +122,25 @@ async function expectTransport(page, name, problems) {
   if (!ok) problems.push(`按鈕狀態「${name}」不符：預期 ${JSON.stringify(TRANSPORT_STATES[name])}，實際 ${JSON.stringify(got)}`);
 }
 // 動態 import 同一個 module 實例（同 URL），直接讀寫 store／排程器。「載入中」「播完」很難在 8 秒內自然
-// 走到，直接改 store 驗證畫面照狀態表；播放位置則讀排程器的真實值。
+// 走到，直接改 store 驗證畫面照狀態表；播放位置則讀排程器的真實值（tick 播放頭，用 score 的速度表換算成原譜秒數）。
 const setStore = (page, patch) => page.evaluate(async (p) => {
   (await import('/src/midi/midiPlayer.js')).playerStore.set(p);
 }, patch).then(() => page.waitForTimeout(80));
-const positionSeconds = (page) => page.evaluate(async () =>
-  (await import('/src/midi/synth.js')).scheduler.getPositionSeconds());
-// 輪詢到進度超過 seconds 才回傳（逾時就回傳目前的值，讓後面的斷言報出實際數字）。排程 tick 被主執行緒卡住時，
-// 樂譜時鐘每個 tick 最多只前進 100ms（見 scheduler.js 的 MAX_TICK_DT_SEC），headless Chromium 跑 MediaPipe 時
-// 進度會比真實時間慢，所以不能用固定睡眠估計進度。
+const positionSeconds = (page) => page.evaluate(async () => {
+  const { scheduler } = await import('/src/midi/synth.js');
+  return scheduler._score ? scheduler._score.midiTicksToSeconds(scheduler.getPositionTicks()) : 0;
+});
+// 演奏有指派聲部時，播放頭只在觸發時往前（每放行一個 segment 就跳到它的 tick）：這裡按觸發鍵（演奏者 1，真實的鍵盤路徑）一下一下
+// 把進度推到超過 seconds 才回傳（逾時或按了 400 下就回傳目前的值，讓後面的斷言報出實際數字）。
 async function waitForPositionAbove(page, seconds, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  await page.evaluate(() => document.activeElement?.blur()); // 焦點在按鈕上時字元鍵一樣觸發，但先清掉焦點比較單純
+  for (let i = 0; i < 400; i++) {
     const pos = await positionSeconds(page);
     if (pos > seconds || Date.now() > deadline) return pos;
-    await page.waitForTimeout(250);
+    await page.keyboard.press('KeyF');
   }
+  return positionSeconds(page);
 }
 // 在頁面內同一個 JS task 裡按下按鈕並立刻讀排程器位置：click 事件與排程器的重設都是同步做的，讀到的
 // 就是「剛重設」的值，不受 Playwright 往返延遲影響（無頭瀏覽器同時跑 MediaPipe 時，往返動輒一秒，
@@ -145,7 +148,7 @@ async function waitForPositionAbove(page, seconds, timeoutMs = 30000) {
 const clickAndReadPosition = (page, buttonId) => page.evaluate(async (id) => {
   const { scheduler } = await import('/src/midi/synth.js');
   document.getElementById(id).click();
-  return scheduler.getPositionSeconds();
+  return scheduler._score ? scheduler._score.midiTicksToSeconds(scheduler.getPositionTicks()) : 0;
 }, buttonId);
 
 // ── 試聽（官方 Sequencer）相關的小工具 ──
@@ -230,8 +233,8 @@ function makeMuseScoreShapedMidi() {
 const MUSESCORE_MIDI = { name: 'musescore-shaped.mid', mimeType: 'audio/midi', buffer: makeMuseScoreShapedMidi() };
 
 // worklet 回讀：真的把檔案載入、整首自動播放，同時監聽 worklet 回報的事件（合成器處理過的 programChange／controllerChange／
-// noteOn，不是我們自己記的值），逐個 voice 檢查：它的輸出 channel 在第一個 noteOn 之前，worklet 真的收到了該 voice 的
-// program 與 CC7／10／91／93（值等於 parser 解出來、排程器送出去的），打擊 voice 真的在打擊 channel 出聲，而且各 channel 的
+// noteOn，不是我們自己記的值），逐個 staff 檢查：它的輸出 channel 在第一個 noteOn 之前，worklet 真的收到了該 staff 的
+// program 與 CC7／10／91／93（值等於 parser 解出來、排程器送出去的），打擊 staff 真的在打擊 channel 出聲，而且各 channel 的
 // 打擊配置在載入前後都是 GM 的樣子。冒煙測試看不到 worklet 內部，光「沒有報錯」不算通過。
 async function checkWorkletReadback(page, problems) {
   console.log('▶ worklet 回讀：載入 MuseScore 形狀的譜、整首自動播放，檢查 worklet 收到的初始狀態…');
@@ -246,19 +249,20 @@ async function checkWorkletReadback(page, problems) {
     }
   });
   await page.click('#btnPlay');
-  await page.waitForFunction(() => window.__hf.synth.scheduler.isFinished(), null, { timeout: 30000 });
+  // headless 同時跑姿勢推論，排程 tick 常被主執行緒卡住（每個 tick 最多前進 100ms），進度只有真實時間的三成左右：等待上限要寬。
+  await page.waitForFunction(() => window.__hf.synth.scheduler.isFinished(), null, { timeout: 90000 });
   await page.waitForTimeout(600); // worklet 的事件回報是非同步的，等最後幾個到齊
   const got = await page.evaluate(async () => {
     const { scheduler } = await import('/src/midi/synth.js');
-    const voices = [...scheduler._voices.values()].map((v) => ({
+    const staves = [...scheduler._staves.values()].map((v) => ({
       id: v.id, kind: v.kind, channel: v.channel, program: v.program, percussionKit: v.percussionKit,
       baseVolume: v.baseVolume, init: v.init, noteCount: v.notes.length,
     }));
     const drums = (syn) => Array.from({ length: 64 }, (_, i) => (syn.midiChannels[i]?.patch?.isDrum ? i : -1)).filter((i) => i >= 0);
-    return { voices, echo: window.__echo, drums: drums(scheduler.assistSynth) };
+    return { staves, echo: window.__echo, drums: drums(scheduler.assistSynth) };
   });
-  check(got.voices.length === 5, '載入後有 5 個 voice（鋼琴 2、弓弦 2、打擊 1）', problems, JSON.stringify(got.voices.map((v) => v.id)));
-  for (const v of got.voices) {
+  check(got.staves.length === 5, '載入後有 5 個 staff（鋼琴 2、弓弦 2、打擊 1）', problems, JSON.stringify(got.staves.map((v) => v.id)));
+  for (const v of got.staves) {
     const mine = got.echo.filter((e) => e.label === 'assist' && e.ch === v.channel);
     const firstOn = mine.findIndex((e) => e.t === 'on');
     const before = firstOn < 0 ? [] : mine.slice(0, firstOn);
@@ -271,8 +275,8 @@ async function checkWorkletReadback(page, problems) {
     const ons = mine.filter((e) => e.t === 'on').length;
     check(ons === v.noteCount, `${v.id} 的 noteOn 在 worklet 端都發聲了（${v.noteCount} 顆）`, problems, `實際 ${ons}`);
   }
-  const drumVoice = got.voices.find((v) => v.percussionKit);
-  check(drumVoice?.channel === 9 && JSON.stringify(got.drums) === '[9,25,41,57]', '打擊 voice 在 channel 9，且載入後 worklet 的打擊配置仍是 GM（9／25／41／57）', problems, JSON.stringify({ channel: drumVoice?.channel, drums: got.drums }));
+  const drumStaff = got.staves.find((v) => v.percussionKit);
+  check(drumStaff?.channel === 9 && JSON.stringify(got.drums) === '[9,25,41,57]', '打擊 staff 在 channel 9，且載入後 worklet 的打擊配置仍是 GM（9／25／41／57）', problems, JSON.stringify({ channel: drumStaff?.channel, drums: got.drums }));
 }
 
 // 試聽基本操作（選好範例、演奏還沒播過的 ready 狀態開始）：♪ 進入試聽 → 時間真的往前走 → ❚❚ 暫停
@@ -350,25 +354,25 @@ async function checkChannelLayout(page, problems) {
   }
 }
 
-// 歌曲需要的 port 比開機補的多（62 個旋律 voice 要 5 個 port）：載入時 synth.js 依需要補 channel 並重設，worklet 的打擊配置
-// 要變成 5 個 port 的 channel 9（9／25／41／57／73），其餘（含新補的 64～79）是旋律；62 個 voice 全部分得到輸出 channel。
+// 歌曲需要的 port 比開機補的多（62 個旋律 staff 要 5 個 port）：載入時 synth.js 依需要補 channel 並重設，worklet 的打擊配置
+// 要變成 5 個 port 的 channel 9（9／25／41／57／73），其餘（含新補的 64～79）是旋律；62 個 staff 全部分得到輸出 channel。
 async function checkChannelGrowth(page, problems) {
-  console.log('▶ 歌曲需要更多 port：載入 62 個旋律 voice 的樂譜，檢查 channel 依需要補、打擊配置…');
+  console.log('▶ 歌曲需要更多 port：載入 62 個旋律 staff 的樂譜，檢查 channel 依需要補、打擊配置…');
   const got = await page.evaluate(async () => {
     const { scheduler, load } = await import('/src/midi/synth.js');
     const parts = Array.from({ length: 62 }, (_, i) => ({ id: `p${i}`, trackIndex: i, channel: i % 16, program: 0, bank: { msb: 121, lsb: 0 }, percussionKit: false, init: null, noteCount: 1,
-      voices: [{ id: `v${i}`, program: 0, bank: { msb: 121, lsb: 0 }, percussionKit: false, init: null, noteCount: 1 }] }));
-    const notes = parts.map((p, i) => ({ partId: p.id, voiceId: `v${i}`, trackIndex: i, channel: i % 16, note: 60, velocity: 90, startTick: 0, endTick: 480, startSeconds: 0, endSeconds: 0.5, durationSeconds: 0.5 }));
-    const score = { parts, notes, ticksPerQuarter: 480, durationTicks: 1920, durationSeconds: 2, tickToSeconds: (t) => t / 960,
-      timeSignatures: [{ tick: 0, numerator: 4, denominator: 4, clocksPerClick: 24, thirtySecondNotesPer24Clocks: 8 }] };
+      staves: [{ id: `v${i}`, program: 0, bank: { msb: 121, lsb: 0 }, percussionKit: false, init: null, noteCount: 1 }] }));
+    const notes = parts.map((p, i) => ({ partId: p.id, staffId: `v${i}`, trackIndex: i, channel: i % 16, midiNote: 60, velocity: 90, startTick: 0, endTick: 480, startSeconds: 0, endSeconds: 0.5, durationSeconds: 0.5 }));
+    const score = { parts, notes, segments: [{ ticks: 0, notes }], timeDivision: 480, durationTicks: 1920, durationSeconds: 2, midiTicksToSeconds: (t) => t / 960, secondsToMIDITicks: (sec) => sec * 960,
+      timeSignatures: [{ ticks: 0, numerator: 4, denominator: 4, clocksPerClick: 24, thirtySecondNotesPer24Clocks: 8 }] };
     await load(score, []);
     await new Promise((r) => setTimeout(r, 800)); // worklet 的狀態回報是非同步的
     const drumsOf = (syn) => Array.from({ length: 80 }, (_, i) => (syn.midiChannels[i]?.patch?.isDrum ? i : -1)).filter((i) => i >= 0);
-    const channels = [...scheduler._voices.values()].map((v) => v.channel);
-    return { assist: drumsOf(scheduler.assistSynth), human: drumsOf(scheduler.humanSynth), voices: channels.length, maxChannel: Math.max(...channels), unplaced: scheduler.unplacedVoiceIds.length };
+    const channels = [...scheduler._staves.values()].map((v) => v.channel);
+    return { assist: drumsOf(scheduler.assistSynth), human: drumsOf(scheduler.humanSynth), staves: channels.length, maxChannel: Math.max(...channels), unplaced: scheduler.unplacedStaffIds.length };
   });
-  check(got.voices === 62 && got.unplaced === 0, '62 個旋律 voice 全部分得到輸出 channel（不再有 60 個的上限）', problems, JSON.stringify(got));
-  check(got.maxChannel >= 64 && got.maxChannel < 80, '有 voice 落在新補的 channel 64～79', problems, `最大 channel ${got.maxChannel}`);
+  check(got.staves === 62 && got.unplaced === 0, '62 個旋律 staff 全部分得到輸出 channel（不再有 60 個的上限）', problems, JSON.stringify(got));
+  check(got.maxChannel >= 64 && got.maxChannel < 80, '有 staff 落在新補的 channel 64～79', problems, `最大 channel ${got.maxChannel}`);
   for (const label of ['assist', 'human']) {
     check(JSON.stringify(got[label]) === '[9,25,41,57,73]', `補 channel 之後 ${label} 合成器只有每個 port 的 channel 9 是打擊（9／25／41／57／73）`, problems, `實際打擊 channel：${got[label]}`);
   }
@@ -406,7 +410,7 @@ async function driveAppToPlaying(page, problems) {
   await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
   await expectTransport(page, 'playing', problems);
 
-  const before = await waitForPositionAbove(page, 1); // 電腦輔助的聲部播前奏，進度會往前走
+  const before = await waitForPositionAbove(page, 1); // 按觸發鍵把播放頭推進到 1 秒以上
 
   console.log('▶ 暫停、再按重播…');
   await page.click('#btnPause');
@@ -431,59 +435,49 @@ async function driveAppToPlaying(page, problems) {
   if (!finOk) problems.push(`播完後按 ▶ 沒有從頭播：${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s`);
 }
 
-// 鍵盤觸發（接在 driveAppToPlaying 後面，此時演奏播放中、第一個聲部指派給演奏者 1）：觀察點是排程器的指派聲部
-// （lastSeq＝它看到的觸發累加計數、triggered＝演奏者是否被真實觸發過），在 12ms 的排程 tick 才更新，所以
-// 「沒有變」的斷言前要先等幾個 tick。
+// 鍵盤觸發（接在 driveAppToPlaying 後面，此時演奏播放中、第一個聲部指派給演奏者 1）：觀察點是排程器的 segment 游標
+// （segIndex＝已放行的 segment 數、started＝重設後被觸發過）。trigger() 在 keydown 事件裡同步執行，按鍵送出之後游標立刻就變了，
+// 不用等排程 tick——所以讀取前不需要任何等待。
 async function driveKeyboardTrigger(page, problems) {
-  console.log('▶ 鍵盤觸發：四排字元鍵＝演奏者 1 的一次觸發，防呆（repeat／組合鍵／打字／下拉 type-ahead）…');
-  const human = () => page.evaluate(() => {
-    const v = [...window.__hf.synth.scheduler._voices.values()].find((x) => x.kind === 'human');
-    return { seq: v.lastSeq, triggered: v.triggered };
+  console.log('▶ 鍵盤觸發：四排字元鍵＝演奏者 1 放行全曲的下一個 segment，防呆（repeat／組合鍵／打字／下拉 type-ahead）…');
+  const slot = () => page.evaluate(() => {
+    const sch = window.__hf.synth.scheduler;
+    const sounding = [...sch._staves.values()].some((v) => v.sounding.size > 0);
+    return { seg: sch._segIndex, started: sch._started, sounding };
   });
-  // 等排程器至少再跑過一個 tick（lastSeq 在 tick 才更新）：固定睡眠不夠，MediaPipe 佔住主執行緒時 tick 會被拖延好幾百毫秒
-  const settle = async () => {
-    const t0 = await page.evaluate(() => window.__hf.synth.scheduler._lastTickMs);
-    await page.waitForFunction((t) => window.__hf.synth.scheduler._lastTickMs > t, t0, { timeout: 5000 });
-  };
-  await page.waitForFunction(() => [...window.__hf.synth.scheduler._voices.values()].some((v) => v.kind === 'human' && v.lastSeq !== null), null, { timeout: 5000 });
   await page.evaluate(() => document.activeElement?.blur());
 
-  let s = await human();
-  check(s.seq === 0 && !s.triggered, '按鍵之前：指派聲部還沒被觸發', problems, JSON.stringify(s));
+  let s = await slot();
+  check(s.seg === 0 && !s.started, '按鍵之前：還沒有任何 segment 被放行', problems, JSON.stringify(s));
   await page.keyboard.press('KeyF');
-  await page.waitForFunction((n) => [...window.__hf.synth.scheduler._voices.values()].some((v) => v.kind === 'human' && v.lastSeq === n && v.triggered), s.seq + 1, { timeout: 3000 }).catch(() => {});
-  let t = await human();
-  check(t.seq === s.seq + 1 && t.triggered, '按一下 F：指派聲部的觸發計數 +1、triggered', problems, JSON.stringify(t));
+  let t = await slot();
+  check(t.seg === 1 && t.started && t.sounding, '按一下 F：放行第一個 segment、音當下就在響', problems, JSON.stringify(t));
 
   s = t;
   await page.keyboard.down('KeyG');
   await page.keyboard.down('KeyG'); // 第二次 down 沒有 up＝瀏覽器的自動重複（event.repeat）
   await page.keyboard.up('KeyG');
-  await settle();
-  t = await human();
-  check(t.seq === s.seq + 1, '按住不放的自動重複只算一次', problems, `${s.seq} → ${t.seq}`);
+  t = await slot();
+  check(t.seg === s.seg + 1, '按住不放的自動重複只算一次', problems, `${s.seg} → ${t.seg}`);
 
   s = t;
   await page.keyboard.press('Control+KeyJ');
   await page.keyboard.press('Alt+KeyJ');
-  await settle();
-  t = await human();
-  check(t.seq === s.seq, 'Ctrl／Alt 組合鍵不觸發', problems, `${s.seq} → ${t.seq}`);
+  t = await slot();
+  check(t.seg === s.seg, 'Ctrl／Alt 組合鍵不觸發', problems, `${s.seg} → ${t.seg}`);
 
   s = t;
   await page.keyboard.press('Space');
   await page.keyboard.press('F5').catch(() => {});
-  await settle();
-  t = await human();
-  check(t.seq === s.seq, '不在四排裡的鍵（Space、F5）不觸發', problems, `${s.seq} → ${t.seq}`);
+  t = await slot();
+  check(t.seg === s.seg, '不在四排裡的鍵（Space、F5）不觸發', problems, `${s.seg} → ${t.seg}`);
 
   s = t;
   await page.click('#midiSongQuery');
   await page.keyboard.type('abc');
-  await settle();
-  t = await human();
+  t = await slot();
   const typed = await page.inputValue('#midiSongQuery');
-  check(t.seq === s.seq && typed === 'abc', '焦點在搜尋欄：打字不觸發、字照常打進欄位', problems, `${s.seq} → ${t.seq}，欄位內容「${typed}」`);
+  check(t.seg === s.seg && typed === 'abc', '焦點在搜尋欄：打字不觸發、字照常打進欄位', problems, `${s.seg} → ${t.seg}，欄位內容「${typed}」`);
   await page.fill('#midiSongQuery', '');
   await page.evaluate(() => document.activeElement?.blur());
 
@@ -498,14 +492,29 @@ async function driveKeyboardTrigger(page, problems) {
     return sel.selectedIndex;
   });
   await page.keyboard.press('KeyB');
-  await settle();
-  t = await human();
+  t = await slot();
   const idx = await page.evaluate(() => { const el = document.getElementById('kbTestSelect'); const i = el.selectedIndex; el.remove(); return i; });
-  check(selectedAfter === 0 && idx === 0 && t.seq === s.seq + 1, '焦點在下拉：type-ahead 被擋掉（選項不跳）、仍算一次觸發', problems, `選項 ${selectedAfter} → ${idx}，計數 ${s.seq} → ${t.seq}`);
+  check(selectedAfter === 0 && idx === 0 && t.seg === s.seg + 1, '焦點在下拉：type-ahead 被擋掉（選項不跳）、仍放行一個 segment', problems, `選項 ${selectedAfter} → ${idx}，游標 ${s.seg} → ${t.seg}`);
+
+  // 暫停中按鍵不放行（排程器沒在播放）。
+  s = t;
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+  await page.keyboard.press('KeyH');
+  t = await slot();
+  check(t.seg === s.seg, '暫停中按鍵不放行', problems, `${s.seg} → ${t.seg}`);
+  await page.click('#btnPlay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+  await page.evaluate(() => document.activeElement?.blur());
+  s = t;
+  await page.keyboard.press('KeyH');
+  t = await slot();
+  check(t.seg === s.seg + 1, '恢復播放後按鍵照常放行', problems, `${s.seg} → ${t.seg}`);
 }
 
 // 試聽 vs 演奏（接在 driveAppToPlaying 後面，此時演奏正在播放）：播放中 ♪ 是灰的、暫停後按 ♪ 會
-// 結束演奏進度；試聽中的手勢觸發被忽略、改指派不影響試聽；離開試聽後 ▶ 重新載入、演奏從頭開始。
+// 結束演奏進度；試聽中的觸發鍵被忽略、改指派不影響試聽；離開試聽後 ▶ 重新載入、演奏從頭開始。
 async function drivePreviewVsPerformance(page, problems) {
   console.log('▶ 試聽 vs 演奏：演奏播放中 ♪ 是灰的，暫停後按 ♪ 結束演奏進度…');
   check(await page.evaluate(() => document.getElementById('btnPreview').disabled), '演奏播放中 ♪ 是灰的（要先暫停）', problems);
@@ -518,18 +527,17 @@ async function drivePreviewVsPerformance(page, problems) {
   const posAfter = await positionSeconds(page);
   check(perfPos > 0.3 && posAfter === 0, '進入試聽＝演奏進度歸零（排程器已停）', problems, `${perfPos.toFixed(2)}s → ${posAfter.toFixed(2)}s`);
 
-  console.log('▶ 試聽中有手勢觸發、改指派…');
-  // 此時演奏者 1 還指派著第一個聲部：若手勢沒被忽略，排程器會被啟動
-  await page.evaluate(async () => {
-    (await import('/src/midi/midiPlayer.js')).setGesturePerformanceState({ arcTriggerSeqBySlot: { 1: 7 }, presentSlots: [1] });
-  });
+  console.log('▶ 試聽中按觸發鍵、改指派…');
+  // 此時演奏者 1 還指派著第一個聲部：若按鍵沒被忽略，排程器會放行音（試聽中排程器已停，不該有任何反應）
+  await page.keyboard.press('KeyF');
   const tA = await previewTime(page);
   await page.waitForTimeout(500);
   const perf = await page.evaluate(async () => {
     const { scheduler } = await import('/src/midi/synth.js');
-    return { playing: scheduler.isPlaying(), pos: scheduler.getPositionSeconds() };
+    return { playing: scheduler.isPlaying(), pos: scheduler.getPositionTicks() };
   });
-  check(!perf.playing && perf.pos === 0, '試聽中的手勢觸發被忽略（排程器沒有被啟動）', problems, JSON.stringify(perf));
+  const slotCursor = await page.evaluate(() => window.__hf.synth.scheduler._segIndex);
+  check(!perf.playing && perf.pos === 0 && slotCursor === 0, '試聽中的觸發鍵被忽略（排程器沒有被啟動、沒放行任何 segment）', problems, JSON.stringify({ ...perf, slotCursor }));
   await page.locator('.score-part-id').first().selectOption('');
   await page.waitForTimeout(300);
   const tB = await previewTime(page);

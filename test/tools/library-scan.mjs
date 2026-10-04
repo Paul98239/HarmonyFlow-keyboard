@@ -2,14 +2,16 @@
 //  library-scan.mjs — 曲庫全掃：用整個遠端 MIDI 曲庫驗證排程器（手動執行，不進 CI，純 Node）
 //
 //  四種掃描（--only=parse,autoplay,perform,scenarios，預設全跑）：
-//    parse      每首歌解析與聲部切分：沒有例外、至少 1 個 part、每個 voice 都分得到輸出 channel、警告分類統計、
-//               多聲部（可指派）的歌有幾首；〈蝸牛與黃鸝鳥〉必須切成「長笛、大鋼琴」（使用者用原始 MuseScore 檔確認過的金標準）。
+//    parse      每首歌解析與聲部切分：沒有例外、至少 1 個 part、每個 staff 都分得到輸出 channel、警告分類統計、
+//               多聲部（可指派）的歌有幾首；〈蝸牛與黃鸝鳥〉必須切成「長笛、大鋼琴」（使用者用原始 MuseScore 檔確認過的金標準）；
+//               另外印出按鍵負擔：一次觸發放行一個 segment，每首歌要按幾下、原速下每秒要按幾下。
 //    autoplay   每首歌整首自動播放（沒有人被指派）：每顆音都發聲、每個 noteOn 一個 noteOff（「成對」以音為單位，
 //               原檔用 Note Off 還是 velocity 0 的 Note On 結束都一樣）、起訖時間誤差 ≤ 一個排程 tick（12ms）。
-//    perform    多聲部歌曲 × 3 種揮手風格（準時／慢 25％＋抖動 15％／快 20％＋抖動 20％），指派音符最多的聲部：
-//               放行了的音都要發聲、不卡音、同刻音在同一個 tick 發聲；另外量揮手→發聲的延遲與追趕造成的壓縮。
-//    scenarios  情境掃描：前奏提早揮手、一人兩聲部、多人（2～4 位）、晚進場、中途停手（不再回來／回來）、休止期間不揮、
-//               停手 0.6／2／8 秒——每個情境都用同一組不變量判定通過與否。
+//    perform    多聲部歌曲 × 5 種逐 segment 觸發風格（準時／快 20％／快 3 倍＋抖動／慢 25％＋抖動／慢 2 倍＋抖動），指派音符最多的
+//               聲部：每個 segment 都放行、每顆音（你的與電腦輔助的）在放行它的那一次觸發當下發聲（0ms）、不卡音、
+//               同一個 tick 的音同刻（差 0ms）——任何按鍵速度都成立，沒有放寬的選項。
+//    scenarios  情境掃描：一人兩聲部、多人（2～4 位輪流按）、連按（比樂譜快很多）、中途停手（不再回來／回來）、第一下提早按——
+//               每個情境都用同一組不變量判定通過與否。
 //
 //  曲庫：預設放在 test/tools/library/（不進 git）。第一次先 `--download` 從遠端曲庫抓下來（單連線＋間隔，已有的
 //  檔案會略過）；也可以用 --dir 指到別的資料夾。--limit=N 只掃前 N 首。
@@ -21,18 +23,15 @@
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { parseMidi, buildBeatGrid } from '../../src/midi/midiParser.js';
+import { parseMidi } from '../../src/midi/midiParser.js';
 import { Scheduler } from '../../src/midi/scheduler.js';
-import { autoPlayStats, makeRng, measure, nominalWaves, rankedParts, simulate, startBeatOf } from './sim.mjs';
+import { autoPlayStats, makeRng, measure, onsetPresses, pressLoad, rankedParts, segmentSecs, simulate } from './sim.mjs';
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'library'));
 const ONLY = new Set(String(args.only || 'parse,autoplay,perform,scenarios').split(','));
 const LIMIT = Number(args.limit) || Infinity;
 const TICK_TOL_MS = 12.5;                          // 一個排程 tick（12ms）加浮點容差
-const GATE_PREEMPT_PCT = 5;                        // 穩定揮手（抖動 ±15％）：電腦搶在揮手前放行的比例上限（％）
-const GATE_MISS_LAG_BEATS = 0.35;                  // 漏揮：補位比「該揮的時間」晚的拍數中位數上限（τ＋量化誤差）
-const PRELUDE_SKEW_TOL_MS = 60;                    // 前奏照原速：揮手間隔剛好等於拍長時估速收斂在 1，容許幾個 tick 的誤差；被追趕衝過去會差好幾秒
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ═══════════════════════════════════════════
@@ -90,18 +89,22 @@ function scanParse(songs, fileCount) {
   console.log(`沒有任何 part：${noPart.length} 首`);
   if (noPart.length) problems++;
   const unplaced = [];
-  const voiceCounts = songs.map((s) => {
+  const staffCounts = songs.map((s) => {
     const hp = new Scheduler();
     const stub = { controllerChange() {}, programChange() {}, noteOn() {}, noteOff() {} };
     hp.setSynths(stub, stub); // 有合成器才會用滿 64 個 channel（app 裡兩個合成器都補到 64 個）
     hp.load(s.score, []);
-    if (hp.unplacedVoiceIds.length) unplaced.push(s.title);
-    return s.score.parts.reduce((a, p) => a + p.voices.length, 0);
+    if (hp.unplacedStaffIds.length) unplaced.push(s.title);
+    return s.score.parts.reduce((a, p) => a + p.staves.length, 0);
   });
-  console.log(`放不下輸出 channel 的 voice：${unplaced.length} 首${unplaced.length ? '（' + unplaced.slice(0, 5).join('、') + '）' : ''}；voice 總數最多 ${Math.max(...voiceCounts)} 個`);
+  console.log(`放不下輸出 channel 的 staff：${unplaced.length} 首${unplaced.length ? '（' + unplaced.slice(0, 5).join('、') + '）' : ''}；staff 總數最多 ${Math.max(...staffCounts)} 個`);
   if (unplaced.length) problems++;
   const multi = songs.filter((s) => s.score.parts.length >= 2);
   console.log(`多聲部（≥2 個 part，可以指派演奏者）：${multi.length} 首／${songs.length} 首；單一 part：${songs.length - multi.length} 首`);
+  // 一次觸發放行一個 segment：按鍵數＝全曲 segment 數。原速（樂譜速度）下平均／最忙 1 秒要按幾下，決定這個模型實際好不好彈。
+  const loads = songs.map((x) => pressLoad(x.score)).filter((l) => l.segments > 0);
+  const med = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
+  console.log(`按鍵負擔（一次觸發放行一個 segment）：每首 segment 數 中位 ${med(loads.map((l) => l.segments))}、最多 ${Math.max(...loads.map((l) => l.segments))}；原速每秒平均要按 中位 ${med(loads.map((l) => l.perSecAvg)).toFixed(1)} 下、最大 ${Math.max(...loads.map((l) => l.perSecAvg)).toFixed(1)} 下；最忙的 1 秒內要按 中位 ${med(loads.map((l) => l.perSecPeak))} 下、最多 ${Math.max(...loads.map((l) => l.perSecPeak))} 下`);
   const warnKinds = new Map();
   for (const s of songs) for (const w of s.score.warnings) {
     const k = w.replace(/\d+(\.\d+)?/g, 'N').slice(0, 48);
@@ -112,8 +115,8 @@ function scanParse(songs, fileCount) {
   const snail = songs.find((s) => s.title.includes('蝸牛與黃鸝鳥'));
   if (snail) {
     const names = snail.score.parts.map((p) => p.name).join('、');
-    const ok = names === '長笛、大鋼琴' && snail.score.parts[1].voices.length === 2;
-    console.log(`${ok ? '✓' : '✗'} 金標準〈蝸牛與黃鸝鳥〉：${names}（鋼琴 ${snail.score.parts[1]?.voices.length} 個 voice）`);
+    const ok = names === '長笛、大鋼琴' && snail.score.parts[1].staves.length === 2;
+    console.log(`${ok ? '✓' : '✗'} 金標準〈蝸牛與黃鸝鳥〉：${names}（鋼琴 ${snail.score.parts[1]?.staves.length} 個 staff）`);
     if (!ok) problems++;
   } else console.log('（曲庫裡沒有〈蝸牛與黃鸝鳥〉，略過金標準檢查）');
   return problems;
@@ -140,36 +143,32 @@ function scanAutoplay(songs) {
 }
 
 /* ═══════════════════════════════════════════
-   掃描 2：多聲部歌曲 × 3 種揮手風格
+   掃描 2：多聲部歌曲 × 3 種逐音觸發風格
    ═══════════════════════════════════════════ */
 
-const STYLES = [['準時', 1, 0], ['慢 25％＋抖動 15％', 1.25, 0.15], ['快 20％＋抖動 20％', 0.8, 0.2]];
-const median = (a) => { const s = a.filter(Number.isFinite).sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
+const STYLES = [['準時', 1, 0], ['快 20％', 0.8, 0], ['快 3 倍＋抖動 30％', 0.3, 0.3], ['慢 25％＋抖動 15％', 1.25, 0.15], ['慢 2 倍＋抖動 20％', 2, 0.2]];
+
+// 每次模擬共用的不變量（任何按鍵速度與人數都成立，沒有放寬的選項）：該放行的都發聲、每個 noteOn 一個 noteOff、每顆音都在放行它的
+// 那一次觸發當下發聲、同一個 tick 的音同刻（差 0ms）；completePresses＝每個 segment 都有被按到，這時一個都不能沒被放行。
+const violations = (m, { completePresses = true } = {}) => m.releasedMissing || m.unpaired || m.strayOff || m.badVelocity
+  || m.offTrigger || m.syncMax > 0 || (completePresses && m.notReleased);
 
 function scanPerform(songs) {
   const multi = songs.filter((s) => s.score.parts.length >= 2 && rankedParts(s.score).length);
   const rows = [];
   for (const s of multi) {
-    const beats = buildBeatGrid(s.score), main = rankedParts(s.score)[0], b0 = startBeatOf(s.score, beats, [main.id]);
+    const main = rankedParts(s.score)[0], secs = segmentSecs(s.score);
     for (const [styleName, factor, jitter] of STYLES) {
-      const waves = nominalWaves(beats, b0, { factor, jitter, rnd: makeRng(21) });
-      const m = measure(simulate(s.score, [{ partIds: [main.id], waves }]), { factor, waves, b0 });
-      rows.push({ s, main, styleName, m });
+      const presses = onsetPresses(secs, { factor, jitter, rnd: makeRng(21) });
+      rows.push({ s, main, styleName, m: measure(simulate(s.score, [{ partIds: [main.id], presses }])) });
     }
   }
   const sum = (key) => rows.reduce((a, r) => a + r.m[key], 0), count = (f) => rows.filter((r) => f(r.m)).length;
-  console.log(`\n=== 多聲部歌曲 ${multi.length} 首 × ${STYLES.length} 種揮手風格 ＝ ${rows.length} 次模擬（各指派音符最多的聲部）===`);
-  console.log(`放行了卻沒發聲的音：${sum('releasedMissing')} 顆（${count((m) => m.releasedMissing)} 次模擬）；沒被放行的音（揮手不夠多）：${sum('unreleased')} 顆`);
+  console.log(`\n=== 多聲部歌曲 ${multi.length} 首 × ${STYLES.length} 種逐 segment 觸發風格 ＝ ${rows.length} 次模擬（各指派音符最多的聲部）===`);
+  console.log(`該放行卻沒發聲的音：${sum('releasedMissing')} 顆（${count((m) => m.releasedMissing)} 次模擬）；沒被放行的音（觸發不夠多）：${sum('notReleased')} 顆`);
   console.log(`每個 noteOn 一個 noteOff：沒收的音 ${sum('unpaired')} 個（${count((m) => m.unpaired)} 次）、多餘的 noteOff ${sum('strayOff')} 個、velocity 0 的 noteOn ${sum('badVelocity')} 個`);
-  console.log(`同刻音發聲差 > ${TICK_TOL_MS}ms：${count((m) => m.syncMax > TICK_TOL_MS)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）`);
-  console.log(`揮手→發聲 p50 中位數 ${median(rows.map((r) => r.m.lagP50))}ms、p99 中位數 ${median(rows.map((r) => r.m.lagP99))}ms（最差一次的 p99 ${Math.max(...rows.map((r) => r.m.lagP99 ?? 0))}ms）`);
-  console.log(`追趕造成的壓縮：相鄰音間隔被壓到不到一半 ${sum('compressed')}／${sum('adjacent')}，擠在同一個 tick ${sum('bursts')}；相連音接點多出 >30ms 空白 ${sum('legatoGaps')}／${sum('legato')}`);
-  console.log(`共用拍位比演奏者數的拍多走（代打搶在揮手前走拍）：${count((m) => m.ratchetWaves)} 次模擬（最多 ${Math.max(...rows.map((r) => r.m.ratchetMax))} 拍）`);
-  for (const style of STYLES.map((x) => x[0])) {
-    const sub = rows.filter((r) => r.styleName === style);
-    console.log(`  ${style}：揮手→發聲 p50 中位 ${median(sub.map((r) => r.m.lagP50))}ms、p99 中位 ${median(sub.map((r) => r.m.lagP99))}ms、被壓縮 ${sub.reduce((a, r) => a + r.m.compressed, 0)}／${sub.reduce((a, r) => a + r.m.adjacent, 0)}`);
-  }
-  const bad = rows.filter((r) => r.m.releasedMissing || r.m.unpaired || r.m.strayOff || r.m.badVelocity || r.m.syncMax > TICK_TOL_MS);
+  console.log(`不在放行它的那一次觸發當下發聲的音：${sum('offTrigger')} 顆；同刻音發聲差 > 0ms：${count((m) => m.syncMax > 0)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）`);
+  const bad = rows.filter((r) => violations(r.m));
   for (const r of bad.slice(0, 8)) console.log('  ✗', r.s.title, r.main.name, r.styleName, JSON.stringify(r.m));
   return bad.length;
 }
@@ -178,107 +177,52 @@ function scanPerform(songs) {
    掃描 3：情境
    ═══════════════════════════════════════════ */
 
-// 每個情境：players（每位演奏者的聲部與揮手時間表）＋ exempt（哪些音不要求一定發聲）。第一位演奏者永遠揮到曲末
-// （錨點），所以整首的每一拍都會被放行；其他人揮手的樣子由情境決定。
+// 每個情境：players（每位演奏者的聲部與觸發時間表）。沒有按完整首的情境（停手）notReleased 不算違規（complete: false）。
 function buildScenarios(score, rnd) {
-  const beats = buildBeatGrid(score), [A, B, C, D] = rankedParts(score).map((p) => p.id);
-  const b0Of = (ids) => startBeatOf(score, beats, ids);
-  const waves = (b0, o = {}) => nominalWaves(beats, b0, { rnd, ...o });
+  const [A, B, C, D] = rankedParts(score).map((p) => p.id);
+  const secs = segmentSecs(score);
   const out = [];
-  // syncTolMs：同刻音發聲差的容許值。演奏者之間錯開的情境，晚幾十 ms 才揮第一下的人，他拍首的音是補上的（見
-  // scheduler.js 的合併窗），所以容許值要加上最大的錯開量。
-  // track：單人每拍揮一次、沒有漏揮的情境，另外量揮手→發聲的延遲與共用拍位有沒有比演奏者多走。
-  const add = (name, ids, players, { exempt, syncTolMs = TICK_TOL_MS, track = false, preludeSec = null, gate = null } = {}) => out.push({ name, players, exempt, syncTolMs, track, preludeSec, gate });
-  const solo = (name, o, track = false, gate = null) => add(name, [A], [{ partIds: [A], waves: waves(b0Of([A]), o) }], { track, gate });
+  const add = (name, players, o = {}) => out.push({ name, players, ...o });
+  const solo = (name, o, extra = {}) => add(name, [{ partIds: [A], presses: onsetPresses(secs, { rnd, ...o }) }], extra);
+  // 同一張時間表輪流交給多位演奏者按（第 i 下由第 i % n 位按）：任何有指派聲部的演奏者按一下都推進全曲。
+  const roundRobin = (ids, o) => { const all = onsetPresses(secs, { rnd, ...o }); return ids.map((id, k) => ({ partIds: [id], presses: all.filter((_, i) => i % ids.length === k) })); };
 
-  if (beats[b0Of([A])].startSeconds >= 2) solo('前奏提早揮手（第一下揮手落在前奏 30％處）', { leadMs: -beats[b0Of([A])].startSeconds * 700 });
-  // 聲部開頭有空白（至少 4 拍，而且空白期間別的聲部有音）：演奏者從第 0 拍就照原速打拍子。前奏中的揮手只估速、不放行拍，
-  // 前奏的音要照原速發聲。指派的是第一個符合條件的聲部（不一定是音符最多的那個，那個常常是從頭就有音）。
-  const late = rankedParts(score).find((p) => b0Of([p.id]) >= 4 && score.notes.some((n) => n.partId !== p.id && n.startSeconds < beats[b0Of([p.id])].startSeconds));
-  if (late) add('前奏打拍子（單人，聲部開頭有空白，從第 0 拍起照原速揮）', [late.id], [{ partIds: [late.id], waves: waves(0) }], { preludeSec: beats[b0Of([late.id])].startSeconds });
+  solo('準時（單人）', {});
+  solo('第一下提早按（單人，落在第一個 segment 之前 70％處，之後準時）', { leadMs: -secs[0] * 700 });
+  solo('按得比樂譜快很多（單人，間隔 ×0.3、抖動 ±30％）', { factor: 0.3, jitter: 0.3 });
+  solo('按得比樂譜慢很多（單人，間隔 ×3、抖動 ±30％）', { factor: 3, jitter: 0.3 });
+  solo('連按（單人，每 24ms 一下，比樂譜快很多）', { burst: true });
+  solo('中途停手（單人，第 20 個 segment 之後不再按）', { pause: [19, Infinity] }, { complete: false });
+  for (const sec of [0.6, 2, 8]) solo(`停手 ${sec} 秒後回來（單人，第 20 個 segment 之後）`, { pause: [19, sec * 1000] });
   if (B) {
-    const ids = [A, B], b0 = b0Of(ids);
-    add('一人兩個聲部', ids, [{ partIds: ids, waves: waves(b0, { jitter: 0.1 }) }]);
-    add('兩位演奏者（錯開 40ms、抖動）', ids, [{ partIds: [A], waves: waves(b0, { jitter: 0.1 }) }, { partIds: [B], waves: waves(b0, { jitter: 0.15, offsetMs: 40 }) }],
-      { syncTolMs: TICK_TOL_MS + 40 });
-    add('一人晚進場（第 8 拍才開始揮）', ids, [{ partIds: [A], waves: waves(b0) }, { partIds: [B], waves: waves(b0, { fromBeat: 8 }) }],
-      { exempt: (v, n) => v.partId === B && n.beatIndex <= b0 + 9 });   // 他第一下揮手之前走過的拍，他的聲部本來就是靜音
-    add('一人中途停手（第 10 拍之後不再揮）', ids, [{ partIds: [A], waves: waves(b0) }, { partIds: [B], waves: waves(b0, { pause: [9, Infinity] }) }]);
-    add('一人停手 6 秒後回來（第 10 拍之後）', ids, [{ partIds: [A], waves: waves(b0) }, { partIds: [B], waves: waves(b0, { pause: [9, 6000] }) }]);
+    add('一人兩個聲部', [{ partIds: [A, B], presses: onsetPresses(secs, { rnd, jitter: 0.1 }) }]);
+    add('兩位演奏者（輪流按、抖動）', roundRobin([A, B], { jitter: 0.1 }));
+    const [pa, pb] = roundRobin([A, B], {});
+    add('兩位演奏者，其中一位中途停手不再回來（剩下的人按不完全曲）', [pa, { ...pb, presses: pb.presses.slice(0, 10) }], { complete: false });
   }
   if (C) {
-    const ids = [A, B, C, D].filter(Boolean), b0 = b0Of(ids);
-    const players = [{ partIds: [A], waves: waves(b0) }, { partIds: [B], waves: waves(b0, { jitter: 0.1, offsetMs: 30 }) },
-      { partIds: [C], waves: waves(b0, { jitter: 0.15, offsetMs: 70, skipProb: 0.1 }) }];
-    if (D) players.push({ partIds: [D], waves: waves(b0, { jitter: 0.2, offsetMs: 110 }) });
-    add(`${players.length} 位演奏者（錯開、抖動、其中一位隨機漏揮 10％）`, ids, players, { syncTolMs: TICK_TOL_MS + 110 });
+    const ids = [A, B, C, D].filter(Boolean);
+    add(`${ids.length} 位演奏者（輪流按、抖動）`, roundRobin(ids, { jitter: 0.15 }));
   }
-  solo('休止期間不揮手（單人，連續 4 拍不揮）', { skipBeats: [6, 10] });
-  for (const sec of [0.6, 2, 8]) solo(`停手 ${sec} 秒後回來（單人，第 11 拍）`, { pause: [10, sec * 1000] });
-  // 速度跟隨：factor＝揮手間隔是樂譜拍長的幾倍（<1 快、>1 慢），jitter＝每次間隔隨機偏差的比例（±）。
-  // gate（量化門檻，不達標就算一筆不符合）：preemptPct＝電腦搶在揮手前放行的比例上限、aheadSongs＝共用拍位比演奏者數的拍多走的歌數上限
-  // （0＝不能有棘輪）、missLag＝漏揮補位晚拍數中位數上限；known＝已知未達標的原因（照樣量、印出來，但不算不符合，要修就移掉）。
-  for (const factor of [0.7, 1, 1.25, 1.6]) for (const jitter of [0.15, 0.3]) {
-    const gate = jitter === 0.15 ? { preemptPct: GATE_PREEMPT_PCT, aheadSongs: 0 } : null;
-    if (gate && factor === 1.25) gate.known = '揮手間隔比估計慢到 1.25 倍＋抖動時，電腦搶先約 10％，少數歌多走 4 拍';
-    if (gate && factor === 1.6) gate.known = '慢 1.6 倍時估計要幾拍才收斂，期間電腦搶先放行，部分歌多走 3 拍';
-    solo(`穩定揮手 ×${factor}、抖動 ±${jitter * 100}％（單人）`, { factor, jitter }, true, gate);
-  }
-  solo('漸快（單人，揮手間隔從 ×1.4 漸漸縮到 ×0.6）', { factorAt: (k, n) => 1.4 - (0.8 * k) / n }, true, { aheadSongs: 0 });
-  solo('漸慢（單人，揮手間隔從 ×0.6 漸漸拉長到 ×1.4）', { factorAt: (k, n) => 0.6 + (0.8 * k) / n }, true, { aheadSongs: 0 });
-  solo('突然變快（單人，第 20 拍起揮手間隔從 ×1 變 ×0.5）', { factorAt: (k) => (k < 20 ? 1 : 0.5) }, true, { aheadSongs: 0 });
-  solo('突然變慢（單人，第 20 拍起揮手間隔從 ×1 變 ×2）', { factorAt: (k) => (k < 20 ? 1 : 2) }, true,
-    { aheadSongs: 0, known: '估計收斂前（約 10 拍）電腦已經多放行 2 拍，這個位移之後不會消失（N2 已知取捨）' });
-  // 漏揮：電腦在「該揮的時間＋τ」替你放行，你下一次準時的揮手不該多推一拍。
-  for (const p of [0.1, 0.3]) solo(`隨機漏揮 ${p * 100}％（單人，抖動 ±10％）`, { skipProb: p, jitter: 0.1 }, true,
-    { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0, ...(p === 0.3 ? { known: '連續漏揮多拍時補位相位漂移，漏揮 30％ 的補位約晚 2.7 拍' } : {}) });
-  solo('連續漏 3 拍（單人，第 9～11 拍）', { skipBeats: [8, 11] }, true, { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0 });
-  solo('每 4 拍漏 1 拍（單人）', { skipEvery: 4 }, true, { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0 });
-  // 完全停手 N 拍後回來（錯過的拍全由電腦走）。
-  for (const n of [2, 8, 30]) solo(`停手 ${n} 拍後回來（單人，第 11 拍起）`, { skipBeats: [10, 10 + n] }, true, { missLag: GATE_MISS_LAG_BEATS, aheadSongs: 0 });
-  return out.map((sc) => ({ ...sc, b0: b0Of(sc.players.flatMap((p) => p.partIds)) }));
+  return out;
 }
 
 function scanScenarios(songs) {
   const byName = new Map();
   for (const s of songs.filter((x) => rankedParts(x.score).length >= 1)) {
     for (const sc of buildScenarios(s.score, makeRng(7))) {
-      const m = measure(simulate(s.score, sc.players), { exempt: sc.exempt, ...(sc.track ? { waves: sc.players[0].waves, b0: sc.b0 } : {}), preludeEndSec: sc.preludeSec });
+      const m = measure(simulate(s.score, sc.players));
       if (!byName.has(sc.name)) byName.set(sc.name, []);
-      byName.get(sc.name).push({ s, m, tol: sc.syncTolMs, track: sc.track, gate: sc.gate });
+      byName.get(sc.name).push({ s, m, opts: { completePresses: sc.complete !== false } });
     }
   }
-  console.log(`\n=== 情境掃描（每個情境的不變量：放行了的音都發聲、每個 noteOn 一個 noteOff、同刻音同一個 tick）===`);
+  console.log(`\n=== 情境掃描（每個情境的不變量：該放行的音都發聲、每個 noteOn 一個 noteOff、每顆音在放行它的觸發當下發聲、同刻音差 0ms）===`);
   let failures = 0;
   for (const [name, runs] of byName) {
     const sum = (key) => runs.reduce((a, r) => a + r.m[key], 0);
-    const bad = runs.filter((r) => r.m.releasedMissing || r.m.unpaired || r.m.strayOff || r.m.badVelocity || r.m.syncMax > r.tol || r.m.preludeSkewMax > PRELUDE_SKEW_TOL_MS);
+    const bad = runs.filter((r) => violations(r.m, r.opts));
     failures += bad.length;
-    let line = `${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；放行了卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms；曲末沒被放行的音 ${sum('unreleased')} 顆（${runs.filter((r) => r.m.unreleased).length} 首）`;
-    if (runs[0].m.preludeSkewMax != null) line += `\n    前奏的音實際發聲時間與樂譜時間的最大差 ${Math.max(...runs.map((r) => r.m.preludeSkewMax))}ms（門檻 ${PRELUDE_SKEW_TOL_MS}ms）`;
-    if (runs[0].track) {
-      const pre = sum('preempted'), waves = sum('waveCount');
-      line += `\n    揮手→發聲 p50 中位 ${median(runs.map((r) => r.m.lagP50))}ms、p99 中位 ${median(runs.map((r) => r.m.lagP99))}ms（最差一首 p99 ${Math.max(...runs.map((r) => r.m.lagP99 ?? 0))}ms）；`
-        + `電腦搶在揮手前放行 ${(100 * pre / waves).toFixed(1)}％（${pre}／${waves} 次揮手）；共用拍位比演奏者數的拍多走：${runs.filter((r) => r.m.ratchetWaves).length} 首（最多 ${Math.max(...runs.map((r) => r.m.ratchetMax))} 拍）；被壓縮 ${sum('compressed')}／${sum('adjacent')}`;
-      const missLag = median(runs.map((r) => r.m.missLagMed));
-      if (missLag != null) line += `；漏揮的拍由電腦補位，比他本來該揮的時間晚拍長的 ${missLag}`;
-    }
-    const gate = runs[0].gate;
-    if (gate) {
-      const waves = sum('waveCount'), pctPre = waves ? (100 * sum('preempted')) / waves : 0, ahead = runs.filter((r) => r.m.ratchetWaves).length;
-      const miss = median(runs.map((r) => r.m.missLagMed));
-      const fails = [];
-      if (gate.preemptPct != null && pctPre > gate.preemptPct) fails.push(`電腦搶在揮手前放行 ${pctPre.toFixed(1)}％ > ${gate.preemptPct}％`);
-      if (gate.aheadSongs != null && ahead > gate.aheadSongs) fails.push(`共用拍位多走的歌 ${ahead} 首 > ${gate.aheadSongs} 首`);
-      if (gate.missLag != null && miss != null && miss > gate.missLag) fails.push(`漏揮補位晚 ${miss} 拍 > ${gate.missLag} 拍`);
-      if (fails.length) {
-        if (gate.known) line += `
-    ⚠ 量化門檻未達標（已知，不算不符合）：${fails.join('；')}。原因：${gate.known}`;
-        else { line += `
-    ✗ 量化門檻未達標：${fails.join('；')}`; failures += 1; }
-      }
-    }
-    console.log(line);
+    console.log(`${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；該放行卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、非觸發當下發聲 ${sum('offTrigger')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms；曲末沒被放行的音 ${sum('notReleased')} 顆（${runs.filter((r) => r.m.notReleased).length} 首）`);
     for (const r of bad.slice(0, 3)) console.log('    ', r.s.title, JSON.stringify(r.m));
   }
   return failures;

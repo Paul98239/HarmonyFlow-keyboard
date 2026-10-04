@@ -7,9 +7,9 @@
 //  （previewPlayer.js 包裝，走電腦輔助那個合成器 synth），跟演奏互斥：兩者共用 synth 的 channel，
 //  任何一邊開始之前都先 flushPreviousSong() 把另一邊停掉。
 //
-//  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值；沒被自己的演奏者
-//  揮過手的聲部就是靜音（見 scheduler.js 的說明）。沒被指派的聲部固定走 synth，跟指派
-//  聲部共用同一個樂譜時鐘，同一刻的音同時發聲。humanGain 開啟時的目標值刻意設在 1.0 以上
+//  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值；指派只決定走哪個合成器與誰有資格
+//  觸發（見 scheduler.js 的說明）。沒被指派的聲部固定走 synth，跟你的聲部在同一個 segment 一起發聲。
+//  humanGain 開啟時的目標值刻意設在 1.0 以上
 //  （`HUMAN_EMPHASIS_GAIN`），讓使用者控制的聲部整體比電腦輔助的聲部更突出；電腦輔助那一軌
 //  固定不掛額外 gain，是這個音量對比的基準，不會跟著被調小聲。
 // ============================================================
@@ -47,9 +47,7 @@ const DRUM_CHANNEL_OFFSET = 9;
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
 const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（電腦輔助軌固定是 1.0 基準，沒有額外
                                   // gain）：使用者控制的聲部整體調大聲，凸顯真人正在演奏的部分；
-                                  // 實測後可能還要繼續調整。改這個值時，scheduler.js 的
-                                  // AUTOPILOT_VOLUME_CC 要重算（該檔案的常數註解有完整公式）——
-                                  // 兩個檔案不能互相 import 形成循環，只能靠這兩則註解手動同步。
+                                  // 實測後可能還要繼續調整。
 
 /* ═══════════════════════════════════════════
    引擎狀態
@@ -70,8 +68,8 @@ let lastGateTarget = -1;
 // 狀態，下一次 flushPreviousSong() 要多做一次完整重設。
 let SequencerClass, previewPlayer = null, previewUsed = false;
 
-// 拍級事件驅動排程器（scheduler.js）：驅動 synth（未指派聲部，反應式播放）與
-// synthHuman（指派聲部，接手才發聲），由播放器的 12ms 排程 tick 呼叫 tick()。
+// 排程器（scheduler.js）：驅動 synth（未指派聲部，跟著指派聲部的位置走）與 synthHuman（指派聲部，觸發才發聲）；
+// 播放器呼叫 trigger()（觸發當下發聲）並用 12ms 排程 tick 呼叫 tick()（輔助聲部與到期收音）。
 export const scheduler = new Scheduler();
 
 /* ═══════════════════════════════════════════

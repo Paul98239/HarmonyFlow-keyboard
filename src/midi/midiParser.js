@@ -5,15 +5,16 @@
 //
 //  典型用法：
 //    const parsed = parseMidi(await file.arrayBuffer());
-//    parsed.parts   // → 這份總譜有哪些聲部（MuseScore 的一個樂器＝一個 part，底下是 voice＝譜表 × channel）
-//    parsed.notes   // → scheduler.js 直接拿這份（連同 parts、buildBeatGrid()）建立 voice
+//    parsed.parts   // → 這份總譜有哪些聲部（MuseScore 的一個樂器＝一個 part，底下是 staff＝譜表 × channel）
+//    parsed.segments // → 全曲的垂直切片（同一個 startTick 的所有音）：scheduler.js 一次觸發放行一個 segment
+//    parsed.notes   // → scheduler.js 連同 parts 建立 staff（音符依 staffId 分給各 staff）
 //
 //  本模組不碰 Blob／DOM／AudioContext——包成 Blob 是呼叫端的事。
 //
 //  ── 本模組的界線：規格保證什麼、應用層假設什麼 ──
 //  SMF 規格真正寫進檔案的是「格線」：時間解析度（division）、速度（FF 51）、拍號（FF 58）。
 //  這三樣加起來足以把任何一個 tick 精確還原成「第幾拍、第幾秒」，`buildTempoMap()`／
-//  `makeTickToSeconds()`／`buildMeasureGrid()`／`buildBeatGrid()` 這條鏈是確定性計算，不是
+//  `makeMidiTicksToSeconds()`／`buildMeasureGrid()`／`buildBeatGrid()` 這條鏈是確定性計算，不是
 //  推導。規格沒有寫進檔案的是格線上的「音樂意義」：小節線本身、弱起、強弱、swing、複拍子
 //  的實際律動——這些只能由應用層推導，而推導必然帶假設，本模組只在明確標示假設（CLAUDE.md「拍子從哪裡來」的假設表，
 //  A 開頭的項目，散在各函式的 JSDoc／註解裡）的地方才做這類啟發式推導，其餘一律照規格算出來的數字為準。
@@ -84,7 +85,7 @@ const WARNING_LIMIT = 100;
 // GM1 打擊樂固定使用第 10 個 MIDI channel（索引 9，不是第 10 個 track）上 program 代表的
 // 是鼓組而非旋律樂器。GM2 §2.4／§3.3.1 允許用 Bank Select（CC0 MSB／CC32 LSB）在任何 channel
 // 上切換：bank 79H(121)＝旋律（channel 9 以外的規格預設值）、bank 78H(120)＝節奏（channel 9
-// 的規格預設值）——voice 的 percussionKit 判定依這條規則走（見 buildPart()），不是只看
+// 的規格預設值）——staff 的 percussionKit 判定依這條規則走（見 buildPart()），不是只看
 // channel 號碼。這張表只用來檢查鼓組 program 是不是 GM2 附錄 B 定義的編號。
 // 拼法對齊 GM2 規格文件附錄 B「General MIDI 2 Percussion Sound Set」表格標題（PC#1 STANDARD Set、
 // PC#9 ROOM Set…）：全部是「XXX Set」，不是「XXX Kit」；56 號那組官方寫的是縮寫「SFX Set」，
@@ -371,7 +372,7 @@ function decorateMeta(ev, warn, trackIndex) {
         ev.microsecondsPerQuarter = (d[0] << 16) | (d[1] << 8) | d[2];
         ev.bpm = ev.microsecondsPerQuarter > 0 ? 60000000 / ev.microsecondsPerQuarter : 0;
       } else {
-        warn(`track ${trackIndex} 的 tick ${ev.tick}：速度事件 FF51 長度應為 3，實際 ${d.length}，已忽略`);
+        warn(`track ${trackIndex} 的 tick ${ev.ticks}：速度事件 FF51 長度應為 3，實際 ${d.length}，已忽略`);
       }
       break;
     case META.SMPTE_OFFSET:
@@ -398,7 +399,7 @@ function decorateMeta(ev, warn, trackIndex) {
         ev.clocksPerClick = 24;
         ev.thirtySecondNotesPer24Clocks = 0x08;
       } else {
-        warn(`track ${trackIndex} 的 tick ${ev.tick}：拍號事件 FF58 長度應為 4（或簡化版 2），實際 ${d.length}，已忽略`);
+        warn(`track ${trackIndex} 的 tick ${ev.ticks}：拍號事件 FF58 長度應為 4（或簡化版 2），實際 ${d.length}，已忽略`);
       }
       break;
     case META.KEY_SIGNATURE:
@@ -472,7 +473,7 @@ function parseTrack(body, trackIndex, warn) {
         const type = r.u8(`track ${trackIndex} 的 meta 型別`);
         const length = r.vlq(`track ${trackIndex} 的 meta 長度`);
         const data = r.copy(length, `track ${trackIndex} 的 meta 內容`);
-        const ev = { tick, kind: 'meta', type, data };
+        const ev = { ticks: tick, kind: 'meta', type, data };
         decorateMeta(ev, warn, trackIndex);
         events.push(ev);
 
@@ -481,7 +482,7 @@ function parseTrack(body, trackIndex, warn) {
         else if (type === META.DEVICE_NAME) {
           // RP-019：一軌只能有一個 Device Name（FF 09），用來把整軌鎖定給單一裝置。
           if (!deviceName) deviceName = ev.text;
-          else warn(`track ${trackIndex} 的 tick ${ev.tick}：出現第二個 Device Name（FF 09），RP-019 規定一軌只能有一個，已忽略`);
+          else warn(`track ${trackIndex} 的 tick ${ev.ticks}：出現第二個 Device Name（FF 09），RP-019 規定一軌只能有一個，已忽略`);
         }
         else if (type === META.PORT) {
           if (port === null) port = ev.port ?? null; // 之後若又出現不同的值，取最後一個（官方 SpessaSynth 整條軌用最後的 port）
@@ -491,9 +492,9 @@ function parseTrack(body, trackIndex, warn) {
           // Device Name 描述成「取代 cable number（也就是這裡的 FF 21）的更好做法」，隱含同一個
           // 「一軌對應一個裝置」的假設，但這是慣例上的推論，不是 RP-019 對 FF 21 本身的規定
           // ——中途改變代表這軌違反了這個推論出來的慣例；整條軌一律用最後的 port 算絕對 channel
-          // （buildPortOffsets()），同一軌內重複的 channel 號碼可能因此被誤併成同一個 voice。
+          // （buildPortOffsets()），同一軌內重複的 channel 號碼可能因此被誤併成同一個 staff。
           else if (ev.port !== port) {
-            warn(`track ${trackIndex} 的 tick ${ev.tick}：MIDI Port（FF 21，業界慣例欄位，非 RP-001 正式定義）中途從 ${port} 改成 ${ev.port}，違反「一軌對應一個裝置」的慣例，整條軌改用最後的 port`);
+            warn(`track ${trackIndex} 的 tick ${ev.ticks}：MIDI Port（FF 21，業界慣例欄位，非 RP-001 正式定義）中途從 ${port} 改成 ${ev.port}，違反「一軌對應一個裝置」的慣例，整條軌改用最後的 port`);
             port = ev.port;
           }
         }
@@ -508,7 +509,7 @@ function parseTrack(body, trackIndex, warn) {
         // F0：完整 SysEx（結尾的 F7 含在資料內）。F7：escape／續傳封包，資料原樣送出。
         const length = r.vlq(`track ${trackIndex} 的 SysEx 長度`);
         const data = r.copy(length, `track ${trackIndex} 的 SysEx 內容`);
-        events.push({ tick, kind: 'sysex', type: status === 0xf0 ? 'sysex' : 'escape', data });
+        events.push({ ticks: tick, kind: 'sysex', type: status === 0xf0 ? 'sysex' : 'escape', data });
       } else if (status >= 0x80 && status <= 0xef) {
         const high = status & 0xf0;
         const channel = status & 0x0f;
@@ -519,7 +520,7 @@ function parseTrack(body, trackIndex, warn) {
           warn(`track ${trackIndex} 的 tick ${tick}：${type} 的資料位元組超過 0x7F，檔案可能已損毀`);
         }
         channels.add(channel);
-        events.push({ tick, kind: 'channel', type, channel, data1, data2 });
+        events.push({ ticks: tick, kind: 'channel', type, channel, data1, data2 });
       } else {
         // F1~F6、F8~FE 是 System Common／Real-Time，依規格不得出現在 SMF 檔案裡；
         // 一旦出現就無從得知它佔幾個位元組，硬猜只會讓整軌解析錯位。
@@ -537,7 +538,7 @@ function parseTrack(body, trackIndex, warn) {
   if (!sawEndOfTrack) {
     warn(`track ${trackIndex} 沒有 End of Track（FF 2F 00）事件，已以最後一個事件的位置為軌尾`);
   }
-  const endTick = sawEndOfTrack ? tick : (events.length ? events[events.length - 1].tick : 0);
+  const endTick = sawEndOfTrack ? tick : (events.length ? events[events.length - 1].ticks : 0);
 
   return {
     index: trackIndex,
@@ -563,7 +564,7 @@ function collectMeta(tracks, type) {
     }
   }
   // Array.prototype.sort 自 ES2019 起保證穩定，同 tick 時維持「軌序 → 事件序」。
-  list.sort((a, b) => a.ev.tick - b.ev.tick);
+  list.sort((a, b) => a.ev.ticks - b.ev.ticks);
   return list;
 }
 
@@ -578,33 +579,33 @@ function buildTempoMap(tracks, division, warn) {
   for (const { ev, trackIndex } of collectMeta(tracks, META.SET_TEMPO)) {
     if (!(ev.microsecondsPerQuarter > 0)) continue;
     const last = map[map.length - 1];
-    if (last && last.tick === ev.tick) {
+    if (last && last.ticks === ev.ticks) {
       // 同一個 tick 有多個速度事件：後出現者生效（軌序、事件序在後的），跟官方 SpessaSynth 一致。
       if (last.microsecondsPerQuarter !== ev.microsecondsPerQuarter) {
-        warn(`tick ${ev.tick} 有互相衝突的速度事件（track ${trackIndex} 指定 ${ev.bpm.toFixed(2)} BPM），採用後出現的那一個`);
+        warn(`tick ${ev.ticks} 有互相衝突的速度事件（track ${trackIndex} 指定 ${ev.bpm.toFixed(2)} BPM），採用後出現的那一個`);
         last.microsecondsPerQuarter = ev.microsecondsPerQuarter;
         last.bpm = ev.bpm;
       }
       continue;
     }
     if (last && last.microsecondsPerQuarter === ev.microsecondsPerQuarter) continue; // 重複值不必新增區段
-    map.push({ tick: ev.tick, microsecondsPerQuarter: ev.microsecondsPerQuarter, bpm: ev.bpm, seconds: 0 });
+    map.push({ ticks: ev.ticks, microsecondsPerQuarter: ev.microsecondsPerQuarter, bpm: ev.bpm, seconds: 0 });
   }
-  if (!map.length || map[0].tick !== 0) {
-    map.unshift({ tick: 0, microsecondsPerQuarter: DEFAULT_TEMPO_US, bpm: 60000000 / DEFAULT_TEMPO_US, seconds: 0 });
+  if (!map.length || map[0].ticks !== 0) {
+    map.unshift({ ticks: 0, microsecondsPerQuarter: DEFAULT_TEMPO_US, bpm: 60000000 / DEFAULT_TEMPO_US, seconds: 0 });
   }
-  // 逐段累積起始秒數，之後 tickToSeconds 只要找到所屬區段再線性內插即可。
+  // 逐段累積起始秒數，之後 midiTicksToSeconds 只要找到所屬區段再線性內插即可。
   if (division.type === 'ppq') {
     for (let i = 1; i < map.length; i++) {
       const prev = map[i - 1];
       map[i].seconds =
-        prev.seconds + ((map[i].tick - prev.tick) * prev.microsecondsPerQuarter) / 1e6 / division.ticksPerQuarter;
+        prev.seconds + ((map[i].ticks - prev.ticks) * prev.microsecondsPerQuarter) / 1e6 / division.ticksPerQuarter;
     }
   }
   return map;
 }
 
-function makeTickToSeconds(tempoMap, division) {
+function makeMidiTicksToSeconds(tempoMap, division) {
   // SMPTE 的 tick 本身就是絕對時間，速度事件在這個模式下不參與換算（規格明訂）。
   if (division.type === 'smpte') {
     return (tick) => tick / division.ticksPerSecond;
@@ -615,11 +616,32 @@ function makeTickToSeconds(tempoMap, division) {
     let hi = tempoMap.length - 1;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (tempoMap[mid].tick <= tick) lo = mid;
+      if (tempoMap[mid].ticks <= tick) lo = mid;
       else hi = mid - 1;
     }
     const seg = tempoMap[lo];
-    return seg.seconds + ((tick - seg.tick) * seg.microsecondsPerQuarter) / 1e6 / tpq;
+    return seg.seconds + ((tick - seg.ticks) * seg.microsecondsPerQuarter) / 1e6 / tpq;
+  };
+}
+
+// midiTicksToSeconds 的反函數（名稱照官方 BasicMIDI.secondsToMIDITicks）。數學上：tick → 秒在每個速度區段內是斜率固定的
+// 線性函數、區段之間接得起來，整條是嚴格遞增的分段線性函數，所以反函數也是分段線性——先用 seg.seconds（每段的起始秒數，
+// 嚴格遞增）二分搜尋找到所屬區段，再在區段內反解線性式。回傳值可以是小數（秒不一定剛好落在整數 tick 上）。
+function makeSecondsToMIDITicks(tempoMap, division) {
+  if (division.type === 'smpte') {
+    return (seconds) => seconds * division.ticksPerSecond;
+  }
+  const tpq = division.ticksPerQuarter;
+  return (seconds) => {
+    let lo = 0;
+    let hi = tempoMap.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (tempoMap[mid].seconds <= seconds) lo = mid;
+      else hi = mid - 1;
+    }
+    const seg = tempoMap[lo];
+    return seg.ticks + ((seconds - seg.seconds) * 1e6 * tpq) / seg.microsecondsPerQuarter;
   };
 }
 
@@ -628,15 +650,15 @@ function buildSignatureList(tracks, type, decorate, fallback) {
   for (const { ev } of collectMeta(tracks, type)) {
     const last = out[out.length - 1];
     // 同一個 tick 有多個拍號／調號：後出現者生效（軌序、事件序在後的），跟速度表（buildTempoMap）與官方 SpessaSynth 一致。
-    if (last && last.tick === ev.tick) { out[out.length - 1] = decorate(ev); continue; }
+    if (last && last.ticks === ev.ticks) { out[out.length - 1] = decorate(ev); continue; }
     out.push(decorate(ev));
   }
-  if (!out.length || out[0].tick !== 0) out.unshift({ tick: 0, ...fallback });
+  if (!out.length || out[0].ticks !== 0) out.unshift({ ticks: 0, ...fallback });
   return out;
 }
 
 /* ═══════════════════════════════════════════
-   解析：聲部切分（Part／voice）與音符配對
+   解析：聲部切分（Part／staff）與音符配對
    ═══════════════════════════════════════════ */
 
 // 切分規則（一條規則，沒有「是不是 MuseScore 檔」的分支）：
@@ -644,8 +666,8 @@ function buildSignatureList(tracks, type, decorate, fallback) {
 //   在 tick 0 對這個樂器的每個 channel 寫初始化區塊（CC121、[Bank]、Program Change、CC7／10／91／93），下面的譜表沒有。
 //   所以依軌序掃描：一條 track 併入「目前這一組」，當且僅當它沒有初始化區塊（hasInit）、軌名跟這組首軌相同（任一方是空
 //   的也算相同）、它的音符 channel 全在這組已知的 channel 內；否則自成新的一組。沒有音符的組（Meta 軌、空軌）不成聲部。
-//   voice ＝ 組內每一個「有音符的 (track, channel)」（一個譜表 × 一個樂器 channel：鋼琴兩行譜是兩個 voice，弓弦的
-//   pizzicato channel 有音時是另一個 voice）。
+//   staff ＝ 組內每一個「有音符的 (track, channel)」（一個譜表 × 一個樂器 channel：鋼琴兩行譜是兩個 staff，弓弦的
+//   pizzicato channel 有音時是另一個 staff）。
 //   不推導高階資訊：譜號、旋律／伴奏、Voice 1–4、演奏法、踏板線、動態曲線、反覆記號在 MIDI 裡不存在或不精準，硬推只會
 //   多出誤判，所以不做。已知限制：同一條 track 內的多個 channel 視為同一個樂器的音色層（format 0 的多樂器 GM 檔不會被拆開）。
 
@@ -666,7 +688,7 @@ function summarizeTrack(track) {
   for (const ev of track.events) {
     if (ev.kind !== 'channel') continue;
     if (ev.type === 'noteOn' && ev.data2 > 0) noteChannels.add(ev.channel);
-    if (ev.tick !== 0 || (ev.type !== 'programChange' && ev.type !== 'controlChange')) continue;
+    if (ev.ticks !== 0 || (ev.type !== 'programChange' && ev.type !== 'controlChange')) continue;
     let init = initByChannel.get(ev.channel);
     if (!init) initByChannel.set(ev.channel, (init = {}));
     if (ev.type === 'programChange') {
@@ -721,43 +743,49 @@ function buildPortOffsets(tracks) {
 // Program Change 是 channel 的狀態、跨軌共用，但「跨軌共用」不代表可以照檔案裡的軌道排列
 // 順序處理——一顆音該用哪個 program，要看「這個時間點」該 channel 實際生效的值，不是「前面
 // 處理過的軌道留下的值」。這裡建一份查詢器：優先用同一軌自己在這個時間點之前最後一次送過的
-// Program Change；這軌自己從沒送過時，才查全曲所有軌、同 channel、時間點更早（同 tick 依
+// Program Change；這軌自己從沒送過時，才查全曲所有軌、同一個絕對 channel、時間點更早（同 tick 依
 // 軌序決定）的最後一次 Program Change；兩者都沒有就回傳規格預設值 0。
 // 呼叫端必須依「事件在檔案裡出現的順序」使用：換軌時呼叫 resetTrack()，逐一遇到 Program
 // Change 事件時呼叫 noteProgramChange()，查詢在這之間穿插進行——collectNotes() 本來就是這樣
 // 逐軌逐事件處理，不需要額外排序。
 function buildProgramResolver(tracks) {
-  const globalByChannel = new Map(); // channel → [{tick, trackIndex, program}]（依 tick、軌序排序）
+  // 全曲查詢的 key 是「絕對 channel」（軌內 channel ＋ port 偏移）：不同 port 的同號 channel 是不同的 channel，
+  // 只用軌內 channel 當 key 的話，沒有自己 Program Change 的軌會吃到別的 port 同號 channel 的音色。
+  const portOffsets = buildPortOffsets(tracks);
+  const absChannel = (trackIndex, channel) => channel + (portOffsets.get(trackIndex) ?? 0);
+  const globalByChannel = new Map(); // 絕對 channel → [{ticks, trackIndex, program}]（依 tick、軌序排序）
   for (const track of tracks) {
     for (const ev of track.events) {
       if (ev.kind !== 'channel' || ev.type !== 'programChange') continue;
-      let list = globalByChannel.get(ev.channel);
-      if (!list) globalByChannel.set(ev.channel, (list = []));
-      list.push({ tick: ev.tick, trackIndex: track.index, program: ev.data1 });
+      const key = absChannel(track.index, ev.channel);
+      let list = globalByChannel.get(key);
+      if (!list) globalByChannel.set(key, (list = []));
+      list.push({ ticks: ev.ticks, trackIndex: track.index, program: ev.data1 });
     }
   }
   for (const list of globalByChannel.values()) {
-    list.sort((a, b) => a.tick - b.tick || a.trackIndex - b.trackIndex);
+    list.sort((a, b) => a.ticks - b.ticks || a.trackIndex - b.trackIndex);
   }
 
-  function globalLookup(channel, tick) {
+  function globalLookup(channel, ticks) {
     const list = globalByChannel.get(channel);
     if (!list || !list.length) return null;
     let lo = 0, hi = list.length - 1, ans = -1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (list[mid].tick <= tick) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+      if (list[mid].ticks <= ticks) { ans = mid; lo = mid + 1; } else hi = mid - 1;
     }
     return ans === -1 ? null : list[ans].program;
   }
 
-  let localProgram = new Map(); // 目前這一軌自己已知的 program，channel → program
+  let localProgram = new Map(); // 目前這一軌自己已知的 program，軌內 channel → program
+  let currentTrack = -1;        // 目前處理到哪一軌：全曲查詢要靠它算出絕對 channel
   return {
-    resetTrack() { localProgram = new Map(); },
+    resetTrack(trackIndex) { localProgram = new Map(); currentTrack = trackIndex; },
     noteProgramChange(channel, program) { localProgram.set(channel, program); },
-    programAt(channel, tick) {
+    programAt(channel, ticks) {
       if (localProgram.has(channel)) return localProgram.get(channel);
-      const global = globalLookup(channel, tick);
+      const global = globalLookup(absChannel(currentTrack, channel), ticks);
       return global != null ? global : 0;
     },
   };
@@ -765,46 +793,46 @@ function buildProgramResolver(tracks) {
 
 /**
  * @param {string} partId
- * @param {string} voiceId
+ * @param {string} staffId
  * @param {number} trackIndex
  * @param {number} channel  絕對 channel（含 port 偏移）
  * @param {MidiChannelEvent} onEvent
  * @param {number} endTick
- * @param {(tick:number) => number} tickToSeconds
+ * @param {(ticks:number) => number} midiTicksToSeconds
  * @returns {MidiNote}
  */
-function makeNote(partId, voiceId, trackIndex, channel, onEvent, endTick, tickToSeconds) {
-  const startSeconds = tickToSeconds(onEvent.tick);
-  const endSeconds = tickToSeconds(endTick);
+function makeNote(partId, staffId, trackIndex, channel, onEvent, endTick, midiTicksToSeconds) {
+  const startSeconds = midiTicksToSeconds(onEvent.ticks);
+  const endSeconds = midiTicksToSeconds(endTick);
   return {
     partId,
-    voiceId,
+    staffId,
     trackIndex,
     channel,
-    note: onEvent.data1,
+    midiNote: onEvent.data1,
     velocity: onEvent.data2,
-    startTick: onEvent.tick,
+    startTick: onEvent.ticks,
     endTick,
-    durationTicks: endTick - onEvent.tick,
+    durationTicks: endTick - onEvent.ticks,
     startSeconds,
     endSeconds,
     durationSeconds: endSeconds - startSeconds,
   };
 }
 
-// 逐軌逐事件把 note-on／note-off 配成音，同時記下每個 voice 的統計（第一顆音當下生效的 program／bank、音符數、起訖、
-// 同音高重疊次數）。voiceIndex：`${trackIndex}:${軌內 channel}` → { partId, voiceId, channel（絕對） }。
-function collectNotes(tracks, tickToSeconds, warn, programResolver, voiceIndex) {
+// 逐軌逐事件把 note-on／note-off 配成音，同時記下每個 staff 的統計（第一顆音當下生效的 program／bank、音符數、起訖、
+// 同音高重疊次數）。staffIndex：`${trackIndex}:${軌內 channel}` → { partId, staffId, channel（絕對） }。
+function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIndex) {
   const notes = [];
-  const statsByVoice = new Map(); // voiceId → { program, bank, noteCount, startTick, endTick, overlaps }
+  const statsByStaff = new Map(); // staffId → { program, bank, noteCount, startTick, endTick, overlaps }
   const statsOf = (vk, program, bank) => {
-    let st = statsByVoice.get(vk.voiceId);
-    if (!st) statsByVoice.set(vk.voiceId, (st = { program, bank, noteCount: 0, startTick: Infinity, endTick: 0, overlaps: 0 }));
+    let st = statsByStaff.get(vk.staffId);
+    if (!st) statsByStaff.set(vk.staffId, (st = { program, bank, noteCount: 0, startTick: Infinity, endTick: 0, overlaps: 0 }));
     return st;
   };
   const emit = (vk, trackIndex, onEv, endTick) => {
-    const note = makeNote(vk.partId, vk.voiceId, trackIndex, vk.channel, onEv, endTick, tickToSeconds);
-    const st = statsByVoice.get(vk.voiceId);
+    const note = makeNote(vk.partId, vk.staffId, trackIndex, vk.channel, onEv, endTick, midiTicksToSeconds);
+    const st = statsByStaff.get(vk.staffId);
     st.noteCount++;
     st.startTick = Math.min(st.startTick, note.startTick);
     st.endTick = Math.max(st.endTick, note.endTick);
@@ -812,7 +840,7 @@ function collectNotes(tracks, tickToSeconds, warn, programResolver, voiceIndex) 
   };
 
   for (const track of tracks) {
-    programResolver.resetTrack();
+    programResolver.resetTrack(track.index);
     const runningBank = new Map(); // channel → { msb, lsb }：這一軌到目前為止最後一次送的 Bank Select
     // key = channel * 128 + 音高。同一 key 可能同時有多顆未收尾的音（同音重疊），
     // 以先進先出配對：先響的音先被關掉，這是最貼近演奏直覺的解讀。
@@ -834,9 +862,9 @@ function collectNotes(tracks, tickToSeconds, warn, programResolver, voiceIndex) 
 
       const key = ev.channel * 128 + ev.data1;
       if (isNoteOn) {
-        const vk = voiceIndex.get(`${track.index}:${ev.channel}`);
-        // voice 的 program／bank 取「第一顆音響起當下」生效的值（沒有初始化區塊時才會用到，見 buildPart()）。
-        const st = statsOf(vk, programResolver.programAt(ev.channel, ev.tick), runningBank.has(ev.channel) ? { ...runningBank.get(ev.channel) } : null);
+        const vk = staffIndex.get(`${track.index}:${ev.channel}`);
+        // staff 的 program／bank 取「第一顆音響起當下」生效的值（沒有初始化區塊時才會用到，見 buildPart()）。
+        const st = statsOf(vk, programResolver.programAt(ev.channel, ev.ticks), runningBank.has(ev.channel) ? { ...runningBank.get(ev.channel) } : null);
         let queue = pending.get(key);
         if (!queue) pending.set(key, (queue = []));
         if (queue.length) st.overlaps++;
@@ -845,38 +873,38 @@ function collectNotes(tracks, tickToSeconds, warn, programResolver, voiceIndex) 
       }
       const queue = pending.get(key);
       if (!queue || !queue.length) {
-        warn(`track ${track.index} 的 tick ${ev.tick}：channel ${ev.channel} 音高 ${ev.data1} 有 note off 卻沒有對應的 note on，已忽略`);
+        warn(`track ${track.index} 的 tick ${ev.ticks}：channel ${ev.channel} 音高 ${ev.data1} 有 note off 卻沒有對應的 note on，已忽略`);
         continue;
       }
       const { ev: onEv, vk } = queue.shift();
-      emit(vk, track.index, onEv, ev.tick);
+      emit(vk, track.index, onEv, ev.ticks);
     }
     for (const [key, queue] of pending) {
       for (const { ev: on, vk } of queue) {
-        warn(`track ${track.index} 的 tick ${on.tick}：channel ${(key / 128) | 0} 音高 ${key % 128} 的 note on 沒有對應的 note off，已在軌尾收尾`);
-        emit(vk, track.index, on, Math.max(on.tick, track.endTick));
+        warn(`track ${track.index} 的 tick ${on.ticks}：channel ${(key / 128) | 0} 音高 ${key % 128} 的 note on 沒有對應的 note off，已在軌尾收尾`);
+        emit(vk, track.index, on, Math.max(on.ticks, track.endTick));
       }
     }
   }
   notes.sort(
-    (a, b) => a.startTick - b.startTick || a.trackIndex - b.trackIndex || a.channel - b.channel || a.note - b.note
+    (a, b) => a.startTick - b.startTick || a.trackIndex - b.trackIndex || a.channel - b.channel || a.midiNote - b.midiNote
   );
-  return { notes, statsByVoice };
+  return { notes, statsByStaff };
 }
 
-// 一組 track（part）→ part 物件與底下的 voice。voice 的初始狀態：
+// 一組 track（part）→ part 物件與底下的 staff。staff 的初始狀態：
 //   · 這組首軌在 tick 0 對這個 channel 有初始化 → 直接採用（program；bank；混音 CC7／10／91／93，缺的補 GM 預設）。
-//     下行譜的 voice 沿用首軌對同一個 channel 的初始化（MuseScore 只在最上行譜寫初始化區塊）。
+//     下行譜的 staff 沿用首軌對同一個 channel 的初始化（MuseScore 只在最上行譜寫初始化區塊）。
 //   · 沒有 → program 沿用時間軸查詢（自己軌優先、再查全曲、預設 0；見 buildProgramResolver），bank 取第一顆音之前最後一次
 //     送的 CC0／CC32，混音 init 記 null（下游用 GM 預設）。
 //   · bank 都沒送過時用 GM2 §3.3.1 的規格預設（絕對 channel 的第 10 個 channel 是節奏 bank 120，其餘是旋律 bank 121）；
 //     percussionKit ＝ bank MSB 為 120（GM2 §2.4：任何 channel 送 Bank 78H 都是節奏通道，不限 channel 9）。
-function buildPart(group, partId, statsByVoice, voiceIndex, warn) {
-  const voices = [];
+function buildPart(group, partId, statsByStaff, staffIndex, warn) {
+  const staves = [];
   for (const summary of group.tracks) {
     for (const channel of [...summary.noteChannels].sort((a, b) => a - b)) {
-      const vk = voiceIndex.get(`${summary.track.index}:${channel}`);
-      const st = statsByVoice.get(vk.voiceId);
+      const vk = staffIndex.get(`${summary.track.index}:${channel}`);
+      const st = statsByStaff.get(vk.staffId);
       const fromInit = group.first.initByChannel.get(channel) || null;
       const hasBank = fromInit && (fromInit.msb !== undefined || fromInit.lsb !== undefined);
       const defaultMsb = vk.channel % 16 === DRUM_CHANNEL ? 120 : 121;
@@ -896,8 +924,8 @@ function buildPart(group, partId, statsByVoice, voiceIndex, warn) {
       if (st.overlaps) {
         warn(`track ${summary.track.index} 的 channel ${channel}：同音高重疊 ${st.overlaps} 次（依先進先出配對，每個 note-on 配到最早還沒結束的那顆音）`);
       }
-      voices.push({
-        id: vk.voiceId, partId, trackIndex: summary.track.index, channel: vk.channel, program, bank, percussionKit, init,
+      staves.push({
+        id: vk.staffId, partId, trackIndex: summary.track.index, channel: vk.channel, program, bank, percussionKit, init,
         noteCount: st.noteCount, startTick: st.startTick, endTick: st.endTick,
       });
     }
@@ -905,19 +933,19 @@ function buildPart(group, partId, statsByVoice, voiceIndex, warn) {
   return {
     id: partId,
     name: '', // nameParts() 補：要先數過所有 part 才知道哪些音色名需要加序號
-    noteCount: voices.reduce((sum, v) => sum + v.noteCount, 0),
-    startTick: Math.min(...voices.map((v) => v.startTick)),
-    endTick: Math.max(...voices.map((v) => v.endTick)),
-    voices,
+    noteCount: staves.reduce((sum, v) => sum + v.noteCount, 0),
+    startTick: Math.min(...staves.map((v) => v.startTick)),
+    endTick: Math.max(...staves.map((v) => v.endTick)),
+    staves,
   };
 }
 
-// 命名：基底名＝part 的主 voice（音符最多，同數取 channel 小者）的 GM 繁中音色名，打擊用鼓組名，查不到才用「聲部 N」；
+// 命名：基底名＝part 的主 staff（音符最多，同數取 channel 小者）的 GM 繁中音色名，打擊用鼓組名，查不到才用「聲部 N」；
 // 不採信軌名、不放高低音譜／旋律伴奏／bank 的任何描述。整份總譜有 ≥2 個 part 基底名相同時依 part 順序（＝總譜由上而下）
 // 加序號「 1」「 2」…；基底名本身以數字結尾（「弦樂合奏 1」）改用全形括號「（1）」，免得疊成「弦樂合奏 1 1」這種容易誤讀的雙重編號。
 function nameParts(parts) {
   const bases = parts.map((part, i) => {
-    const main = [...part.voices].sort((a, b) => b.noteCount - a.noteCount || a.channel - b.channel)[0];
+    const main = [...part.staves].sort((a, b) => b.noteCount - a.noteCount || a.channel - b.channel)[0];
     return gmProgramNameZh(main.program, main.percussionKit) || `聲部 ${i + 1}`;
   });
   const sameBase = (i) => bases.filter((b) => b === bases[i]).length;
@@ -930,27 +958,40 @@ function nameParts(parts) {
   });
 }
 
-// 整個聲部切分：track 摘要 → 分組（part）→ 配對音符（同時算 voice 統計）→ 組成 part／voice → 命名。
-function collectPartsAndNotes(tracks, tickToSeconds, warn, programResolver) {
+// 整個聲部切分：track 摘要 → 分組（part）→ 配對音符（同時算 staff 統計）→ 組成 part／staff → 命名。
+function collectPartsAndNotes(tracks, midiTicksToSeconds, warn, programResolver) {
   const portOffsets = buildPortOffsets(tracks);
   const groups = groupTracks(tracks.map(summarizeTrack));
-  // `${trackIndex}:${軌內 channel}` → { partId, voiceId, channel（絕對） }；part id ＝ p＋首軌序號，voice id ＝ t＋軌序號＋c＋絕對 channel。
-  const voiceIndex = new Map();
+  // `${trackIndex}:${軌內 channel}` → { partId, staffId, channel（絕對） }；part id ＝ p＋首軌序號，staff id ＝ t＋軌序號＋c＋絕對 channel。
+  const staffIndex = new Map();
   const partIds = new Map(groups.map((g) => [g, `p${g.first.track.index}`]));
   for (const group of groups) {
     for (const summary of group.tracks) {
       for (const channel of summary.noteChannels) {
         const abs = channel + (portOffsets.get(summary.track.index) ?? 0);
-        voiceIndex.set(`${summary.track.index}:${channel}`, { partId: partIds.get(group), voiceId: `t${summary.track.index}c${abs}`, channel: abs });
+        staffIndex.set(`${summary.track.index}:${channel}`, { partId: partIds.get(group), staffId: `t${summary.track.index}c${abs}`, channel: abs });
       }
     }
   }
 
-  const { notes, statsByVoice } = collectNotes(tracks, tickToSeconds, warn, programResolver, voiceIndex);
-  const parts = groups.map((group) => buildPart(group, partIds.get(group), statsByVoice, voiceIndex, warn));
+  const { notes, statsByStaff } = collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIndex);
+  const parts = groups.map((group) => buildPart(group, partIds.get(group), statsByStaff, staffIndex, warn));
   nameParts(parts);
   if (!parts.length) warn('這份檔案裡沒有任何音符，切分不出聲部');
   return { parts, notes };
+}
+
+// 全曲的垂直切片（名稱借自 MuseScore 的 Segment：同一個 tick 上所有譜表的音）。notes 已依 startTick 排序，所以相同
+// startTick 的音一定相鄰，一次線性掃描就分完（時間 O(n)）。這是「總譜觸發」的最小單位：排程器一次放行一個 segment，
+// 全曲所有聲部在同一次呼叫內一起起音，上下對齊由結構保證，不靠時間比對。
+export function buildSegments(notes) {
+  const segments = [];
+  for (const note of notes) {
+    const last = segments[segments.length - 1];
+    if (last && last.ticks === note.startTick) last.notes.push(note);
+    else segments.push({ ticks: note.startTick, notes: [note] });
+  }
+  return segments;
 }
 
 /* ═══════════════════════════════════════════
@@ -969,22 +1010,22 @@ function validateStructuralConventions(tracks, format, warn) {
       const precededByTransmittable = firstTrack.events
         .slice(0, seqIdx)
         .some((e) => e.kind === 'channel' || e.kind === 'sysex');
-      if (ev.tick !== 0 || precededByTransmittable) {
-        warn(`track 0 的 tick ${ev.tick}：Sequence Number（FF 00）沒有出現在軌首（RP-001 規定必須在 tick 0、且在任何可送出事件之前）`);
+      if (ev.ticks !== 0 || precededByTransmittable) {
+        warn(`track 0 的 tick ${ev.ticks}：Sequence Number（FF 00）沒有出現在軌首（RP-001 規定必須在 tick 0、且在任何可送出事件之前）`);
       }
     }
     // FF 02 Copyright：規格要求在第一軌、tick 0。只查 tick，不強求是整軌第一個事件——RP-001
     // 對 Sequence Number 的敘述同樣建議放在最前面，兩者都合規時哪個先寫入沒有規格上的定論。
     const copyEv = firstTrack.events.find((ev) => ev.kind === 'meta' && ev.type === META.COPYRIGHT);
-    if (copyEv && copyEv.tick !== 0) {
-      warn(`track 0 的 tick ${copyEv.tick}：Copyright Notice（FF 02）沒有出現在 tick 0（RP-001 規定應放在第一軌、tick 0）`);
+    if (copyEv && copyEv.ticks !== 0) {
+      warn(`track 0 的 tick ${copyEv.ticks}：Copyright Notice（FF 02）沒有出現在 tick 0（RP-001 規定應放在第一軌、tick 0）`);
     }
   }
   // FF 03 Sequence/Track Name：規格要求若有必須出現在 tick 0。
   for (const track of tracks) {
     const ev = track.events.find((e) => e.kind === 'meta' && e.type === META.TRACK_NAME);
-    if (ev && ev.tick !== 0) {
-      warn(`track ${track.index} 的 tick ${ev.tick}：Sequence/Track Name（FF 03）沒有出現在 tick 0（RP-001 規定若有必須在 tick 0）`);
+    if (ev && ev.ticks !== 0) {
+      warn(`track ${track.index} 的 tick ${ev.ticks}：Sequence/Track Name（FF 03）沒有出現在 tick 0（RP-001 規定若有必須在 tick 0）`);
     }
   }
   // format 1：tempo map（FF 51／FF 58）與 SMPTE Offset（FF 54）規定要放第一軌，出現在其他軌
@@ -994,11 +1035,11 @@ function validateStructuralConventions(tracks, format, warn) {
       for (const ev of tracks[i].events) {
         if (ev.kind !== 'meta') continue;
         if (ev.type === META.SET_TEMPO) {
-          warn(`track ${i} 的 tick ${ev.tick}：Set Tempo（FF 51）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
+          warn(`track ${i} 的 tick ${ev.ticks}：Set Tempo（FF 51）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
         } else if (ev.type === META.TIME_SIGNATURE) {
-          warn(`track ${i} 的 tick ${ev.tick}：Time Signature（FF 58）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
+          warn(`track ${i} 的 tick ${ev.ticks}：Time Signature（FF 58）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
         } else if (ev.type === META.SMPTE_OFFSET) {
-          warn(`track ${i} 的 tick ${ev.tick}：SMPTE Offset（FF 54）出現在非第一軌，RP-001 明訂在 format 1 裡這個事件在其他軌沒有意義`);
+          warn(`track ${i} 的 tick ${ev.ticks}：SMPTE Offset（FF 54）出現在非第一軌，RP-001 明訂在 format 1 裡這個事件在其他軌沒有意義`);
         }
       }
     }
@@ -1021,8 +1062,7 @@ function validateStructuralConventions(tracks, format, warn) {
  * channel voice message（note-on／off、CC、program change、pitch bend…）。
  * data1／data2 的意義依 type 而定，見檔頭 CHANNEL_DATA_BYTES 旁的對照表。
  * @typedef {object} MidiChannelEvent
- * @property {number} tick
- * @property {'channel'} kind
+ * @property {number} ticks * @property {'channel'} kind
  * @property {'noteOff'|'noteOn'|'polyAftertouch'|'controlChange'|'programChange'|'channelAftertouch'|'pitchBend'} type
  * @property {number} channel  0~15
  * @property {number} data1
@@ -1032,8 +1072,7 @@ function validateStructuralConventions(tracks, format, warn) {
 /**
  * meta 事件（FF xx）。data 是原始位元組；decorateMeta() 依 type 另外解出語意欄位（有就有、沒有就 undefined）。
  * @typedef {object} MidiMetaEvent
- * @property {number} tick
- * @property {'meta'} kind
+ * @property {number} ticks * @property {'meta'} kind
  * @property {number} type  meta 型別位元組（見 META）
  * @property {Uint8Array} data
  * @property {string} [text]  FF 01~0F 的文字類 meta
@@ -1053,8 +1092,7 @@ function validateStructuralConventions(tracks, format, warn) {
 
 /**
  * @typedef {object} MidiSysexEvent
- * @property {number} tick
- * @property {'sysex'} kind
+ * @property {number} ticks * @property {'sysex'} kind
  * @property {'sysex'|'escape'} type  F0 或 F7
  * @property {Uint8Array} data
  */
@@ -1078,18 +1116,18 @@ function validateStructuralConventions(tracks, format, warn) {
  * @typedef {{type:'ppq', ticksPerQuarter:number, raw:number} | {type:'smpte', nominalFps:number, framesPerSecond:number, ticksPerFrame:number, ticksPerSecond:number, ticksPerQuarter:null, raw:number}} MidiDivision
  */
 
-/** @typedef {{tick:number, microsecondsPerQuarter:number, bpm:number, seconds:number}} TempoMapEntry */
-/** @typedef {{tick:number, numerator:number, denominator:number, clocksPerClick:number, thirtySecondNotesPer24Clocks:number}} TimeSignatureEntry */
-/** @typedef {{tick:number, sharpsFlats:number, minor:boolean}} KeySignatureEntry */
+/** @typedef {{ticks:number, microsecondsPerQuarter:number, bpm:number, seconds:number}} TempoMapEntry */
+/** @typedef {{ticks:number, numerator:number, denominator:number, clocksPerClick:number, thirtySecondNotesPer24Clocks:number}} TimeSignatureEntry */
+/** @typedef {{ticks:number, sharpsFlats:number, minor:boolean}} KeySignatureEntry */
 
 /**
  * 一顆音（note-on 配對到 note-off 之後的結果），由 collectNotes() 產生。
  * @typedef {object} MidiNote
  * @property {string} partId  所屬 part（MuseScore 的一個樂器）
- * @property {string} voiceId  所屬 voice（一個譜表 × 一個樂器 channel）
+ * @property {string} staffId  所屬 staff（一個譜表 × 一個樂器 channel）
  * @property {number} trackIndex
  * @property {number} channel  絕對 channel：軌內 channel 加上 port 偏移（依 port 第一次出現的順序 +16，跟官方 SpessaSynth 一致）
- * @property {number} note  音高 0~127
+ * @property {number} midiNote  音高 0~127
  * @property {number} velocity  note-on 的力度
  * @property {number} startTick
  * @property {number} endTick
@@ -1100,8 +1138,8 @@ function validateStructuralConventions(tracks, format, warn) {
  */
 
 /**
- * 一個 voice ＝ 組內一個「有音符的 (track, channel)」：一個譜表 × 一個樂器 channel（排程單位）。
- * @typedef {object} MidiVoice
+ * 一個 staff ＝ 組內一個「有音符的 (track, channel)」：一個譜表 × 一個樂器 channel（排程單位）。
+ * @typedef {object} MidiStaff
  * @property {string} id  t{trackIndex}c{絕對 channel}
  * @property {string} partId
  * @property {number} trackIndex
@@ -1118,15 +1156,29 @@ function validateStructuralConventions(tracks, format, warn) {
  */
 
 /**
- * 一個聲部（part）＝ MuseScore 的一個樂器，可指派的單位；底下有一個以上的 voice（鋼琴兩行譜是兩個 voice）。
+ * 全曲同一個 startTick 的所有音（跨聲部、跨譜表）。
+ * @typedef {object} MidiSegment
+ * @property {number} ticks  這個 segment 的起音 tick（＝裡面每顆音的 startTick）
+ * @property {MidiNote[]} notes  依 notes 的排序（trackIndex、channel、midiNote）
+ */
+
+/**
+ * 全曲同一個 startTick 的所有音（跨聲部、跨譜表）。
+ * @typedef {object} MidiSegment
+ * @property {number} ticks  這個 segment 的起音 tick（＝裡面每顆音的 startTick）
+ * @property {MidiNote[]} notes  維持 notes 的排序（trackIndex、channel、midiNote）
+ */
+
+/**
+ * 一個聲部（part）＝ MuseScore 的一個樂器，可指派的單位；底下有一個以上的 staff（鋼琴兩行譜是兩個 staff）。
  * 切分規則見 midiParser.js 的「聲部切分」說明。
  * @typedef {object} MidiPart
  * @property {string} id  p{首軌的 track 序號}
- * @property {string} name  GM 繁中音色名（取主 voice 的音色；同名依序加序號）
+ * @property {string} name  GM 繁中音色名（取主 staff 的音色；同名依序加序號）
  * @property {number} noteCount
  * @property {number} startTick
  * @property {number} endTick
- * @property {MidiVoice[]} voices
+ * @property {MidiStaff[]} staves
  */
 
 /**
@@ -1135,16 +1187,20 @@ function validateStructuralConventions(tracks, format, warn) {
  * @property {number} format  0／1／2
  * @property {number} numTracksDeclared
  * @property {MidiDivision} division
- * @property {number|null} ticksPerQuarter  smpte 時為 null
+ * @property {number|null} timeDivision  smpte 時為 null
  * @property {MidiTrack[]} tracks
  * @property {TempoMapEntry[]} tempoMap
  * @property {TimeSignatureEntry[]} timeSignatures  保證至少一筆、且第一筆在 tick 0
  * @property {KeySignatureEntry[]} keySignatures  同上
  * @property {MidiNote[]} notes  依 startTick 排序
+ * @property {MidiSegment[]} segments  全曲的垂直切片：依 startTick 把 notes 分組（每個 startTick 一個 segment，ticks 遞增）
+ * @property {MidiSegment[]} segments  全曲的垂直切片：依 startTick 把 notes 分組（每個 startTick 一個 segment，ticks 遞增）
  * @property {MidiPart[]} parts  依首軌的 track 序號排序（＝總譜由上而下）
  * @property {number} durationTicks
  * @property {number} durationSeconds
- * @property {(tick:number) => number} tickToSeconds  依速度表把 tick 換算成秒
+ * @property {(ticks:number) => number} midiTicksToSeconds  依速度表把 tick 換算成秒
+ * @property {(seconds:number) => number} secondsToMIDITicks  midiTicksToSeconds 的反函數（回傳值可以是小數）
+ * @property {(seconds:number) => number} secondsToMIDITicks  midiTicksToSeconds 的反函數（回傳值可以是小數）
  * @property {string[]} warnings  解析過程中發現的問題（不中斷解析）
  */
 
@@ -1211,12 +1267,12 @@ export function parseMidi(input) {
   validateStructuralConventions(tracks, format, warn);
 
   const tempoMap = buildTempoMap(tracks, division, warn);
-  const tickToSeconds = makeTickToSeconds(tempoMap, division);
+  const midiTicksToSeconds = makeMidiTicksToSeconds(tempoMap, division);
   const timeSignatures = buildSignatureList(
     tracks,
     META.TIME_SIGNATURE,
     (ev) => ({
-      tick: ev.tick,
+      ticks: ev.ticks,
       numerator: ev.numerator,
       denominator: ev.denominator,
       clocksPerClick: ev.clocksPerClick,
@@ -1227,35 +1283,37 @@ export function parseMidi(input) {
   const keySignatures = buildSignatureList(
     tracks,
     META.KEY_SIGNATURE,
-    (ev) => ({ tick: ev.tick, sharpsFlats: ev.sharpsFlats, minor: ev.minor }),
+    (ev) => ({ ticks: ev.ticks, sharpsFlats: ev.sharpsFlats, minor: ev.minor }),
     { sharpsFlats: 0, minor: false }
   );
 
-  // program 依時間軸查詢（沒有初始化區塊的 voice 用），見 buildProgramResolver() 的說明。
+  // program 依時間軸查詢（沒有初始化區塊的 staff 用），見 buildProgramResolver() 的說明。
   const programResolver = buildProgramResolver(tracks);
-  const { parts, notes } = collectPartsAndNotes(tracks, tickToSeconds, warn, programResolver);
+  const { parts, notes } = collectPartsAndNotes(tracks, midiTicksToSeconds, warn, programResolver);
   const durationTicks = tracks.reduce((max, t) => Math.max(max, t.endTick), 0);
 
   return {
     format,
     numTracksDeclared,
     division,
-    ticksPerQuarter: division.ticksPerQuarter,
+    timeDivision: division.ticksPerQuarter,
     tracks,
     tempoMap,
     timeSignatures,
     keySignatures,
     notes,
+    segments: buildSegments(notes),
     parts,
     durationTicks,
-    durationSeconds: tickToSeconds(durationTicks),
-    tickToSeconds,
+    durationSeconds: midiTicksToSeconds(durationTicks),
+    midiTicksToSeconds,
+    secondsToMIDITicks: makeSecondsToMIDITicks(tempoMap, division),
     warnings,
   };
 }
 
 /* ═══════════════════════════════════════════
-   小節格線：多人合奏共用同步用（scheduler.js）。不塞進 parseMidi() 的回傳值。
+   小節格線：不塞進 parseMidi() 的回傳值（排程器目前不用它，逐音放行只看 startTick）。
    ═══════════════════════════════════════════ */
 
 /**
@@ -1265,10 +1323,10 @@ export function parseMidi(input) {
  */
 
 /**
- * 依拍號（timeSignatures）與 ticksPerQuarter 推算全曲的小節線。拍號中途變更處強制斷一條
+ * 依拍號（timeSignatures）與 timeDivision 推算全曲的小節線。拍號中途變更處強制斷一條
  * 小節線，該段落最後一小節可能因此不是完整長度；樂曲真正結尾的最後一小節不截短，保留完整
  * 名目長度（讓演奏者仍有整小節的揮手窗口）。SMPTE division 沒有「四分音符」這個概念，
- * ticksPerQuarter 為 null，回傳空陣列——呼叫端退回沒有格線的路徑（A5，應用層限制，不是
+ * timeDivision 為 null，回傳空陣列——呼叫端退回沒有格線的路徑（A5，應用層限制，不是
  * 規格的一部分）。弱起拍（anacrusis）目前不處理，格線一律從 tick 0 起算，檔案若有弱起，
  * 所有小節線與拍位會整體平移（A1）。
  *
@@ -1301,10 +1359,10 @@ export function parseMidi(input) {
  * @returns {Measure[]}
  */
 export function buildMeasureGrid(parsed) {
-  const tpq = parsed.ticksPerQuarter;
+  const tpq = parsed.timeDivision;
   if (!tpq) return [];
   const sigs = parsed.timeSignatures; // 保證至少一筆、且第一筆在 tick 0
-  const pieceEnd = Math.max(parsed.durationTicks, sigs[sigs.length - 1].tick + 1);
+  const pieceEnd = Math.max(parsed.durationTicks, sigs[sigs.length - 1].ticks + 1);
   const warn = makeWarn(parsed.warnings);
 
   const grid = [];
@@ -1312,7 +1370,7 @@ export function buildMeasureGrid(parsed) {
   for (let i = 0; i < sigs.length; i++) {
     const sig = sigs[i];
     const isLastSection = i + 1 >= sigs.length;
-    const sectionEnd = isLastSection ? pieceEnd : sigs[i + 1].tick;
+    const sectionEnd = isLastSection ? pieceEnd : sigs[i + 1].ticks;
     let numerator = sig.numerator;
     let denominator = sig.denominator;
     // bb 非正整數（規格外的值）時退回規格最常見的 8（一個四分音符＝8 個三十二分音符，見上）。
@@ -1324,7 +1382,7 @@ export function buildMeasureGrid(parsed) {
       // 拍號無效（分子 <=0，或分母透過 2**d[1] 算出超大值把 notatedBeatTicks 除到趨近 0）：
       // 這裡的 tick 永遠不會前進，下面的 while 迴圈會原地卡死。警告後退回 4/4；連 4/4
       // 都算不出正數（denominator 本身也異常）就整段退回「一拍＝一個四分音符」。
-      warn(`拍號 ${sig.numerator}/${sig.denominator}（tick ${sig.tick}）無效，已當作 4/4 處理`);
+      warn(`拍號 ${sig.numerator}/${sig.denominator}（tick ${sig.ticks}）無效，已當作 4/4 處理`);
       numerator = 4;
       denominator = 4;
       bb = 8;
@@ -1352,8 +1410,8 @@ export function buildMeasureGrid(parsed) {
         index: grid.length,
         startTick: tick,
         endTick,
-        startSeconds: parsed.tickToSeconds(tick),
-        endSeconds: parsed.tickToSeconds(endTick),
+        startSeconds: parsed.midiTicksToSeconds(tick),
+        endSeconds: parsed.midiTicksToSeconds(endTick),
         numerator,
         denominator,
         notatedBeatTicks,
@@ -1391,8 +1449,8 @@ export function buildBeatGrid(parsed) {
         beatInMeasure: b,
         startTick,
         endTick,
-        startSeconds: parsed.tickToSeconds(startTick),
-        endSeconds: parsed.tickToSeconds(endTick),
+        startSeconds: parsed.midiTicksToSeconds(startTick),
+        endSeconds: parsed.midiTicksToSeconds(endTick),
       });
     }
   }
@@ -1431,12 +1489,12 @@ function encodeTrack(events) {
   const w = new ByteWriter();
   let previousTick = 0;
   for (const ev of events) {
-    const delta = ev.tick - previousTick;
+    const delta = ev.ticks - previousTick;
     if (delta < 0) {
-      throw new MidiParseError(`事件未依 tick 遞增排序，無法編碼（tick ${ev.tick} 出現在 ${previousTick} 之後）`);
+      throw new MidiParseError(`事件未依 tick 遞增排序，無法編碼（tick ${ev.ticks} 出現在 ${previousTick} 之後）`);
     }
     w.vlq(delta);
-    previousTick = ev.tick;
+    previousTick = ev.ticks;
     writeEvent(w, ev);
   }
   const last = events[events.length - 1];

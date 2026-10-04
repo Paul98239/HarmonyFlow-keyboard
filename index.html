@@ -53,9 +53,9 @@
   <div id="app-shell" inert>
     <!-- 頂端進度條：純視覺、跨滿攝影機外框寬度、不可互動、不顯示任何時間文字。進度是播放頭在
          原譜的第幾秒換算成比例（scheduler.getPositionSeconds() / score.durationSeconds）
-         ——沒人觸發時完全靜止、有觸發時會跳，這是拍級事件驅動的誠實呈現，不做補間動畫。用
+         ——輔助聲部停格等你時靜止、你放行新的起音組時會跟著跳，這是事件驅動的誠實呈現，不做補間動畫。用
          <progress> 而不是可互動控制項：天生唯讀、不接點擊／拖曳、不會被 Tab 聚焦。要回到開頭用
-         播放列的重播鈕；拖曳跳到任意時間點目前不做（要連動共用拍位與各聲部的接手狀態，工程量偏大）。 -->
+         播放列的重播鈕；拖曳跳到任意時間點目前不做（要連動各槽位的游標與輔助聲部的時鐘，工程量偏大）。 -->
     <progress id="topProgressBar" class="top-progress-bar" max="1" value="0" aria-label="播放進度" hidden></progress>
     <div id="top-center-stack">
       <!-- 播放 pill：四顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽，互相防呆：哪顆能按由 midiPlayer.js 的

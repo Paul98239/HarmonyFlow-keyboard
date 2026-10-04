@@ -45,8 +45,8 @@ const TAU = Math.PI * 2;
 // 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（跟 ArcDetector 門檻、ID 標籤字級
 // 同一套慣例），人離鏡頭遠近不同時偏移比例才會一致，不用固定 px。
 const CHIN_OFFSET_RATIO = 0.18;
-// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（現在 scheduler.js 是拍級
-// 事件驅動、沒有背景時鐘，停頓幾秒——例如正在對著一顆長音不動——是完全正常的演奏節奏，門檻
+// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（排程器是觸發事件驅動、
+// 停頓幾秒——例如正在對著一顆長音不動——是完全正常的演奏節奏，門檻
 // 故意放寬，不再是主要機制）；真正負責「換手」體驗的是 HAND_STILL_RADIUS／HAND_STILL_MS：
 // 鎖定的手連續待在一個小範圍內夠久就視為靜止（藏起來的手通常也是靜止的），比「多久沒觸發」
 // 更直接對應「手被藏起來但還沒觸發過」這個情境——MediaPipe 對被遮擋的手常常會猜一個信心分數
@@ -62,10 +62,10 @@ const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續�
 // let 而非 const：槽位數要跟系統控制 bar 的「現場人數」走（applyPoseCount 會用新的 maxUsers 重建）。
 let tracker = new PersonTracker({ maxUsers: CONFIG.maxUsers });
 
-// 手勢：每個鎖定槽位左右手各一個 ArcDetector（拋物線手勢 → 換音符的觸發，見
-// scheduler.js；不輸出音量）。每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號
-// （→ scheduler 的前進許可）」＋「這一幀真的在場的槽位」，經 setPerformanceStateListener
-// 註冊的回呼送給播放器（midi/midiPlayer.js）。這裡只送離散的觸發序號，播放速度由 scheduler.js 依兩次觸發的間隔估計。
+// 手勢：每個鎖定槽位左右手各一個 ArcDetector（拋物線手勢 → 換音符的觸發；不輸出音量）。
+// 每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號」＋「這一幀真的在場的槽位」，經 setPerformanceStateListener
+// 註冊的回呼送出去。目前沒有人註冊（觸發來源是鍵盤，見 keyboard.js）；接回時由 main.js 在觸發序號變動時
+// 呼叫 midiPlayer.triggerSlot()。這裡只送離散的觸發序號。
 const MP_LEFT_WRIST = 15, MP_RIGHT_WRIST = 16;
 const MP_LEFT_ELBOW = 13, MP_RIGHT_ELBOW = 14;
 const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;
@@ -81,7 +81,7 @@ const arcLastSeqBySlot = Array.from({ length: CONFIG.maxUsers },
     left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined,
     stillAnchor: null, stillSinceMs: undefined,
   }));
-// 注意：combinedSeq 刻意不在這裡歸零。scheduler.js 靠它「有沒有變」判斷有沒有新觸發，
+// 注意：combinedSeq 刻意不在這裡歸零。接收端靠它「有沒有變」判斷有沒有新觸發，
 // 歸零會讓下一次比對誤判成一次新事件、平白多彈一個音（實測發現：走出鏡頭超過 SLOT_RELEASE_MS、
 // 按重置骨架 ID、改現場人數都會呼叫到這裡）。combinedSeq 單調遞增、永不重置。
 const resetSlotDetectors = (arcSlot, lastSeq) => {
@@ -106,7 +106,7 @@ const SLOT_RELEASE_MS = 1000;
 let performanceStateListener = null;
 let lastSentState = null;
 let lastEmitMs = 0;            // 上一次真的送出的時刻（心跳用，見 emitGesturePerformanceState）
-// 必須明顯小於 midi/midiPlayer.js 的 GATE_STALE_MS(250ms)：那兩個常數是一對，改動任一邊都要一起看。
+// 接收端若有斷訊看門狗，它的門檻必須明顯大於這個心跳間隔。
 const EMIT_HEARTBEAT_MS = 100;
 
 function performanceStatesDiffer(a, b) {
@@ -124,8 +124,7 @@ function performanceStatesDiffer(a, b) {
 }
 
 // 只在 arcTriggerSeqBySlot 有意義變化時才送，免得每幀都打一次——但再久也一定會送一次（心跳），
-// 因為「沒有變化」跟「沒有訊號」是兩件事。midi/scheduler.js 用「多久沒有新的 triggerSeq」
-// 判斷要不要切成電腦代打模式；有了心跳，「還有沒有訊號」只由這裡決定，看門狗才恢復成字面意思：
+// 因為「沒有變化」跟「沒有訊號」是兩件事。有了心跳，「還有沒有訊號」只由這裡決定，接收端的看門狗才是字面意思：
 // 真的沒有幀在跑（分頁切走、迴圈停掉）。
 function emitGesturePerformanceState(state, nowMs) {
   const heartbeatDue = nowMs - lastEmitMs >= EMIT_HEARTBEAT_MS;
@@ -372,7 +371,7 @@ function updateSlotArc(arcDet, track, nowMs) {
 // 之後只認那隻手的觸發——避免另一隻閒置手被模型猜出來後在畫面上飄移、湊出假拋物線造成誤觸發
 // （實測發現的問題）。鎖定的手連續不可見、連續 HAND_LOCK_RELEASE_MS 沒有新觸發（保險絲）、
 // 或連續 HAND_STILL_MS 幾乎沒在動（主要機制，見上方常數註解），才放開讓使用者換手。
-// combinedSeq 是槽位自己的累加計數，供 midi/scheduler.js 判斷「有沒有新事件」。state
+// combinedSeq 是槽位自己的累加計數，供接收端判斷「有沒有新事件」。state
 // 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
 function combineArcTriggers(state, arc, nowMs) {
   const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, shoulderWidth } = arc;
@@ -793,7 +792,7 @@ function detachCamera(reason) {
   ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
   resetAllSlotDetectors();
   slotInactiveSinceMs.fill(0);
-  // 讓播放器立刻知道沒有人在場（改由電腦代打），不等它的斷訊看門狗。
+  // 讓接收端立刻知道沒有人在場，不等它的斷訊看門狗。
   emitGesturePerformanceState(EMPTY_PERFORMANCE_STATE, performance.now());
 }
 

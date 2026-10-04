@@ -4,7 +4,7 @@
 //  沒有測試框架，跟 test/browser/smoke-test.mjs 同一套風格：run()／assert() 是整個專案
 //  唯一的測試慣例。用法：node test/unit/midi-parser.test.mjs
 //
-//  聲部切分（Part／voice）的規則見 midiParser.js 的 groupTracks() 說明；這裡的手工檔模仿 MuseScore
+//  聲部切分（Part／staff）的規則見 midiParser.js 的 groupTracks() 說明；這裡的手工檔模仿 MuseScore
 //  匯出器的軌佈局：一個譜表一條 track，只有樂器最上行譜的 track 在 tick 0 對樂器的每個 channel 寫初始化區塊
 //  （CC121、[Bank]、Program Change、CC7、CC10、CC91、CC93）。
 // ============================================================
@@ -57,9 +57,9 @@ const notes = (ch, pitches, { start = 0, dur = 480 } = {}) => pitches.flatMap((p
   { deltaTick: dur, bytes: [0x80 | ch, p, 0] },
 ]);
 
-// ── 聲部切分：Part（MuseScore 的樂器）與 voice（一個譜表 × 一個樂器 channel）──
+// ── 聲部切分：Part（MuseScore 的樂器）與 staff（一個譜表 × 一個樂器 channel）──
 
-run('鋼琴兩行譜：下行譜沒有初始化區塊、軌名相同、同 channel → 1 個 part、2 個 voice', () => {
+run('鋼琴兩行譜：下行譜沒有初始化區塊、軌名相同、同 channel → 1 個 part、2 個 staff', () => {
   const parsed = parseMidi(midiFile([
     track([nameEv('Piano'), ...initBlock(0, 0), ...notes(0, [60, 62])]), // 上行譜
     track([nameEv('Piano'), ...notes(0, [48, 50])]),                     // 下行譜
@@ -67,22 +67,22 @@ run('鋼琴兩行譜：下行譜沒有初始化區塊、軌名相同、同 chann
   assert(parsed.parts.length === 1, `預期 1 個 part，實際 ${parsed.parts.length}：${parsed.parts.map((p) => p.name)}`);
   const part = parsed.parts[0];
   assert(part.name === '大鋼琴', `名稱應為「大鋼琴」，實際「${part.name}」`);
-  assert(part.voices.map((v) => v.id).join() === 't0c0,t1c0', `voice 應為 t0c0、t1c0，實際 ${part.voices.map((v) => v.id)}`);
-  assert(part.noteCount === 4 && part.voices.every((v) => v.noteCount === 2), `音符數：part 4、每個 voice 2，實際 ${part.noteCount}／${part.voices.map((v) => v.noteCount)}`);
+  assert(part.staves.map((v) => v.id).join() === 't0c0,t1c0', `staff 應為 t0c0、t1c0，實際 ${part.staves.map((v) => v.id)}`);
+  assert(part.noteCount === 4 && part.staves.every((v) => v.noteCount === 2), `音符數：part 4、每個 staff 2，實際 ${part.noteCount}／${part.staves.map((v) => v.noteCount)}`);
   assert(parsed.notes.every((n) => n.partId === part.id), '每顆音的 partId 都應該是這個 part');
-  assert(parsed.notes.filter((n) => n.voiceId === 't1c0').length === 2, '下行譜的音應標 voiceId t1c0');
-  assert(part.voices[1].program === 0 && part.voices[1].init?.volume === 100, '下行譜沿用上行譜（首軌）對這個 channel 的初始化');
+  assert(parsed.notes.filter((n) => n.staffId === 't1c0').length === 2, '下行譜的音應標 staffId t1c0');
+  assert(part.staves[1].program === 0 && part.staves[1].init?.volume === 100, '下行譜沿用上行譜（首軌）對這個 channel 的初始化');
 });
 
-run('弓弦樂器三個 channel（normal／pizzicato／tremolo）：只有 normal 有音符 → 1 個 voice；pizzicato 也有音 → 2 個 voice', () => {
+run('弓弦樂器三個 channel（normal／pizzicato／tremolo）：只有 normal 有音符 → 1 個 staff；pizzicato 也有音 → 2 個 staff', () => {
   const init = [...initBlock(0, 40), ...initBlock(1, 45), ...initBlock(2, 44)];
   const onlyNormal = parseMidi(midiFile([track([nameEv('Violin'), ...init, ...notes(0, [67])])]));
-  assert(onlyNormal.parts.length === 1 && onlyNormal.parts[0].voices.length === 1, `只有 ch0 有音：預期 1 part 1 voice，實際 ${onlyNormal.parts.length}／${onlyNormal.parts[0]?.voices.length}`);
+  assert(onlyNormal.parts.length === 1 && onlyNormal.parts[0].staves.length === 1, `只有 ch0 有音：預期 1 part 1 staff，實際 ${onlyNormal.parts.length}／${onlyNormal.parts[0]?.staves.length}`);
   const withPizz = parseMidi(midiFile([track([nameEv('Violin'), ...init, ...notes(0, [67, 69]), ...notes(1, [71])])]));
   const part = withPizz.parts[0];
-  assert(withPizz.parts.length === 1 && part.voices.length === 2, `pizzicato 有音：預期 1 part 2 voice，實際 ${withPizz.parts.length}／${part.voices.length}`);
-  assert(part.voices.map((v) => v.program).join() === '40,45', `兩個 voice 的音色應為 40、45，實際 ${part.voices.map((v) => v.program)}`);
-  assert(part.name === '小提琴', `part 名稱取主 voice（音符最多）的音色：預期「小提琴」，實際「${part.name}」`);
+  assert(withPizz.parts.length === 1 && part.staves.length === 2, `pizzicato 有音：預期 1 part 2 staff，實際 ${withPizz.parts.length}／${part.staves.length}`);
+  assert(part.staves.map((v) => v.program).join() === '40,45', `兩個 staff 的音色應為 40、45，實際 ${part.staves.map((v) => v.program)}`);
+  assert(part.name === '小提琴', `part 名稱取主 staff（音符最多）的音色：預期「小提琴」，實際「${part.name}」`);
 });
 
 run('兩個小提琴 Part（各自有初始化區塊）→ 2 個 part，命名「小提琴 1」「小提琴 2」', () => {
@@ -110,10 +110,10 @@ run('軌名是空的、沒有初始化區塊、但用的是這組沒有的 chann
   assert(parsed.parts.length === 2, `下行譜只會用上行譜已知的 channel，實際 ${parsed.parts.length} 個 part：${parsed.parts.map((p) => p.name)}`);
 });
 
-run('part 名稱取音符最多的 voice 的音色（不是第一個 voice）：pizzicato channel 音符較多就叫「撥弦弦樂」', () => {
+run('part 名稱取音符最多的 staff 的音色（不是第一個 staff）：pizzicato channel 音符較多就叫「撥弦弦樂」', () => {
   const init = [...initBlock(0, 40), ...initBlock(1, 45)];
   const parsed = parseMidi(midiFile([track([nameEv('Violin'), ...init, ...notes(0, [67]), ...notes(1, [60, 62, 64])])]));
-  assert(parsed.parts[0].voices.length === 2 && parsed.parts[0].name === '撥弦弦樂', `實際「${parsed.parts[0].name}」`);
+  assert(parsed.parts[0].staves.length === 2 && parsed.parts[0].name === '撥弦弦樂', `實際「${parsed.parts[0].name}」`);
 });
 
 run('基底名稱本身以數字結尾（弦樂合奏 1）：區分用全形括號，不疊成雙重數字', () => {
@@ -130,29 +130,29 @@ run('打擊樂器在 port 1：絕對 channel 25（port 出現順序 +16）、per
   assert(parsed.parts.length === 2, `預期 2 個 part，實際 ${parsed.parts.length}`);
   const drum = parsed.parts[1];
   assert(drum.name === '標準鼓組', `名稱應為「標準鼓組」，實際「${drum.name}」`);
-  const v = drum.voices[0];
-  assert(v.channel === 25 && v.percussionKit === true, `打擊 voice 應在絕對 channel 25 且 percussionKit，實際 ${v.channel}／${v.percussionKit}`);
+  const v = drum.staves[0];
+  assert(v.channel === 25 && v.percussionKit === true, `打擊 staff 應在絕對 channel 25 且 percussionKit，實際 ${v.channel}／${v.percussionKit}`);
   assert(parsed.notes.filter((n) => n.partId === drum.id).every((n) => n.channel === 25), '打擊 part 的音符 channel 應為 25');
   assert(parsed.notes.find((n) => n.partId === parsed.parts[0].id).channel === 0, 'port 0 的音符 channel 維持 0');
 });
 
-run('初始化區塊取出：voice.init＝{volume, pan, reverb, chorus}、program、bank', () => {
+run('初始化區塊取出：staff.init＝{volume, pan, reverb, chorus}、program、bank', () => {
   const parsed = parseMidi(midiFile([
     track([nameEv('Flute'), ...initBlock(0, 73, { vol: 90, pan: 30, rev: 20, cho: 10, bank: [0, 4] }), ...notes(0, [72])]),
   ]));
-  const v = parsed.parts[0].voices[0];
+  const v = parsed.parts[0].staves[0];
   assert(JSON.stringify(v.init) === JSON.stringify({ volume: 90, pan: 30, reverb: 20, chorus: 10 }), `init 實際 ${JSON.stringify(v.init)}`);
   assert(v.program === 73 && v.bank.msb === 0 && v.bank.lsb === 4, `program／bank 實際 ${v.program}／${JSON.stringify(v.bank)}`);
 });
 
-run('沒有初始化區塊的 voice：init 為 null；bank 沒送過就用 GM2 規格預設（旋律 121、打擊 channel 9 是 120）', () => {
+run('沒有初始化區塊的 staff：init 為 null；bank 沒送過就用 GM2 規格預設（旋律 121、打擊 channel 9 是 120）', () => {
   const parsed = parseMidi(midiFile([
     track([pc(0, 40), ...notes(0, [60])]),
     track([...notes(9, [36])]),
   ]));
-  const [melodic, drum] = parsed.parts.map((p) => p.voices[0]);
-  assert(melodic.init === null && melodic.program === 40, `旋律 voice：init 應為 null、program 40，實際 ${JSON.stringify(melodic.init)}／${melodic.program}`);
-  assert(melodic.bank.msb === 121 && melodic.bank.lsb === 0 && melodic.percussionKit === false, `旋律 voice 的預設 bank 應為 121／0，實際 ${JSON.stringify(melodic.bank)}`);
+  const [melodic, drum] = parsed.parts.map((p) => p.staves[0]);
+  assert(melodic.init === null && melodic.program === 40, `旋律 staff：init 應為 null、program 40，實際 ${JSON.stringify(melodic.init)}／${melodic.program}`);
+  assert(melodic.bank.msb === 121 && melodic.bank.lsb === 0 && melodic.percussionKit === false, `旋律 staff 的預設 bank 應為 121／0，實際 ${JSON.stringify(melodic.bank)}`);
   assert(drum.init === null && drum.bank.msb === 120 && drum.percussionKit === true, `channel 9 的預設 bank 應為 120（打擊），實際 ${JSON.stringify(drum.bank)}／${drum.percussionKit}`);
 });
 
@@ -166,7 +166,7 @@ run('Meta 軌佈局：不含音符的第一軌被忽略，不成為 part', () =>
   assert(parsed.parts.length === 1 && parsed.parts[0].name === '雙簧管', `預期只有「雙簧管」，實際 ${parsed.parts.map((p) => p.name)}`);
 });
 
-run('〈蝸牛與黃鸝鳥〉的結構（使用者用原始 MuseScore 檔確認過）：長笛＋鋼琴（上行譜有初始化區塊、下行譜只有 Program Change）→ 2 個 part，鋼琴 2 個 voice', () => {
+run('〈蝸牛與黃鸝鳥〉的結構（使用者用原始 MuseScore 檔確認過）：長笛＋鋼琴（上行譜有初始化區塊、下行譜只有 Program Change）→ 2 個 part，鋼琴 2 個 staff', () => {
   const parsed = parseMidi(midiFile([
     track([nameEv('Metadata'), tempoEv(500000)]),                                        // 不含音符的 Meta 軌
     track([nameEv(''), ...initBlock(0, 73), ...notes(0, [76, 77])]),                     // 長笛：軌名是空的
@@ -174,7 +174,7 @@ run('〈蝸牛與黃鸝鳥〉的結構（使用者用原始 MuseScore 檔確認�
     track([nameEv('Piano'), pc(1, 0), ...notes(1, [48, 52])]),                           // 鋼琴下行譜：只有 Program Change
   ]));
   assert(parsed.parts.map((p) => p.name).join() === '長笛,大鋼琴', `應為「長笛、大鋼琴」，實際 ${parsed.parts.map((p) => p.name)}`);
-  assert(parsed.parts[1].voices.length === 2, `鋼琴應有 2 個 voice（兩個譜表），實際 ${parsed.parts[1].voices.length}`);
+  assert(parsed.parts[1].staves.length === 2, `鋼琴應有 2 個 staff（兩個譜表），實際 ${parsed.parts[1].staves.length}`);
 });
 
 run('第一個樂器軌名稱是空的、下行譜有名稱：併入同一個 part（任一方軌名為空都算相同）', () => {
@@ -201,21 +201,21 @@ run('名稱只依 program：不採信軌名、不放高低音譜／旋律伴奏�
   assert(parsed.parts[0].name === '尼龍弦吉他', `名稱只依 program，實際「${parsed.parts[0].name}」`);
 });
 
-run('canon 金標準：2 個 part（小提琴／大提琴）、各 1 個 voice、513／453 顆音、init＝100／64／0／0、零警告', () => {
+run('canon 金標準：2 個 part（小提琴／大提琴）、各 1 個 staff、513／453 顆音、init＝100／64／0／0、零警告', () => {
   const buf = readFileSync(new URL('../../src/assets/canon-violin-cello.mid', import.meta.url));
   const parsed = parseMidi(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
   assert(parsed.parts.map((p) => p.name).join() === '小提琴,大提琴', `實際 ${parsed.parts.map((p) => p.name)}`);
-  assert(parsed.parts.every((p) => p.voices.length === 1), 'canon 每個 part 只有 1 個 voice');
+  assert(parsed.parts.every((p) => p.staves.length === 1), 'canon 每個 part 只有 1 個 staff');
   assert(parsed.parts.map((p) => p.noteCount).join() === '513,453', `音符數應為 513、453，實際 ${parsed.parts.map((p) => p.noteCount)}`);
   for (const p of parsed.parts) {
-    assert(JSON.stringify(p.voices[0].init) === JSON.stringify({ volume: 100, pan: 64, reverb: 0, chorus: 0 }), `${p.name} 的 init 實際 ${JSON.stringify(p.voices[0].init)}`);
+    assert(JSON.stringify(p.staves[0].init) === JSON.stringify({ volume: 100, pan: 64, reverb: 0, chorus: 0 }), `${p.name} 的 init 實際 ${JSON.stringify(p.staves[0].init)}`);
   }
   assert(parsed.warnings.length === 0, `canon 不該有任何警告，實際 ${parsed.warnings}`);
 });
 
 // ── 資料形狀：刪掉的欄位不再出現 ──
 
-run('已刪除的欄位（clef／role／medianNote／trackName…）不再出現在 part、voice、note 上', () => {
+run('已刪除的欄位（clef／role／medianNote／trackName…）不再出現在 part、staff、note 上', () => {
   const parsed = parseMidi(midiFile([track([nameEv('Piano'), ...initBlock(0, 0), ...notes(0, [60])])]));
   const gone = ['clef', 'role', 'medianNote', 'polyphonyAvg', 'lowestNote', 'highestNote', 'programs', 'programName', 'trackName', 'instrumentName', 'isDrum'];
   for (const k of gone) assert(!(k in parsed.parts[0]), `part 不該再有 ${k}`);
@@ -234,7 +234,7 @@ run('情境 A：音符在無 PC 的軌、PC 在另一軌——依時間軸查詢
   const trackPC = track([pc(0, 40)]); // tick 0: PC 40, ch0
   const parsed = parseMidi(midiFile([trackNotes, trackPC]));
   assert(parsed.notes.length === 1, `預期 1 顆音符，實際 ${parsed.notes.length}`);
-  assert(parsed.parts[0].voices[0].program === 40, `依時間軸查詢應該是 program 40，實際 ${parsed.parts[0].voices[0].program}`);
+  assert(parsed.parts[0].staves[0].program === 40, `依時間軸查詢應該是 program 40，實際 ${parsed.parts[0].staves[0].program}`);
 });
 
 run('情境 B：同一 channel 兩次 PC，音符夾在中間', () => {
@@ -245,7 +245,7 @@ run('情境 B：同一 channel 兩次 PC，音符夾在中間', () => {
   const trackPC = track([pc(0, 40), pc(0, 41, 960)]);
   const parsed = parseMidi(midiFile([trackNotes, trackPC]));
   assert(parsed.notes.length === 1, '預期 1 顆音符');
-  assert(parsed.parts[0].voices[0].program === 40, `音符落在 PC40 之後、PC41 之前，應該是 40，實際 ${parsed.parts[0].voices[0].program}`);
+  assert(parsed.parts[0].staves[0].program === 40, `音符落在 PC40 之後、PC41 之前，應該是 40，實際 ${parsed.parts[0].staves[0].program}`);
 });
 
 run("情境 B'：自己軌自己送過 PC 時優先採用，不查全曲時間軸", () => {
@@ -257,22 +257,22 @@ run("情境 B'：自己軌自己送過 PC 時優先採用，不查全曲時間�
   const trackB = track([pc(0, 99)]); // 同 channel，不該影響 A
   const parsed = parseMidi(midiFile([trackA, trackB]));
   assert(parsed.notes.length === 1, '預期 1 顆音符');
-  assert(parsed.parts[0].voices[0].program === 5, `自己軌的 PC5 應該優先，實際 ${parsed.parts[0].voices[0].program}`);
+  assert(parsed.parts[0].staves[0].program === 5, `自己軌的 PC5 應該優先，實際 ${parsed.parts[0].staves[0].program}`);
 });
 
-run('有初始化區塊的 voice：program 只看 tick 0，之後 tick>0 的 Program Change 被忽略', () => {
+run('有初始化區塊的 staff：program 只看 tick 0，之後 tick>0 的 Program Change 被忽略', () => {
   const parsed = parseMidi(midiFile([
     track([...initBlock(0, 40), ...notes(0, [60]), pc(0, 41, 480), ...notes(0, [62])]),
   ]));
-  assert(parsed.parts.length === 1 && parsed.parts[0].voices.length === 1, `同一個 (track, channel) 只有 1 個 voice，實際 ${parsed.parts.length}／${parsed.parts[0]?.voices.length}`);
-  assert(parsed.parts[0].voices[0].program === 40, `program 應為 tick 0 的 40，實際 ${parsed.parts[0].voices[0].program}`);
+  assert(parsed.parts.length === 1 && parsed.parts[0].staves.length === 1, `同一個 (track, channel) 只有 1 個 staff，實際 ${parsed.parts.length}／${parsed.parts[0]?.staves.length}`);
+  assert(parsed.parts[0].staves[0].program === 40, `program 應為 tick 0 的 40，實際 ${parsed.parts[0].staves[0].program}`);
 });
 
-run('有初始化區塊的 voice：tick>0 的 Program Change 就算在第一顆音之前出現也被忽略', () => {
+run('有初始化區塊的 staff：tick>0 的 Program Change 就算在第一顆音之前出現也被忽略', () => {
   const parsed = parseMidi(midiFile([
     track([...initBlock(0, 40), pc(0, 41, 240), ...notes(0, [60], { start: 240 })]), // tick 240 換成 41，第一顆音在 tick 480
   ]));
-  assert(parsed.parts[0].voices[0].program === 40, `program 應為 tick 0 的 40，實際 ${parsed.parts[0].voices[0].program}`);
+  assert(parsed.parts[0].staves[0].program === 40, `program 應為 tick 0 的 40，實際 ${parsed.parts[0].staves[0].program}`);
 });
 
 // ── 時間軸與 port 的對齊（跟官方 SpessaSynth 一致；差異測試 oracle.test.mjs 另外對照）──
@@ -286,18 +286,18 @@ run('同 tick 的速度衝突：後出現者生效（跟官方一致）', () => 
   assert(Math.abs(parsed.notes[0].startSeconds - 1.5) < 1e-9, `起音應為 1.5s（後出現者生效），實際 ${parsed.notes[0].startSeconds}`);
 });
 
-run('MuseScore 的空譜表：鋼琴只有一行譜有音、另一行是空的（有初始化區塊或只有軌名），仍是一個 part、一個 voice，初始音量取首軌的', () => {
+run('MuseScore 的空譜表：鋼琴只有一行譜有音、另一行是空的（有初始化區塊或只有軌名），仍是一個 part、一個 staff，初始音量取首軌的', () => {
   const partsOf = (tracks) => parseMidi(midiFile(tracks)).parts;
-  // 上行譜只有初始化區塊（空）、下行譜有音：voice 只有下行譜那一個，音量 90 取自首軌（上行譜）的初始化區塊
+  // 上行譜只有初始化區塊（空）、下行譜有音：staff 只有下行譜那一個，音量 90 取自首軌（上行譜）的初始化區塊
   const upperEmpty = partsOf([track([nameEv('Piano'), ...initBlock(0, 0, { vol: 90 })]), track([nameEv('Piano'), ...notes(0, [48, 50, 52])])]);
-  assert(upperEmpty.length === 1 && upperEmpty[0].voices.length === 1 && upperEmpty[0].voices[0].init?.volume === 90,
-    `上行譜空、下行譜有音：1 個 part、1 個 voice、音量 90，實際 ${JSON.stringify(upperEmpty.map((p) => [p.name, p.voices.map((v) => [v.id, v.init?.volume])]))}`);
-  // 下行譜整條空軌（只有軌名）：不多出 voice，也不影響後面的長笛
+  assert(upperEmpty.length === 1 && upperEmpty[0].staves.length === 1 && upperEmpty[0].staves[0].init?.volume === 90,
+    `上行譜空、下行譜有音：1 個 part、1 個 staff、音量 90，實際 ${JSON.stringify(upperEmpty.map((p) => [p.name, p.staves.map((v) => [v.id, v.init?.volume])]))}`);
+  // 下行譜整條空軌（只有軌名）：不多出 staff，也不影響後面的長笛
   const lowerEmpty = partsOf([track([nameEv('Piano'), ...initBlock(0, 0, { vol: 90 }), ...notes(0, [72, 74])]), track([nameEv('Piano')]), track([nameEv('Flute'), ...initBlock(1, 73), ...notes(1, [80])])]);
-  assert(lowerEmpty.length === 2 && lowerEmpty[0].voices.length === 1 && lowerEmpty[1].voices.length === 1, `鋼琴（一個 voice）＋長笛，實際 ${lowerEmpty.length} 個 part`);
+  assert(lowerEmpty.length === 2 && lowerEmpty[0].staves.length === 1 && lowerEmpty[1].staves.length === 1, `鋼琴（一個 staff）＋長笛，實際 ${lowerEmpty.length} 個 part`);
   // 鋼琴兩行譜都空：整個樂器不成 part
   const bothEmpty = partsOf([track([nameEv('Piano'), ...initBlock(0, 0, { vol: 90 })]), track([nameEv('Piano')]), track([nameEv('Flute'), ...initBlock(1, 73), ...notes(1, [80])])]);
-  assert(bothEmpty.length === 1 && bothEmpty[0].voices.length === 1, `兩行譜都空的鋼琴不成 part，只剩長笛，實際 ${bothEmpty.length} 個 part`);
+  assert(bothEmpty.length === 1 && bothEmpty[0].staves.length === 1, `兩行譜都空的鋼琴不成 part，只剩長笛，實際 ${bothEmpty.length} 個 part`);
 });
 
 run('同 tick 的拍號與調號衝突：後出現者生效（跟速度表、官方一致），不重複列出同一個 tick', () => {
@@ -307,10 +307,10 @@ run('同 tick 的拍號與調號衝突：後出現者生效（跟速度表、官
     track([timeSig(4, 2), timeSig(3, 2, 480), keySig(1), { deltaTick: 480, bytes: [0x90, 60, 100] }, { deltaTick: 480, bytes: [0x80, 60, 0] }]),
     track([timeSig(6, 3, 480), keySig(2)]), // tick 480 的拍號與 tick 480 的調號都是這一軌後出現
   ]));
-  const at480 = parsed.timeSignatures.filter((t) => t.tick === 480);
+  const at480 = parsed.timeSignatures.filter((t) => t.ticks === 480);
   assert(at480.length === 1 && at480[0].numerator === 6 && at480[0].denominator === 8, `tick 480 只該有一筆 6/8（後出現者），實際 ${JSON.stringify(at480)}`);
   assert(parsed.timeSignatures.length === 2, `tick 0 與 tick 480 各一筆，實際 ${parsed.timeSignatures.length} 筆`);
-  const keys480 = parsed.keySignatures.filter((k) => k.tick === 480 || k.tick === 0);
+  const keys480 = parsed.keySignatures.filter((k) => k.ticks === 480 || k.ticks === 0);
   assert(keys480.at(-1).sharpsFlats === 2, `同 tick 的調號後出現者生效（2 個升記號），實際 ${JSON.stringify(parsed.keySignatures)}`);
 });
 
@@ -322,6 +322,69 @@ run('port 絕對 channel：依軌序第一次出現的 port 各 +16，沒有指�
   ]));
   const chOf = (name) => parsed.notes.find((n) => n.partId === parsed.parts.find((p) => p.name === name).id).channel;
   assert(chOf('大鋼琴') === 0 && chOf('小提琴') === 16 && chOf('長笛') === 1, `絕對 channel 應為 0／16／1，實際 ${chOf('大鋼琴')}／${chOf('小提琴')}／${chOf('長笛')}`);
+});
+
+run('沒有初始化區塊的 staff 查 program：只看同一個絕對 channel，不吃到別的 port 同號 channel 的 Program Change', () => {
+  const parsed = parseMidi(midiFile([
+    track([nameEv('Violin'), portEv(0), ...initBlock(0, 40), ...notes(0, [60])]), // port 0 的 channel 0＝絕對 channel 0，program 40
+    track([nameEv('Other'), portEv(1), ...notes(0, [62])]),                       // port 1 的 channel 0＝絕對 channel 16，從沒收過 Program Change
+  ]));
+  const other = parsed.parts.find((p) => p.staves[0].id === 't1c16');
+  assert(other, `應該有一個 staff 叫 t1c16，實際 ${parsed.parts.map((p) => p.staves.map((s) => s.id))}`);
+  assert(other.staves[0].program === 0, `絕對 channel 16 沒有任何 Program Change，應該是規格預設 0，實際 ${other.staves[0].program}（被 port 0 的 channel 0 汙染）`);
+  // 對照：同一個 port 內沒有自己的 Program Change 時，仍沿用同 channel 更早的 Program Change（原本的行為不變）
+  const samePort = parseMidi(midiFile([
+    track([nameEv('Violin'), portEv(0), ...initBlock(0, 40), ...notes(0, [60])]),
+    track([nameEv('Other'), portEv(0), ...notes(0, [62])]),
+  ]));
+  assert(samePort.parts.find((p) => p.staves[0].id === 't1c0').staves[0].program === 40, '同一個 port 的同號 channel 仍要沿用 program 40');
+});
+
+// ── segments：全曲的垂直切片（同一個 startTick 的所有音，跨聲部、跨譜表）──
+
+run('segments：相同 startTick 的音（跨 part、跨 staff）併成一個 segment，每顆音恰好在一個 segment，ticks 嚴格遞增', () => {
+  const parsed = parseMidi(midiFile([
+    track([nameEv('Piano'), ...initBlock(0, 0), ...notes(0, [60, 62, 64])]),        // 上行譜：tick 0、480、960
+    track([nameEv('Piano'), ...notes(0, [48, 50], { start: 0, dur: 960 })]),        // 下行譜：tick 0、960
+    track([nameEv('Flute'), ...initBlock(1, 73), ...notes(1, [72], { start: 480 })]), // 長笛：tick 480
+  ]));
+  const startTicks = [...new Set(parsed.notes.map((n) => n.startTick))].sort((a, b) => a - b);
+  assert(parsed.segments.map((s) => s.ticks).join() === startTicks.join() && startTicks.join() === '0,480,960', `segment 的 ticks 應為 0,480,960，實際 ${parsed.segments.map((s) => s.ticks)}`);
+  assert(parsed.segments.map((s) => s.notes.length).join() === '2,2,2', `tick 0＝上＋下行譜、480＝上行譜＋長笛、960＝上＋下行譜，實際 ${parsed.segments.map((s) => s.notes.length)}`);
+  const flat = parsed.segments.flatMap((s) => s.notes);
+  assert(flat.length === parsed.notes.length && new Set(flat).size === parsed.notes.length, '每顆音恰好在一個 segment（同一個物件，不是複本）');
+  assert(parsed.segments.every((s) => s.notes.every((n) => n.startTick === s.ticks)), 'segment 裡每顆音的 startTick 都等於 segment.ticks');
+  assert(parsed.segments.every((s, i) => i === 0 || s.ticks > parsed.segments[i - 1].ticks), 'segment 的 ticks 嚴格遞增');
+  assert(new Set(parsed.segments[0].notes.map((n) => n.partId)).size === 1 && new Set(parsed.segments[1].notes.map((n) => n.partId)).size === 2, 'tick 0 只有鋼琴（一個 part、兩個 staff），tick 480 有鋼琴與長笛兩個 part');
+});
+
+run('segments：沒有音符的檔案回空陣列', () => {
+  const parsed = parseMidi(midiFile([track([tempoEv(500000)])]));
+  assert(Array.isArray(parsed.segments) && parsed.segments.length === 0, `應為空陣列，實際 ${JSON.stringify(parsed.segments)}`);
+});
+
+// ── secondsToMIDITicks：midiTicksToSeconds 的反函數（分段線性，跨多次速度變化）──
+
+run('secondsToMIDITicks 與 midiTicksToSeconds 互為反函數（跨多次速度變化，含區段邊界）', () => {
+  const parsed = parseMidi(midiFile([
+    track([tempoEv(500000), tempoEv(1000000, 480), tempoEv(250000, 960), { deltaTick: 2000, bytes: [0x90, 60, 100] }, { deltaTick: 480, bytes: [0x80, 60, 0] }]),
+  ]));
+  for (const t of [0, 1, 240, 479, 480, 481, 1000, 1439, 1440, 1441, 2000, 4000, 5000]) {
+    const back = parsed.secondsToMIDITicks(parsed.midiTicksToSeconds(t));
+    assert(Math.abs(back - t) < 1e-6, `tick ${t} → 秒 → tick 應回到 ${t}，實際 ${back}`);
+  }
+  for (const s of [0, 0.25, 0.5, 0.75, 1.5, 2, 3.7]) {
+    const back = parsed.midiTicksToSeconds(parsed.secondsToMIDITicks(s));
+    assert(Math.abs(back - s) < 1e-9, `${s}s → tick → 秒 應回到 ${s}，實際 ${back}`);
+  }
+  // 手算驗證：tick 0~480 以 0.5s／四分音符 → 0.5s 在 tick 480；480~960 以 1s／四分音符 → 1.0s 在 tick 720、1.5s 在 tick 960
+  assert(Math.abs(parsed.secondsToMIDITicks(1) - 720) < 1e-9 && Math.abs(parsed.secondsToMIDITicks(1.5) - 960) < 1e-9, `1s 應為 tick 720、1.5s 應為 tick 960，實際 ${parsed.secondsToMIDITicks(1)}／${parsed.secondsToMIDITicks(1.5)}`);
+});
+
+run('secondsToMIDITicks：SMPTE division 直接乘 ticksPerSecond（速度事件不參與）', () => {
+  // division 0xE728：-25 fps、每格 40 tick → 1000 tick／秒
+  const parsed = parseMidi(midiFile([track([tempoEv(1000000), ...notes(0, [60], { dur: 500 })])], { division: 0xe728 }));
+  assert(parsed.secondsToMIDITicks(2) === 2000 && parsed.midiTicksToSeconds(parsed.secondsToMIDITicks(1.25)) === 1.25, `SMPTE 應為 1000 tick／秒，實際 ${parsed.secondsToMIDITicks(2)}`);
 });
 
 // ── running status 寬鬆讀取 ──
@@ -338,7 +401,7 @@ run('情境 C：running status 跨過 meta 事件仍能正確讀取，不再截�
   ]);
   const parsed = parseMidi(midiFile([trackNotes]));
   assert(parsed.notes.length === 2, `預期 2 顆音符（C4、D4），實際 ${parsed.notes.length}`);
-  const pitches = parsed.notes.map((n) => n.note).sort();
+  const pitches = parsed.notes.map((n) => n.midiNote).sort();
   assert(pitches[0] === 60 && pitches[1] === 62, `音高應該是 60、62，實際 ${pitches}`);
   const hasWarning = parsed.warnings.some((w) => w.includes('running status 沿用跨過了'));
   assert(hasWarning, '應該要有一則「running status 沿用跨過了 meta／SysEx」的警告');
@@ -373,7 +436,7 @@ run('鼓組非標準 program 的警告不再斷言會退回 Standard Kit', () =>
   assert(w.includes('取決於載入的 SoundFont'), `警告應該改成中性措辭：${w}`);
 });
 
-run('同一個 voice 內同音高重疊會警告（先進先出配對）', () => {
+run('同一個 staff 內同音高重疊會警告（先進先出配對）', () => {
   const parsed = parseMidi(midiFile([track([
     { deltaTick: 0, bytes: [0x90, 60, 100] },
     { deltaTick: 240, bytes: [0x90, 60, 90] },
