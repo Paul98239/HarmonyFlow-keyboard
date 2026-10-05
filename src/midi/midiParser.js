@@ -80,6 +80,8 @@ const CHANNEL_DATA_BYTES = Object.freeze({
 // 實際要用的「音符」請直接讀 parsed.notes，那裡已經把 on/off 配對好了。
 
 const DEFAULT_TEMPO_US = 500000; // 規格：沒有 FF51 時視為 120 BPM
+// 合理的 tick 上限：一般檔案遠小於這個數字（480 tpq 的 3 分鐘曲子約 8 萬 tick）；超過多半是 delta-time 損毀。只警告不拒絕。
+const MAX_PLAUSIBLE_TICK = 1e7;
 const WARNING_LIMIT = 100;
 
 // GM1 打擊樂固定使用第 10 個 MIDI channel（索引 9，不是第 10 個 track）上 program 代表的
@@ -299,6 +301,37 @@ function toBytes(input) {
   if (input instanceof ArrayBuffer) return new Uint8Array(input);
   if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
   throw new MidiParseError('parseMidi 只接受 ArrayBuffer、Uint8Array 或其他 TypedArray');
+}
+
+// 容器容錯：把輸入的位元組定位到真正的 SMF（MThd）起點，只改「怎麼讀」，不改檔案內容。
+//   · RMID：RIFF 外包裝（'RIFF' 小端 size 'RMID'，裡面的 'data' chunk 才是 SMF；SpessaSynth 也支援這種外包裝）。
+//   · 檔頭前有雜訊（例如別的程式留下的標頭）：在前 SMF_SEARCH_LIMIT bytes 內找 'MThd'。
+// 找不到就照原本的錯誤處理。
+const SMF_SEARCH_LIMIT = 4096;
+function locateSmf(bytes, warn) {
+  const tag = (off) => String.fromCharCode(bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]);
+  if (bytes.length >= 12 && tag(0) === 'RIFF') {
+    if (tag(8) !== 'RMID') throw new MidiParseError('這是 RIFF 檔但不是 RMID（Standard MIDI File 的 RIFF 外包裝），不是 MIDI');
+    const u32le = (off) => (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
+    for (let pos = 12; pos + 8 <= bytes.length;) {
+      const size = u32le(pos + 4);
+      if (tag(pos) === 'data') {
+        warn(`RMID 外包裝（RIFF），已取出裡面的 Standard MIDI File（${Math.min(size, bytes.length - pos - 8)} bytes）`);
+        return bytes.subarray(pos + 8, Math.min(bytes.length, pos + 8 + size));
+      }
+      pos += 8 + size + (size & 1); // RIFF chunk 對齊到偶數位元組
+    }
+    throw new MidiParseError('RMID 檔裡找不到 data chunk');
+  }
+  if (bytes.length < 4 || tag(0) === 'MThd') return bytes;
+  const last = Math.min(SMF_SEARCH_LIMIT, bytes.length - 4);
+  for (let i = 1; i <= last; i++) {
+    if (bytes[i] === 0x4d && bytes[i + 1] === 0x54 && bytes[i + 2] === 0x68 && bytes[i + 3] === 0x64) {
+      warn(`檔頭前有 ${i} bytes 雜訊，在 offset ${i} 找到 MThd，已略過雜訊`);
+      return bytes.subarray(i);
+    }
+  }
+  return bytes;
 }
 
 function makeWarn(list) {
@@ -723,6 +756,58 @@ function groupTracks(summaries) {
   return groups.filter((g) => g.tracks.some((t) => t.noteChannels.size > 0));
 }
 
+// 這個 channel 在這條軌裡的樂器類別：打擊（bank MSB 120；沒指定 bank 時，絕對 channel 是第 10 個）或 GM family
+// （program >> 3，每 8 個音色一組：弦樂、銅管、簧管…）。判定順序跟 buildPart() 決定 staff 音色的規則一致：首軌 tick 0 對這個
+// channel 的初始化優先（MuseScore 的下行譜沿用首軌的）；首軌沒有，才看這條軌在該 channel 第一顆音之前最後一次送的
+// Program Change／Bank Select；都沒有就當 program 0、bank 沒指定。
+function instrumentClassOf(group, summary, channel, absChannel) {
+  const fromFirst = group.first.initByChannel.get(channel);
+  let program = fromFirst?.program, msb = fromFirst?.msb;
+  if (program === undefined || msb === undefined) {
+    let ownProgram, ownMsb;
+    for (const ev of summary.track.events) {
+      if (ev.kind !== 'channel' || ev.channel !== channel) continue;
+      if (ev.type === 'noteOn' && ev.data2 > 0) break;
+      if (ev.type === 'programChange') ownProgram = ev.data1;
+      else if (ev.type === 'controlChange' && ev.data1 === CC_BANK_MSB) ownMsb = ev.data2;
+    }
+    program ??= ownProgram ?? 0;
+    msb ??= ownMsb;
+  }
+  const isDrum = msb === 120 || (msb === undefined && absChannel % 16 === DRUM_CHANNEL);
+  return isDrum ? '打擊' : `family ${program >> 3}`;
+}
+
+// 同一組 track（一個 part）裡如果有「不同樂器類別」的 channel（format 0 的多樂器檔、同軌混打擊與旋律），拆成不同的 part；
+// 同一個 GM family 的 channel（MuseScore 的 普通 40／撥奏 45／震音 44 這種演奏法 channel）維持在同一個 part。
+// part id：第一個 part 沿用 p＋首軌序號，其餘依序 p＋首軌序號＋.1、.2…（id 只是不透明的字串）。
+function splitGroupsByInstrument(groups, portOffsets, warn) {
+  const out = [];
+  for (const group of groups) {
+    const byClass = new Map(); // 樂器類別 → [{ summary, channels }]
+    for (const summary of group.tracks) {
+      const abs = portOffsets.get(summary.track.index) ?? 0;
+      for (const channel of [...summary.noteChannels].sort((a, b) => a - b)) {
+        const cls = instrumentClassOf(group, summary, channel, channel + abs);
+        if (!byClass.has(cls)) byClass.set(cls, new Map());
+        const perTrack = byClass.get(cls);
+        if (!perTrack.has(summary)) perTrack.set(summary, new Set());
+        perTrack.get(summary).add(channel);
+      }
+    }
+    if (byClass.size <= 1) { out.push(group); continue; }
+    const baseId = `p${group.first.track.index}`;
+    [...byClass.values()].forEach((perTrack, i) => {
+      out.push({
+        first: group.first, knownChannels: group.knownChannels, id: i === 0 ? baseId : `${baseId}.${i}`,
+        tracks: [...perTrack].map(([summary, channels]) => ({ ...summary, noteChannels: channels })),
+      });
+    });
+    warn(`part ${baseId}（track ${group.tracks.map((t) => t.track.index).join('、')}）含 ${byClass.size} 種不同樂器（${[...byClass.keys()].join('、')}），已拆成 ${byClass.size} 個 part`);
+  }
+  return out;
+}
+
 // 每條 track 的 channel 偏移（絕對 channel＝軌內 channel＋偏移），跟官方 SpessaSynth 一致：沒有指定 port（FF21）的 track
 // 用「最小的已指定 port」（都沒有就 0）；依軌序（只看有 channel 事件的軌）第一次出現的 port 配偏移 0、16、32…，
 // 用的是出現順序，不是 port 的數值。
@@ -845,6 +930,10 @@ function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIn
     // key = channel * 128 + 音高。同一 key 可能同時有多顆未收尾的音（同音重疊），
     // 以先進先出配對：先響的音先被關掉，這是最貼近演奏直覺的解讀。
     const pending = new Map();
+    // 沒有對應 note on 的 note off：依 channel 計數、軌處理完才各報一則。MuseScore 的樂器有多個演奏法 channel（普通、撥奏、
+    // 震音），每個音起音時會對其他演奏法的 channel 補送一個同音高的 note off（把它們切掉），一首歌可以有上千個，
+    // 逐個報警會洗版、還會撞到警告數量上限，把後面真正的警告吃掉。
+    const strayOffs = new Map(); // channel → { count, ticks, pitch }（第一個的位置，方便追查）
     for (const ev of track.events) {
       if (ev.kind !== 'channel') continue;
       if (ev.type === 'programChange') { programResolver.noteProgramChange(ev.channel, ev.data1); continue; }
@@ -873,11 +962,16 @@ function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIn
       }
       const queue = pending.get(key);
       if (!queue || !queue.length) {
-        warn(`track ${track.index} 的 tick ${ev.ticks}：channel ${ev.channel} 音高 ${ev.data1} 有 note off 卻沒有對應的 note on，已忽略`);
+        const stray = strayOffs.get(ev.channel);
+        if (stray) stray.count++;
+        else strayOffs.set(ev.channel, { count: 1, ticks: ev.ticks, pitch: ev.data1 });
         continue;
       }
       const { ev: onEv, vk } = queue.shift();
       emit(vk, track.index, onEv, ev.ticks);
+    }
+    for (const [channel, { count, ticks, pitch }] of strayOffs) {
+      warn(`track ${track.index} 的 channel ${channel}：${count} 個 note off 沒有對應的 note on，已忽略（第一個在 tick ${ticks}、音高 ${pitch}；MuseScore 匯出的樂器會對其他演奏法的 channel 補送這種 note off，通常無害）`);
     }
     for (const [key, queue] of pending) {
       for (const { ev: on, vk } of queue) {
@@ -961,10 +1055,11 @@ function nameParts(parts) {
 // 整個聲部切分：track 摘要 → 分組（part）→ 配對音符（同時算 staff 統計）→ 組成 part／staff → 命名。
 function collectPartsAndNotes(tracks, midiTicksToSeconds, warn, programResolver) {
   const portOffsets = buildPortOffsets(tracks);
-  const groups = groupTracks(tracks.map(summarizeTrack));
-  // `${trackIndex}:${軌內 channel}` → { partId, staffId, channel（絕對） }；part id ＝ p＋首軌序號，staff id ＝ t＋軌序號＋c＋絕對 channel。
+  const groups = splitGroupsByInstrument(groupTracks(tracks.map(summarizeTrack)), portOffsets, warn);
+  // `${trackIndex}:${軌內 channel}` → { partId, staffId, channel（絕對） }；part id ＝ p＋首軌序號（一組拆成多個 part 時依序加 .1、.2…），
+  // staff id ＝ t＋軌序號＋c＋絕對 channel。
   const staffIndex = new Map();
-  const partIds = new Map(groups.map((g) => [g, `p${g.first.track.index}`]));
+  const partIds = new Map(groups.map((g) => [g, g.id ?? `p${g.first.track.index}`]));
   for (const group of groups) {
     for (const summary of group.tracks) {
       for (const channel of summary.noteChannels) {
@@ -1030,18 +1125,26 @@ function validateStructuralConventions(tracks, format, warn) {
   }
   // format 1：tempo map（FF 51／FF 58）與 SMPTE Offset（FF 54）規定要放第一軌，出現在其他軌
   // RP-001 p.9 明講「沒有意義」（SMPTE Offset）或違反「tempo map 必須放第一軌」的要求。
+  // 與第一軌「完全相同」（同種類、同 tick、同內容）的不報——很多編曲軟體每條軌都抄一份拍號，照樣有效，報了只是洗版；
+  // 不同的才報，而且依種類彙整成一則（含次數與第一個的位置），不是每個事件一則。
   if (format === 1) {
+    const watched = {
+      [META.SET_TEMPO]: ['Set Tempo（FF 51）', 'RP-001 規定 format 1 的 tempo map 必須放在第一軌'],
+      [META.TIME_SIGNATURE]: ['Time Signature（FF 58）', 'RP-001 規定 format 1 的 tempo map 必須放在第一軌'],
+      [META.SMPTE_OFFSET]: ['SMPTE Offset（FF 54）', 'RP-001 明訂在 format 1 裡這個事件在其他軌沒有意義'],
+    };
+    const key = (ev) => `${ev.type}:${ev.ticks}:${[...ev.data].join(',')}`;
+    const onFirst = new Set((firstTrack?.events || []).filter((ev) => ev.kind === 'meta' && watched[ev.type]).map(key));
+    const found = new Map(); // meta 型別 → { count, trackIndex, ticks }（第一個的位置）
     for (let i = 1; i < tracks.length; i++) {
       for (const ev of tracks[i].events) {
-        if (ev.kind !== 'meta') continue;
-        if (ev.type === META.SET_TEMPO) {
-          warn(`track ${i} 的 tick ${ev.ticks}：Set Tempo（FF 51）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
-        } else if (ev.type === META.TIME_SIGNATURE) {
-          warn(`track ${i} 的 tick ${ev.ticks}：Time Signature（FF 58）出現在非第一軌（RP-001 規定 format 1 的 tempo map 必須放在第一軌）`);
-        } else if (ev.type === META.SMPTE_OFFSET) {
-          warn(`track ${i} 的 tick ${ev.ticks}：SMPTE Offset（FF 54）出現在非第一軌，RP-001 明訂在 format 1 裡這個事件在其他軌沒有意義`);
-        }
+        if (ev.kind !== 'meta' || !watched[ev.type] || onFirst.has(key(ev))) continue;
+        const f = found.get(ev.type);
+        if (f) f.count++; else found.set(ev.type, { count: 1, trackIndex: i, ticks: ev.ticks });
       }
+    }
+    for (const [type, f] of found) {
+      warn(`${watched[type][0]}出現在非第一軌 ${f.count} 次（第一個在 track ${f.trackIndex}、tick ${f.ticks}）：${watched[type][1]}`);
     }
   }
 }
@@ -1210,18 +1313,13 @@ function validateStructuralConventions(tracks, format, warn) {
  * @returns {ParsedMidi} 解析結果；解析過程中發現的問題收在 .warnings，不會中斷解析
  */
 export function parseMidi(input) {
-  const bytes = toBytes(input);
   const warnings = [];
   const warn = makeWarn(warnings);
+  const bytes = locateSmf(toBytes(input), warn);
   const reader = new ByteReader(bytes);
 
   const magic = reader.ascii(4, '檔頭 chunk 標記');
-  if (magic !== 'MThd') {
-    if (magic === 'RIFF') {
-      throw new MidiParseError('這是 RIFF 包裝的 RMID 檔，不是裸的 Standard MIDI File；請先取出其中的 MThd 區段');
-    }
-    throw new MidiParseError(`不是 Standard MIDI File：開頭應為 "MThd"，實際為 "${magic}"`);
-  }
+  if (magic !== 'MThd') throw new MidiParseError(`不是 Standard MIDI File：開頭應為 "MThd"，實際為 "${magic}"`);
 
   const headerLength = reader.u32('檔頭長度');
   if (headerLength < 6) throw new MidiParseError(`檔頭長度應至少為 6，實際為 ${headerLength}`);
@@ -1265,6 +1363,10 @@ export function parseMidi(input) {
     warn('這是 format 2 檔案：各軌是彼此獨立的樂句而非同時演奏的聲部，時間軸與聲部切分的結果未必符合預期');
   }
   validateStructuralConventions(tracks, format, warn);
+  const maxTick = tracks.reduce((m, t) => Math.max(m, t.endTick), 0);
+  if (maxTick > MAX_PLAUSIBLE_TICK) {
+    warn(`最後一個事件在 tick ${maxTick}，超過 ${MAX_PLAUSIBLE_TICK}，檔案可能已損毀（pretty_midi 同樣視為損毀）；仍照常解析`);
+  }
 
   const tempoMap = buildTempoMap(tracks, division, warn);
   const midiTicksToSeconds = makeMidiTicksToSeconds(tempoMap, division);

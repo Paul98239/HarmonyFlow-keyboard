@@ -108,6 +108,13 @@ run('軌名是空的、沒有初始化區塊、但用的是這組沒有的 chann
     track([nameEv(''), ...notes(5, [48])]),
   ]));
   assert(parsed.parts.length === 2, `下行譜只會用上行譜已知的 channel，實際 ${parsed.parts.length} 個 part：${parsed.parts.map((p) => p.name)}`);
+  // 用別的 channel、但自己送了同 GM family 的 Program Change（小提琴 40 → 41）：樂器類別相同，不會被「依樂器類別拆 part」補救，
+  // 所以只能靠「channel 要在上行譜已知的範圍內」這條擋住併組。
+  const sameFamily = parseMidi(midiFile([
+    track([nameEv('Violin'), ...initBlock(0, 40), ...notes(0, [67])]),
+    track([nameEv(''), { deltaTick: 0, bytes: [0xc5, 41] }, ...notes(5, [48])]),
+  ]));
+  assert(sameFamily.parts.length === 2, `別的 channel 不併入上一組（即使同一個 GM family），實際 ${sameFamily.parts.length} 個 part`);
 });
 
 run('part 名稱取音符最多的 staff 的音色（不是第一個 staff）：pizzicato channel 音符較多就叫「撥弦弦樂」', () => {
@@ -385,6 +392,106 @@ run('secondsToMIDITicks：SMPTE division 直接乘 ticksPerSecond（速度事件
   // division 0xE728：-25 fps、每格 40 tick → 1000 tick／秒
   const parsed = parseMidi(midiFile([track([tempoEv(1000000), ...notes(0, [60], { dur: 500 })])], { division: 0xe728 }));
   assert(parsed.secondsToMIDITicks(2) === 2000 && parsed.midiTicksToSeconds(parsed.secondsToMIDITicks(1.25)) === 1.25, `SMPTE 應為 1000 tick／秒，實際 ${parsed.secondsToMIDITicks(2)}`);
+});
+
+// ── 沒有 note on 的 note off：MuseScore 的演奏法 channel ──
+
+run('沒有對應 note on 的 note off 依「軌＋channel」彙整成一則警告（MuseScore 每個音起音時對其他演奏法 channel 補送 note off），不洗版、音符不受影響', () => {
+  // ch0 是普通演奏（有音），ch1、ch2 是同一樂器的撥奏／震音 channel：每個音起音時各補一個同音高的 note off。
+  const stray = (ch, p) => ({ deltaTick: 0, bytes: [0x80 | ch, p, 0] });
+  const events = [nameEv('Violin'), ...initBlock(0, 40), ...initBlock(1, 45), ...initBlock(2, 44)];
+  [60, 62, 64].forEach((p) => events.push({ deltaTick: 0, bytes: [0x90, p, 100] }, stray(1, p), stray(2, p), { deltaTick: 480, bytes: [0x80, p, 0] }));
+  const parsed = parseMidi(midiFile([track(events)]));
+  const warns = parsed.warnings.filter((w) => w.includes('沒有對應的 note on'));
+  assert(parsed.notes.length === 3 && parsed.parts.length === 1, `3 顆音、1 個 part 不受影響，實際 ${parsed.notes.length} 顆／${parsed.parts.length} 個 part`);
+  assert(warns.length === 2, `ch1、ch2 各一則（共 2 則），不是每個 note off 一則（6 則），實際 ${warns.length} 則：${warns}`);
+  assert(warns.every((w) => w.includes('3 個')), `每則要寫出這個 channel 有幾個，實際 ${warns}`);
+  assert(warns.some((w) => w.includes('channel 1：')) && warns.some((w) => w.includes('channel 2：')), `要分別指出是哪個 channel，實際 ${warns}`);
+  assert(warns[0].includes('tick 0') && warns[0].includes('音高 60'), `要附第一個的位置方便追查，實際 ${warns[0]}`);
+});
+
+// ── 容器容錯：RMID 外包裝、檔頭雜訊、tick 過大（只改「怎麼讀」，音符資料不動）──
+
+const u32le = (n) => [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff];
+const smfSample = () => midiFile([track([nameEv('Violin'), ...initBlock(0, 40), ...notes(0, [60, 62, 64])])]);
+
+run('RMID 外包裝（RIFF…RMID…data）：取出裡面的 Standard MIDI File，結果跟裸檔一樣，並警告', () => {
+  const smf = smfSample();
+  const pad = smf.length % 2 ? [0] : [];                                  // RIFF chunk 要對齊到偶數位元組
+  const body = [...enc.encode('RMID'), ...enc.encode('data'), ...u32le(smf.length), ...smf, ...pad];
+  const rmid = new Uint8Array([...enc.encode('RIFF'), ...u32le(body.length), ...body]);
+  const plain = parseMidi(smf), wrapped = parseMidi(rmid);
+  assert(wrapped.notes.length === 3 && JSON.stringify(wrapped.notes.map((n) => [n.midiNote, n.startTick, n.endTick])) === JSON.stringify(plain.notes.map((n) => [n.midiNote, n.startTick, n.endTick])), 'RMID 解出來的音符要跟裸檔完全一樣');
+  assert(wrapped.warnings.some((w) => w.includes('RMID')), `應該有一則提到 RMID 的警告，實際 ${wrapped.warnings}`);
+});
+
+run('RIFF 但不是 RMID（例如 WAVE）：仍然丟錯，訊息說清楚', () => {
+  const wave = new Uint8Array([...enc.encode('RIFF'), ...u32le(4), ...enc.encode('WAVE')]);
+  let err = null;
+  try { parseMidi(wave); } catch (e) { err = e; }
+  assert(err && err.name === 'MidiParseError' && err.message.includes('不是 RMID'), `應丟 MidiParseError 並說「不是 RMID」，實際 ${err?.message}`);
+});
+
+run('檔頭前有雜訊（例如別的格式的檔頭殘留）：在前 4KB 內找 MThd，略過雜訊並警告；超過 4KB 找不到就丟錯', () => {
+  const smf = smfSample();
+  const junk = Array.from({ length: 37 }, (_, i) => (i * 7) & 0x7f);
+  const parsed = parseMidi(new Uint8Array([...junk, ...smf]));
+  assert(parsed.notes.length === 3, `略過雜訊後照常解析，實際 ${parsed.notes.length} 顆音`);
+  assert(parsed.warnings.some((w) => w.includes('37') && w.includes('MThd')), `警告要寫出雜訊的位元組數與 MThd，實際 ${parsed.warnings}`);
+  let err = null;
+  try { parseMidi(new Uint8Array([...new Array(5000).fill(0x20), ...smf])); } catch (e) { err = e; }
+  assert(err && err.name === 'MidiParseError', '雜訊超過 4KB 還找不到 MThd：丟 MidiParseError');
+});
+
+run('tick 超過 1e7：警告「可能損毀」（pretty_midi 同樣視為損毀），但照常解析', () => {
+  const parsed = parseMidi(midiFile([track([nameEv('Piano'), ...initBlock(0, 0), ...notes(0, [60], { start: 20000000 })])]));
+  assert(parsed.notes.length === 1 && parsed.notes[0].startTick === 20000000, '音符照常解析');
+  assert(parsed.warnings.some((w) => w.includes('損毀')), `應該警告可能損毀，實際 ${parsed.warnings}`);
+});
+
+// ── 多 channel 的軌：依 GM family 拆 part（format 0、同軌混多樂器），MuseScore 的演奏法 channel 維持同一個 part ──
+
+run('format 0 同一條軌混多種樂器（鋼琴／小提琴／打擊，各自有 Program Change）：依 GM family 拆成 3 個 part，id 與 staff 對得上', () => {
+  const parsed = parseMidi(midiFile([track([
+    pc(0, 0), pc(1, 40), pc(9, 0),
+    ...notes(0, [60, 62]), ...notes(1, [72, 74]), ...notes(9, [36, 38]),
+  ])], { format: 0 }));
+  assert(parsed.parts.length === 3, `3 個 part，實際 ${parsed.parts.length}：${parsed.parts.map((p) => p.name)}`);
+  assert(parsed.parts.map((p) => p.name).join() === '大鋼琴,小提琴,標準鼓組', `名稱依 GM 音色，實際 ${parsed.parts.map((p) => p.name)}`);
+  assert(parsed.parts.map((p) => p.id).join() === 'p0,p0.1,p0.2', `part id 依序為 p0、p0.1、p0.2，實際 ${parsed.parts.map((p) => p.id)}`);
+  assert(parsed.parts.map((p) => p.staves.map((v) => v.id).join()).join('|') === 't0c0|t0c1|t0c9', `staff 各一個，實際 ${parsed.parts.map((p) => p.staves.map((v) => v.id))}`);
+  assert(parsed.parts[2].staves[0].percussionKit, '打擊 channel 是打擊 staff');
+  assert(parsed.notes.length === 6 && parsed.segments.reduce((a, s) => a + s.notes.length, 0) === 6, '音符一顆不少、segments 照舊涵蓋全部');
+  assert(parsed.notes.filter((n) => n.partId === 'p0.1').every((n) => n.staffId === 't0c1'), '音符的 partId 與 staffId 對應');
+  assert(parsed.warnings.some((w) => w.includes('3 個') && w.includes('part')), `要有一則說明拆成 3 個 part 的警告，實際 ${parsed.warnings}`);
+});
+
+run('MuseScore 的演奏法 channel（小提琴 40／撥奏 45／震音 44，同一個 GM family）維持同一個 part，不被誤拆', () => {
+  const parsed = parseMidi(midiFile([track([nameEv('Violin'), ...initBlock(0, 40), ...initBlock(1, 45), ...initBlock(2, 44),
+    ...notes(0, [60, 62]), ...notes(1, [64], { start: 2400 }), ...notes(2, [65], { start: 3600 })])]));
+  assert(parsed.parts.length === 1 && parsed.parts[0].staves.length === 3, `1 個 part、3 個 staff，實際 ${parsed.parts.length} 個 part`);
+  assert(!parsed.warnings.some((w) => w.includes('拆成')), '沒有拆 part 就不該有拆分的警告');
+});
+
+run('下行譜自己送了不同的 Program Change：判定樂器類別跟 staff 音色一樣以首軌為準，仍是同一個 part（〈卡門〉的下行譜曾被誤拆）', () => {
+  const parsed = parseMidi(midiFile([
+    track([nameEv('Violin'), ...initBlock(0, 40), ...notes(0, [72, 74])]),       // 上行譜：有初始化區塊，小提琴
+    track([nameEv('Violin'), pc(0, 0), ...notes(0, [60, 62])]),                  // 下行譜：只有一個 Program Change（0），沒有初始化區塊
+  ]));
+  assert(parsed.parts.length === 1 && parsed.parts[0].staves.length === 2, `仍是 1 個 part、2 個 staff，實際 ${parsed.parts.length} 個 part：${parsed.parts.map((p) => p.name)}`);
+  assert(parsed.parts[0].staves.every((v) => v.program === 40), '下行譜的 staff 沿用首軌的音色（小提琴 40）');
+});
+
+// ── 警告彙整：速度／拍號出現在非第一軌 ──
+
+run('速度／拍號出現在非第一軌：與第一軌完全相同的不報（照樣有效），不同的依種類彙整成一則', () => {
+  const timeSig = (nn, dd) => ({ deltaTick: 0, bytes: [0xff, 0x58, 4, nn, dd, 24, 8] });
+  const same = parseMidi(midiFile([track([timeSig(4, 2), tempoEv(500000)]), track([nameEv('A'), timeSig(4, 2), ...notes(0, [60])]), track([nameEv('B'), timeSig(4, 2), ...notes(1, [62])])]));
+  assert(!same.warnings.some((w) => w.includes('非第一軌')), `跟第一軌相同的拍號不該警告，實際 ${same.warnings}`);
+  const diff = parseMidi(midiFile([track([timeSig(4, 2)]), track([nameEv('A'), timeSig(3, 2), ...notes(0, [60])]), track([nameEv('B'), timeSig(3, 2), tempoEv(400000), ...notes(1, [62])]), track([nameEv('C'), tempoEv(300000), ...notes(2, [64])])]));
+  const sig = diff.warnings.filter((w) => w.includes('Time Signature') && w.includes('非第一軌')), tempo = diff.warnings.filter((w) => w.includes('Set Tempo') && w.includes('非第一軌'));
+  assert(sig.length === 1 && sig[0].includes('2 次'), `拍號 2 次彙整成 1 則，實際 ${sig}`);
+  assert(tempo.length === 1 && tempo[0].includes('2 次'), `速度 2 次彙整成 1 則，實際 ${tempo}`);
 });
 
 // ── running status 寬鬆讀取 ──
