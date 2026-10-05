@@ -139,6 +139,11 @@ export function triggerSlot(slot) {
   synth.scheduler.trigger(slot, performance.now());
 }
 
+// 量測（main.js 的 window.__stats 用）：電腦音比排好的時刻晚多少，見 scheduler.js 的 lateStats()。
+export function lateStats() {
+  return synth.scheduler.lateStats();
+}
+
 /* ═══════════════════════════════════════════
    分譜載入
    ═══════════════════════════════════════════ */
@@ -432,7 +437,7 @@ function uiTick() {
 
 // 排程 tick：交給 scheduler.tick()，由它推進播放頭、收掉到期的音（沒有指派時整首自動播放，也由它放出走到的 segment；見 scheduler.js）。
 function schedulerTick() {
-  if (synth.isLoaded() && !synth.isPaused()) synth.scheduler.tick(performance.now());
+  if (synth.isLoaded() && !synth.isPaused()) synth.scheduler.tick(performance.now(), synth.audioNow());
 }
 
 // main.js 呼叫一次；不靠 import 副作用啟動。

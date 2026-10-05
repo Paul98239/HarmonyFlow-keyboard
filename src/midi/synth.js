@@ -264,6 +264,9 @@ export async function restart() {
 export function pause() {
   scheduler.pause(); // 收掉所有正在響的音；每個聲部的播放進度都保留，下次播放從原處繼續
 }
+// AudioContext 的目前時間（秒），給排程器的 lookahead 換算時間戳用（WorkletSynthesizer 的 eventOptions.time 就是這條時鐘）。
+// AudioContext 還沒建起來或沒在跑（被瀏覽器暫停）時回傳 undefined，排程器就不提早送、不帶時間戳。
+export function audioNow() { return audioCtx?.state === 'running' ? audioCtx.currentTime : undefined; }
 export function isLoaded() { return isSongLoaded; }
 export function isPaused() { return !isSongLoaded || !scheduler.isPlaying(); }
 export function isFinished() { return isSongLoaded && scheduler.isFinished(); }

@@ -7,8 +7,8 @@
 //    3. 每個 staff 的初始狀態（bank、program、CC7／10／91／93）在該 channel 的第一個 noteOn 之前送到合成器。
 //    4. 整首自動播放（不指派）跑完：每顆解析出來的音恰好一個 noteOn、一個 noteOff，曲末沒有未釋放的音；值域合法
 //       （channel 0～63、音高 0～127、力度 1～127、CC 0～127）。
-//    5. 指派播放（腳本化觸發，每個 segment 在樂譜時間按一下，兩位演奏者輪流）跑完同樣沒有卡音，而且指派聲部（真人軌）的音
-//       只在 trigger() 呼叫內發聲（tick() 不放起音）。
+//    5. 指派播放（腳本化觸發，每個 driver segment 在樂譜時間按一下，兩位演奏者輪流）跑完同樣沒有卡音，而且指派聲部（真人軌）的音
+//       只在 trigger() 呼叫內發聲（tick() 不放起音）；沒被指派的聲部（電腦輔助）不用按，由排程器依速度放出。
 //  第 6 條（worklet 端的 channel 狀態真的等於送出去的值）要真的瀏覽器才看得到，在 test/browser/smoke-test.mjs。
 //
 //  合成器是「嚴格的假合成器」：違規時只記下來、不丟例外（排程器對合成器的呼叫包在 try／catch 裡，丟例外會被吞掉），
@@ -119,20 +119,21 @@ function autoPlay(score) {
   return env;
 }
 
-// 指派播放：每個 segment 在樂譜時間準時觸發一次（模擬完美演奏者），由被指派的演奏者輪流按，觸發到播完。
-// assignments：[partId, 槽位][]。
+// 指派播放：每個 driver segment（被指派聲部的起音）在樂譜時間準時按一次（模擬完美演奏者），由被指派的演奏者輪流按，按到播完；
+// 沒被指派的聲部不用按。被去抖擋掉的按鍵下一個 tick 再按。assignments：[partId, 槽位][]。
 function assignedPlay(score, assignments) {
   const env = setup(score, assignments);
   const slots = [...new Set(assignments.map(([, slot]) => slot))];
-  const segs = env.hp._segments;
+  const segs = env.hp._driverSegs;
   env.hp.play();
   let ms = 0, i = 0;
   env.hp.tick(ms);
   for (; ms < 600000 && !env.hp.isFinished(); ms += TICK_MS) {
     while (i < segs.length && ms >= score.midiTicksToSeconds(segs[i].ticks) * 1000) {
       env.ctx.inTrigger = true;
-      env.hp.trigger(slots[i % slots.length], ms);
+      const ok = env.hp.trigger(slots[i % slots.length], ms);
       env.ctx.inTrigger = false;
+      if (!ok) break;                                          // 被去抖擋掉：下一個 tick 再按
       i++;
     }
     env.hp.tick(ms);
@@ -214,7 +215,7 @@ run('MuseScore 形狀的手工譜：part／staff 結構與輸出 channel 配置�
    5：指派播放（腳本化觸發）
    ═══════════════════════════════════════════ */
 
-run('MuseScore 形狀的手工譜：兩位演奏者（鋼琴、弓弦）輪流在每個 segment 準時觸發，跑到播完：沒有卡音、指派聲部只在 trigger() 裡發聲', () => {
+run('MuseScore 形狀的手工譜：兩位演奏者（鋼琴、弓弦）輪流在每個 driver segment 準時觸發，跑到播完：沒有卡音、指派聲部只在 trigger() 裡發聲', () => {
   const score = museScoreShapedScore();
   const piano = score.parts.find((p) => p.name === '大鋼琴').id, violin = score.parts.find((p) => p.name === '小提琴').id;
   const { hp, assist, human, violations } = assignedPlay(score, [[piano, 1], [violin, 2]]);
@@ -226,7 +227,7 @@ run('MuseScore 形狀的手工譜：兩位演奏者（鋼琴、弓弦）輪流�
   assert(human.totalNoteOns() === score.parts.filter((p) => p.id === piano || p.id === violin).reduce((a, p) => a + p.noteCount, 0), '指派聲部（鋼琴 2 個 staff＋弓弦 2 個 staff）的音都走真人軌');
 });
 
-run('canon 樣本：兩位演奏者輪流在每個 segment 準時觸發，跑到播完：沒有卡音、沒有違規', () => {
+run('canon 樣本：兩位演奏者輪流在每個 driver segment 準時觸發，跑到播完：沒有卡音、沒有違規', () => {
   const [violin, cello] = [canonScore.parts.find((p) => p.name === '小提琴'), canonScore.parts.find((p) => p.name === '大提琴')];
   const { hp, assist, human, violations } = assignedPlay(canonScore, [[violin.id, 1], [cello.id, 2]]);
   assert(hp.isFinished(), '指派播放應該播完');

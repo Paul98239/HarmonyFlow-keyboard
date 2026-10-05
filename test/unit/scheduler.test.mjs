@@ -4,11 +4,12 @@
 //  沒有測試框架，跟 test/browser/smoke-test.mjs 同一套風格：run()／assert() 是整個專案
 //  唯一的測試慣例。假 synth 只實作 controllerChange／programChange／noteOn／noteOff，並替每個
 //  事件蓋上當下的假時間；每 12ms 呼叫一次 tick()，跟 midiPlayer.js 的排程 tick 一致。
-//  觸發（press／pressAt）直接呼叫 trigger(slot, 假時間)，不經過 tick——一個 segment 的所有音要在這次呼叫內發聲。
+//  觸發（press／pressAt）直接呼叫 trigger(slot, 假時間)，不經過 tick——driver 的音要在這次呼叫內發聲。
 //
-//  模型（見 scheduler.js 檔頭）：全曲依 startTick 分成 segment，一次觸發放行下一個 segment（你的聲部與電腦輔助的聲部
-//  一起發聲）；播放頭在兩次觸發之間以 playbackRate 前進、最多到下一個 segment 就停格，只管收音與進度。時間數字都是
-//  照模型手算的，不是跑出來再抄回去；容許誤差以一個排程 tick（12ms）為單位。
+//  模型（見 scheduler.js 檔頭）：被指派的聲部是 driver（每個起音要按一次），電腦輔助的聲部是 follower（不用按）。
+//  每次按鍵啟動它負責的那一段 [T_k, T_{k+1})：follower 的音依估到的速度排好時刻；提早按時沒放完的 follower 音照自己的
+//  時刻放完（不擠、不丟、晚的量＝你早按的量）。時間數字都是照模型手算的，不是跑出來再抄回去；容許誤差以一個排程 tick
+//  （12ms）為單位。
 //
 //  「note-on／note-off 成對」的意思是以「音」為單位：每顆音有一個起點與一個終點（原檔的終點可能是
 //  Note Off，也可能是 velocity 0 的 Note On，parser 都配成同一顆音）；排程器送給合成器的 noteOn 與
@@ -78,12 +79,6 @@ const onMs = (log, note, label) => eventMs(log, 'on', note, label);
 const offMs = (log, note, label) => eventMs(log, 'off', note, label);
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
 const count = (log, t, note) => log.filter((e) => e.t === t && (note === undefined || e.note === note)).length;
-// 按一下之後新出現的 noteOn（回傳那一次呼叫裡發聲的所有音）。
-function pressAndCollect(d, log, slot = 1) {
-  const from = log.length;
-  const ok = d.press(slot);
-  return { ok, ons: log.slice(from).filter((e) => e.t === 'on') };
-}
 
 // 手工譜共用的尾巴：4/4、一律 480 tpq、固定速度（拍長 beatSec 秒）。tick ↔ 秒是線性的，反函數也是。
 function scoreTail(notes, parts, beatSec, durationTicks) {
@@ -122,61 +117,285 @@ function buildBeatScore(spec, beatSec = 0.5) {
 const ONE_TICK_SHORT = 0.5 * 479 / 480;
 
 /* ═══════════════════════════════════════════
-   總譜觸發：一次觸發放行全曲的下一個 segment，所有聲部的音在這次呼叫內同刻發聲（0ms）
+   不變量檢查用的假合成器（壓力測試與 canon 共用）
+   排程器用 try/catch 包住每一次 synth 呼叫（音源掛掉不能拖垮排程），假 synth 裡丟的例外會被吞掉：
+   違規只記下來，每次呼叫排程器之後再檢查。
+   ═══════════════════════════════════════════ */
+function makeInvariantRig(seed) {
+  const state = {
+    hp: null, silencing: false, inTick: false, inTrigger: false, triggerTicks: null, maxSimultaneous: 0, noteOns: 0,
+    balance: new Map(), problems: [], triggerLog: [],
+  };
+  const check = (cond, msg) => { if (!cond) state.problems.push(`seed ${seed}：${msg}`); };
+  state.check = check;
+  state.flush = () => assert(!state.problems.length, state.problems[0]);
+  const staffOf = (ch, label) => [...state.hp._staves.values()].find((x) => x.channel === ch && (label === 'human') === (x.kind === 'human'));
+  state.fake = (label) => ({
+    controllerChange() {}, programChange() {},
+    noteOn: (ch, pitch, vel) => {
+      const hp = state.hp;
+      const staff = staffOf(ch, label);
+      const sounded = [...hp._sounded];
+      const note = sounded[sounded.length - 1];            // 排程器先把音記進 _sounded 再 noteOn
+      state.noteOns++;
+      check(vel >= 1, '送了 velocity 0 的 noteOn（合成器會把它當成 note-off）');
+      check(note && note.midiNote === pitch, `發聲的音高 ${pitch} 跟 _sounded 最後一顆（${note?.midiNote}）不符`);
+      if (staff.kind === 'human') {
+        check(state.inTrigger, `driver 的音（${staff.id}）不是在 trigger() 裡發聲`);
+      } else {
+        check(hp._anchoredSlice >= hp._sliceOfTick(note.startTick), `follower 音（tick ${note.startTick}）在它那一段被按鍵啟動之前就發聲了`);
+        // 不擠、不丟、不補放：每顆 follower 音都在它排好的時刻之後不超過一個排程 tick（12ms）就發聲——沒有被延後再一次放出
+        // （按鍵呼叫裡放出的，只有同 tick 的音，與上個 tick 之後剛到期的殘餘音）。
+        const entry = hp._pending.find((p) => p.note === note);
+        check(entry && hp._clockMs - entry.dueMs <= 12 + 1e-6, `follower 音（tick ${note.startTick}）比排好的時刻晚了 ${entry ? (hp._clockMs - entry.dueMs).toFixed(1) : '?'}ms 才發聲：被補放（擠在一起）`);
+      }
+      const k = `${label}/${ch}/${pitch}`;
+      state.balance.set(k, (state.balance.get(k) ?? 0) + 1);
+      state.maxSimultaneous = Math.max(state.maxSimultaneous, state.balance.get(k));
+      if (state.inTrigger) state.triggerLog.push({ label, pitch });
+    },
+    noteOff: (ch, pitch) => {
+      const hp = state.hp;
+      const staff = staffOf(ch, label);
+      const k = `${label}/${ch}/${pitch}`;
+      state.balance.set(k, (state.balance.get(k) ?? 0) - 1);
+      check(state.balance.get(k) >= 0, `${k} 沒有對應的 noteOn 就 noteOff`);
+      const e = staff.sounding.get(pitch)?.[0];
+      // 收音只有四個理由：到期（照 MIDI 音符長度）、driver 的音在下一次按鍵時 endTick ≤ 新錨點、停格超過閒置門檻、暫停／重播清場
+      if (!state.silencing && e) {
+        const due = e.offMs <= hp._clockMs + 1e-6;
+        const byPress = staff.kind === 'human' && state.inTrigger && e.endTick <= state.triggerTicks;
+        const idle = hp._stallMsAt(hp._clockMs) > 800;
+        check(due || byPress || idle, `${k} 提早收音（offMs ${e.offMs}、時鐘 ${hp._clockMs}）`);
+      }
+    },
+  });
+  return state;
+}
+
+/* ═══════════════════════════════════════════
+   只有「我的聲部」要按：按鍵啟動它負責的那一段
    ═══════════════════════════════════════════ */
 
-run('一次觸發放行全曲的下一個 segment：你的聲部與電腦輔助的聲部在 trigger() 這次呼叫內同刻發聲，放行完之後再按沒有反應', () => {
-  // p0（指派）在拍 0、2、4，a1（電腦輔助）每拍一顆：全曲 5 個 segment＝拍 0～4。音高：p0 40～42、a1 52～56。
+run('按一下放行 driver 的下一個 segment，同 tick 的電腦音同刻發聲；其餘電腦音自己依速度放，不用按', () => {
+  // p0（指派）在拍 0、2、4；a1（電腦輔助）每拍一顆。音高：p0 40～42、a1 52～56。
   const { log, d } = makeHp(buildBeatScore({ p0: [0, 2, 4], a1: [0, 1, 2, 3, 4] }), [['p0', 1]]);
-  d.tick();
-  const want = [[40, 52], [53], [41, 54], [55], [42, 56]];
-  for (let i = 0; i < want.length; i++) {
-    d.runMs(100);
-    const stamp = d.nowMs;
-    const { ok, ons } = pressAndCollect(d, log);
-    assert(ok === true, `第 ${i + 1} 次按下應該放行`);
-    assert(ons.map((e) => e.note).sort().join() === want[i].join(), `第 ${i + 1} 次按下只該放出這個 segment 的音 ${want[i]}，實際 ${ons.map((e) => e.note)}`);
-    assert(ons.every((e) => e.ms === stamp), `這個 segment 的所有音要在按下的那一刻（${stamp}ms）發聲，實際 ${ons.map((e) => `${e.note}@${e.ms}`)}`);
-    assert(ons.every((e) => e.label === (e.note < 50 ? 'human' : 'assist')), '指派聲部走 human 合成器、電腦輔助走 assist 合成器');
-  }
-  const from = log.length;
-  assert(d.press() === false && log.length === from, 'segment 都放行完了，再按不該有任何反應');
+  d.tick(); d.runMs(100);
+  const t0 = d.nowMs;
+  assert(d.press() === true, '第一下應該放行');
+  assert(onMs(log, 40, 'human') === t0 && onMs(log, 52, 'assist') === t0, `你的 40 與同 tick 的電腦音 52 要在按下的那一刻同刻發聲，實際 ${onMs(log, 40)}／${onMs(log, 52)}（按下 ${t0}）`);
+  d.runMs(1100);
+  const t1 = d.nowMs;
+  assert(near(onMs(log, 53, 'assist') - t0, 500, TICK_MS), `拍 1 的電腦音 53 沒有人按，按下後 500ms（速度 1×）自己發聲，實際 ${onMs(log, 53) - t0}ms`);
+  assert(onMs(log, 41) === undefined && onMs(log, 54) === undefined, '拍 2 是你的下一個起音：還沒按，你的 41 與同 tick 的電腦音 54 都不會越過去');
+  assert(d.press() === true, '第二下應該放行');
+  assert(onMs(log, 41, 'human') === t1 && onMs(log, 54, 'assist') === t1, '第二下：你的 41 與電腦音 54 同刻');
+  const rate = 1.0 / ((t1 - t0) / 1000);                     // 兩次按鍵：樂譜 1.0s、真實 t1−t0
+  d.runMs(1500);
+  assert(near(onMs(log, 55, 'assist') - t1, 500 / rate, TICK_MS), `拍 3 的電腦音 55 照估到的速度（${rate.toFixed(3)}×）在 ${(500 / rate).toFixed(0)}ms 後自己發聲，實際 ${onMs(log, 55) - t1}ms`);
+  d.runMs(500);
+  assert(d.press() === true && onMs(log, 42, 'human') !== undefined && onMs(log, 56, 'assist') === onMs(log, 42, 'human'), '第三下：42 與 56 同刻');
+  assert(d.press() === false, 'driver 的 segment 都放行完了，再按沒有反應');
 });
 
-run('按得再快也不跳過任何一顆音：同一毫秒連按五下，全曲每顆音依序各發聲一次', () => {
-  const { log, d } = makeHp(buildBeatScore({ p0: [0, 2, 4], a1: [0, 1, 2, 3, 4] }), [['p0', 1]]);
+run('前奏照原速播、停在你的入場點：第一次按之前電腦聲部自己播，剛好落在你入場那個 tick 的電腦音要等你按', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [4, 5], a1: [0, 1, 2, 3, 4, 5] }), [['p0', 1]]); // 你從拍 4 才入場
   d.tick();
-  for (let i = 0; i < 5; i++) assert(d.press() === true, `第 ${i + 1} 下應該放行`);
-  assert(onNotes(log).join() === '40,52,53,41,54,55,42,56', `全曲 8 顆音依 segment 順序發聲，實際 ${onNotes(log)}`);
-  assert(d.press() === false, '放行完');
-});
-
-run('和弦與多聲部同一個 tick 起音＝同一個 segment：一次觸發全部發聲，下一次才換下一個', () => {
-  const { log, d } = makeHp(buildBeatScore({
-    p0: [{ beat: 0, note: 60 }, { beat: 0, note: 64 }, { beat: 0, note: 67 }, { beat: 1, note: 72 }],
-    a1: [{ beat: 0, note: 36 }],
-  }), [['p0', 1]]);
-  d.tick(); d.runMs(50);
+  const base = d.nowMs;
+  d.runMs(3000);                                              // 完全不按
+  for (let b = 0; b < 4; b++) assert(near(onMs(log, 52 + b, 'assist') - base, b * 500, TICK_MS), `前奏第 ${b} 拍的電腦音應在 ${b * 500}ms 自己發聲，實際 ${onMs(log, 52 + b) - base}`);
+  assert(onMs(log, 56) === undefined && onNotes(log, 'human').length === 0, '拍 4（你的入場點）的電腦音 56 要等你按那一下');
+  assert(near(hp.getPositionTicks(), 1920, 1e-6), `播放頭停在你的入場點（tick 1920），實際 ${hp.getPositionTicks()}`);
   const t = d.nowMs;
-  assert(d.press() === true, '第一次按下');
-  assert(onNotes(log).sort().join() === '36,60,64,67' && [36, 60, 64, 67].every((n) => onMs(log, n) === t), `和弦三顆音與電腦輔助的低音要在同一刻發聲，實際 ${onNotes(log)}`);
-  assert(d.press() === true && onNotes(log).includes(72), '第二次按下才放出下一個 segment 的音');
+  assert(d.press() === true && onMs(log, 40, 'human') === t && onMs(log, 56, 'assist') === t, '按下：你的 40 與電腦音 56 同刻');
 });
 
-run('聲部開頭有空白小節（卡農式）：你的聲部還在休止時，按鍵照樣一顆顆推進電腦輔助聲部，輪到你時兩邊同刻', () => {
-  // p0（指派）從拍 4 才進來，a1 從拍 0 就開始：前四下只放電腦輔助的音，第五下 p0 與 a1 同刻。
+run('前奏鎖：前奏還沒播到你的入場點，按鍵不放行、不跳過前奏；前奏播完那一刻自動放行預按的第一個起音（預按只記一次）', () => {
+  // 卡農形狀：電腦聲部 a1 從拍 0 起每拍一顆（前奏拍 0~3＝2000ms），你的聲部 p0 從拍 4 才入場
   const { log, d } = makeHp(buildBeatScore({ p0: [4, 5, 6], a1: [0, 1, 2, 3, 4, 5, 6] }), [['p0', 1]]);
   d.tick();
-  for (let i = 0; i < 4; i++) {
-    const stamp = d.nowMs + 10;
-    d.runMs(10);
-    const { ok, ons } = pressAndCollect(d, log);
-    assert(ok && ons.length === 1 && ons[0].label === 'assist' && ons[0].note === 52 + i && ons[0].ms === d.nowMs && stamp <= d.nowMs, `第 ${i + 1} 下：只放出電腦輔助的第 ${i + 1} 顆音，實際 ${JSON.stringify(ons)}`);
+  const base = d.nowMs;
+  d.runMs(500);
+  assert(d.press() === false, '前奏中按鍵不放行');
+  assert(d.pressAt(base + 1200) === false && d.pressAt(base + 1700) === false, '前奏中不管按幾下都不放行（預按只是記一個旗標，不是計數）');
+  assert(onNotes(log, 'human').length === 0, `前奏中你的聲部不發聲，實際 ${onNotes(log, 'human')}`);
+  d.runMs(2200);                                              // 前奏播完（base+2000）之後再多走一點
+  for (let b = 0; b < 4; b++) {
+    assert(count(log, 'on', 52 + b) === 1, `前奏第 ${b} 拍的電腦音 ${52 + b} 要恰好發聲一次（不丟、不重複），實際 ${count(log, 'on', 52 + b)}`);
+    assert(near(onMs(log, 52 + b, 'assist') - base, b * 500, TICK_MS), `前奏第 ${b} 拍的電腦音照原速在 ${b * 500}ms 發聲，實際 ${onMs(log, 52 + b) - base}ms（按鍵不能把它挪動）`);
   }
-  assert(onNotes(log, 'human').length === 0, '你的聲部還在休止，不該有音');
-  const { ons } = pressAndCollect(d, log);
-  assert(ons.length === 2 && ons.some((e) => e.label === 'human' && e.note === 40) && ons.some((e) => e.label === 'assist' && e.note === 56) && ons[0].ms === ons[1].ms,
-    `第五下：你的第一顆音與電腦輔助的音同刻，實際 ${JSON.stringify(ons)}`);
+  assert(onMs(log, 40, 'human') !== undefined, '預按過：前奏播完，入場音 40 自動放行');
+  assert(near(onMs(log, 40, 'human') - base, 2000, TICK_MS), `入場音在前奏結束那一刻（2000ms）發聲，實際 ${onMs(log, 40, 'human') - base}ms`);
+  assert(onMs(log, 56, 'assist') === onMs(log, 40, 'human'), '入場點的電腦音 56 與你的 40 同刻');
+  assert(onMs(log, 41, 'human') === undefined, '預按只算一次：你的第二個起音 41 要等你再按');
+  d.runMs(600);
+  assert(d.press() === true && onMs(log, 41, 'human') === d.nowMs, '入場之後的按鍵照常放行、0ms');
+});
+
+run('量測：tick 放出的電腦音記下遲到量（時鐘 − 排好的時刻）；按鍵呼叫內同刻放出的不算；重設清掉', () => {
+  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 2, 4], a1: [0, 1, 2, 3, 4] }), [['p0', 1]]);
+  d.tick();
+  d.press();                                                  // 拍 0 的電腦音在這次呼叫內同刻發聲，不經過 tick
+  assert(hp.lateStats().count === 0, `按鍵呼叫內放出的電腦音不算遲到，實際 ${JSON.stringify(hp.lateStats())}`);
+  d.runMs(480);                                               // 拍 1 的電腦音（按下後 500ms）還沒到
+  d.gap(hp._pending[0].dueMs - hp._clockMs + 50);             // 下一個 tick 剛好晚了 50ms：就像主執行緒被卡住
+  let s = hp.lateStats();
+  assert(s.count === 1 && Math.abs(s.max - 50) < 0.11 && s.over30 === 1, `拍 1 的電腦音比排好的時刻晚 50ms 才被 tick 放出，實際 ${JSON.stringify(s)}`);
+  d.runMs(520);
+  d.press();
+  d.runMs(600);                                               // 拍 3 的電腦音正常 12ms 的 tick 放出：遲到小於一個 tick
+  s = hp.lateStats();
+  assert(s.count === 2 && s.p50 < TICK_MS + 0.5 && s.over30 === 1, `正常 tick 的遲到小於 12ms、個數 2，實際 ${JSON.stringify(s)}`);
+  hp.stop();
+  assert(hp.lateStats().count === 0, '重設（stop）之後清空，重新累計');
+});
+
+run('前奏鎖：沒有預按就不自動放行；預按後暫停再播放，預按作廢', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [4, 5], a1: [0, 1, 2, 3, 4, 5] }), [['p0', 1]]);
+  d.tick();
+  d.runMs(3000);
+  assert(onNotes(log, 'human').length === 0, '完全沒按：入場點到了也不自動放行，等你按');
+  const b = makeHp(buildBeatScore({ p0: [4, 5], a1: [0, 1, 2, 3, 4, 5] }), [['p0', 1]]);
+  b.d.tick(); b.d.runMs(500);
+  assert(b.d.press() === false, '前奏中預按');
+  b.hp.pause(); b.hp.play();
+  b.d.tick(); b.d.runMs(3000);
+  assert(onNotes(b.log, 'human').length === 0, `暫停再播放後預按作廢，入場音不該自動放行，實際 ${onNotes(b.log, 'human')}`);
+});
+
+run('沒有電腦聲部、你的聲部很晚才入場：什麼都不播、播放頭停在入場點', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [2, 4] }), [['p0', 1]]);
+  d.runMs(10000);
+  assert(onNotes(log).length === 0, `不該有任何音，實際 ${onNotes(log)}`);
+  assert(near(hp.getPositionTicks(), 960, 1e-6) && !hp.isFinished(), `進度停在入場點（tick 960）、不算播完，實際 ${hp.getPositionTicks()}`);
+});
+
+run('提早按：上一段沒放完的電腦音照自己的時刻繼續放完（不擠、不丟），晚的量不超過你早按的量，下一段重新對時', () => {
+  // p0 在拍 0、1；a1 在拍 0、0.25、0.5、0.75、1：前四個屬於 p0 第一個起音負責的那一段（predicted 500ms）
+  const { log, d } = makeHp(buildBeatScore({ p0: [0, 1], a1: [0, 0.25, 0.5, 0.75, 1] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  assert(d.press() === true, '第一下');
+  assert(d.pressAt(t0 + 320) === true, '第二下提早 180ms（預估 500ms、實際 320ms；去抖窗口是 300ms，所以接受）');
+  const t1 = t0 + 320;
+  d.runMs(400);
+  const ons = [52, 53, 54, 55].map((n) => onMs(log, n, 'assist'));
+  assert(ons.every((m) => m !== undefined), `四個電腦音都要發聲（不丟），實際 ${ons}`);
+  [0, 125, 250, 375].forEach((want, i) => assert(near(ons[i] - t0, want, TICK_MS), `電腦音 ${52 + i} 應在按下後 ${want}ms 發聲，實際 ${ons[i] - t0}ms`));
+  assert(ons[3] > t1 && !log.some((e) => e.t === 'on' && e.ms === t1 && e.note === 55), `第四個（due ${t0 + 375}）在第二下（${t1}）之後才自己放，不是在按下的那一刻一次放出，實際 ${ons[3]}`);
+  assert(ons.slice(1).every((m, i) => m - ons[i] >= 100), `電腦音彼此仍隔著原本的間隔（不擠在一起），實際 ${ons}`);
+  const ideal = t0 + 0.75 * (t1 - t0);                        // 第四個音（段的 75% 處）若跟著你的速度，理想時刻
+  assert(ons[3] - ideal <= 500 - (t1 - t0) + TICK_MS, `晚收尾的量（${ons[3] - ideal}ms）不超過你早按的量（${500 - (t1 - t0)}ms）`);
+  assert(onMs(log, 41, 'human') === t1 && onMs(log, 56, 'assist') === t1, '第二下那一刻：你的 41 與屬於下一段起點的電腦音 56 同刻（重新對時，沒有累積落後）');
+});
+
+run('電腦音的發聲時刻與長度依估到的速度換算：你按得比檔案快，電腦音也跟著變快、變短', () => {
+  // 兩次按鍵隔 320ms、樂譜 0.5s → 估到 1.5625×。電腦音 53 在拍 1.5（離第二個起音 0.25s）、長 0.2s：
+  // 發聲在 0.25 ÷ 1.5625 ＝ 160ms 後（不是 250ms）、長度 0.2 ÷ 1.5625 ＝ 128ms（不是 200ms）。
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2], a1: [0, { beat: 1.5, dur: 0.2 }] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 320);
+  const t1 = t0 + 320;
+  assert(near(hp.playbackRate, 1.5625, 1e-9), `速度應為 1.5625，實際 ${hp.playbackRate}`);
+  d.runMs(400);
+  assert(near(onMs(log, 53, 'assist') - t1, 160, TICK_MS), `電腦音 53 應在按下後 160ms 發聲，實際 ${onMs(log, 53) - t1}ms`);
+  assert(near(offMs(log, 53, 'assist') - onMs(log, 53, 'assist'), 128, TICK_MS), `電腦音 53 的長度應為 128ms，實際 ${offMs(log, 53) - onMs(log, 53)}ms`);
+});
+
+run('你的音在下一次按鍵時，endTick ≤ 新起音的先收：按得比預估早，也不等排好的收音時刻（先收再放）', () => {
+  // 40 長 0.45s（結尾在 tick 432，離下一個起音 tick 480 的間隙 48 > θ，不是相連音）；第一次按鍵時速度還是 1×，排好的收音時刻在 450ms 後。
+  // 第二下提早到 320ms：這時 40 已經過了它的結尾 tick，要在這一下先關掉，而不是掛到 450ms。
+  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 0.45 }, 1] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 320);
+  assert(offMs(log, 40, 'human') === t0 + 320, `40 應在第二下的那一刻收掉（${t0 + 320}），實際 ${offMs(log, 40)}`);
+  assert(onMs(log, 41, 'human') === t0 + 320, '41 在同一刻發聲');
+});
+
+run('慢按：電腦聲部放完這一段就停，不越過你的下一個起音；你停手太久（停格超過 800ms）這次間隔不拿來估速', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 4], a1: [0, 1, 2, 3, 4, 5, 6, 7] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.runMs(6000);
+  [0, 1, 2, 3].forEach((b) => assert(near(onMs(log, 52 + b, 'assist') - t0, b * 500, TICK_MS), `第 ${b} 拍的電腦音照時刻發聲`));
+  assert(onMs(log, 56) === undefined && onMs(log, 41) === undefined, '拍 4 是你的下一個起音，電腦音 56 與你的 41 都要等你按');
+  assert(near(hp.getPositionTicks(), 1920, 1e-6), `播放頭停在下一個起音（tick 1920），實際 ${hp.getPositionTicks()}`);
+  const t1 = d.nowMs;
+  assert(d.press() === true, '之後照常放行');
+  assert(hp.playbackRate === 1, `停手超過閒置門檻之後的間隔不拿來估速：速度維持 1，實際 ${hp.playbackRate}`);
+  d.runMs(600);
+  assert(near(onMs(log, 57, 'assist') - t1, 500, TICK_MS), '速度維持 1×：拍 5 的電腦音 57 在 500ms 後發聲');
+});
+
+run('停格超過閒置門檻（800ms）：還在響的長音收掉，不能無限期掛著；之後照常往下按', () => {
+  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 5 }, 1] }), [['p0', 1]]); // 長音 5s，下一個起音在 0.5s
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.runMs(1100);                                              // 0.5s 到達下一個起音停格，停格約 600ms：還沒到門檻
+  assert(count(log, 'off', 40) === 0, '停格還沒超過 800ms，長音還在響');
+  d.runMs(500);
+  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40) - t0, 500 + 800, 40), `停格超過 800ms 收掉，實際在 ${offMs(log, 40) - t0}ms`);
+  d.press();
+  assert(count(log, 'on', 41) === 1 && count(log, 'off', 40) === 1, '之後照常放行，長音不會再收第二次');
+});
+
+run('最後一個 driver 起音之後的電腦音照節奏自己放完，尾音照時值收完才算播完；進度夾在總長以內', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0], a1: [0, 1, 2, 3] }), [['p0', 1]]);
+  d.tick();
+  assert(!hp.isFinished(), '還沒按，不算播完');
+  d.press();
+  assert(!hp.isFinished(), '放行完了但電腦音還沒放完，不算播完');
+  d.runMs(6000);
+  assert([52, 53, 54, 55].every((n) => onMs(log, n, 'assist') !== undefined), '之後的電腦音都自己放出來，不用再按');
+  assert(hp.isFinished(), '全部放完、收完＝播完');
+  assert(hp.getPositionTicks() === hp._score.durationTicks, `進度夾在總長（${hp._score.durationTicks} tick），實際 ${hp.getPositionTicks()}`);
+});
+
+/* ═══════════════════════════════════════════
+   估速（最近 8 個間隔的頭尾比值）與去抖
+   ═══════════════════════════════════════════ */
+
+run('playbackRate：第一次按之前與第一次按都是 1；穩定的按鍵節奏估得出來；視窗只看最近 8 個間隔', () => {
+  const beats = Array.from({ length: 20 }, (_, i) => i);      // 每拍一個 driver 起音，樂譜間隔 0.5s
+  const { hp, d } = makeHp(buildBeatScore({ p0: beats }), [['p0', 1]]);
+  d.tick();
+  assert(hp.playbackRate === 1, '還沒按：1');
+  const t0 = d.nowMs;
+  assert(d.press() === true && hp.playbackRate === 1, '第一下沒有間隔可估，維持 1');
+  for (let k = 1; k <= 9; k++) assert(d.pressAt(t0 + k * 400) === true, `第 ${k + 1} 下（每 400ms 一下）應該被接受`);
+  assert(near(hp.playbackRate, 1.25, 1e-9), `每拍 0.5s 在 400ms 內按完＝1.25×，實際 ${hp.playbackRate}`);
+  for (let k = 1; k <= 8; k++) assert(d.pressAt(t0 + 9 * 400 + k * 800) === true, `慢下來每 800ms 一下，第 ${k} 下應該被接受`);
+  assert(near(hp.playbackRate, 0.625, 1e-9), `最近 8 個間隔都是 800ms（0.5s ÷ 0.8s）＝0.625×，更早的快節奏不再影響，實際 ${hp.playbackRate}`);
+});
+
+run('去抖：兩次按鍵太近就忽略第二次——不放行、不發聲、不更新估速；之後正常的按鍵照常放行', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  assert(d.press() === true, '第一下');
+  const before = count(log, 'on');
+  assert(d.pressAt(t0 + 30) === false && count(log, 'on') === before && hp._segIndex === 1, '30ms 後的第二下（手抖／重複觸發）被忽略：不發聲、segment 沒前進');
+  assert(d.pressAt(t0 + 500) === true && hp._segIndex === 2, '500ms 後的按鍵照常放行（那次被忽略的按鍵不影響）');
+  assert(hp.playbackRate === 1, `速度只用兩次有效按鍵（0.5s ÷ 0.5s）＝1，不受被忽略的按鍵影響，實際 ${hp.playbackRate}`);
+  const n = count(log, 'on');
+  assert(d.pressAt(t0 + 600) === false && count(log, 'on') === n, '剛放行完 100ms 內又按：忽略（窗口 ≈ 0.6 × 預估 500ms）');
+});
+
+run('去抖不會把「一開始就比檔案快」的人永遠擋住：只有第一個間隔的第二下被擋，之後都按得上，速度也學得起來', () => {
+  const beats = Array.from({ length: 14 }, (_, i) => i);
+  const { hp, d } = makeHp(buildBeatScore({ p0: beats }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  const results = [];
+  for (let k = 0; k < 14; k++) results.push(d.pressAt(t0 + k * 250));  // 每 250ms 一下＝檔案速度的 2 倍
+  assert(results.filter((r) => !r).length === 1 && results[1] === false, `只有第一個間隔的第二下（250ms 後）被擋，實際 ${results.map((r) => (r ? '✓' : '✗')).join('')}`);
+  assert(near(hp.playbackRate, 2, 1e-9), `視窗內都是 250ms 的間隔＝2×，實際 ${hp.playbackRate}`);
 });
 
 run('沒有放行的情況：沒在播放、槽位沒有指派聲部、暫停中、整首自動播放、載入空樂譜，trigger() 都回傳 false 而且不發聲', () => {
@@ -184,7 +403,7 @@ run('沒有放行的情況：沒在播放、槽位沒有指派聲部、暫停中
   const stopped = makeHp(score, [['p0', 1]], { play: false });
   assert(stopped.d.press() === false, '還沒 play()');
   const { hp, log, d } = makeHp(score, [['p0', 1]]);
-  assert(d.press(2) === false, '槽位 2 沒有指派任何聲部，沒有資格推進全曲');
+  assert(d.press(2) === false, '槽位 2 沒有指派任何聲部，沒有資格推進');
   hp.pause();
   assert(d.press() === false, '暫停中');
   const auto = makeHp(score, []);
@@ -193,7 +412,39 @@ run('沒有放行的情況：沒在播放、槽位沒有指派聲部、暫停中
   empty.load(null, []);
   empty.play();
   assert(empty.trigger(1, 0) === false, '沒有樂譜');
-  assert(onNotes(log).length === 0 && onNotes(stopped.log).length === 0 && onNotes(auto.log).length === 0, '這些情況都不該發聲');
+  assert(onNotes(log).length === 0 && onNotes(stopped.log).length === 0, '這些情況都不該發聲');
+});
+
+/* ═══════════════════════════════════════════
+   收音、相連音、零長度、先進先出
+   ═══════════════════════════════════════════ */
+
+run('音長照 MIDI 的音符長度，再依估到的速度換算成真實時間（速度 1× 時就是檔案寫的長度）', () => {
+  const dur = 0.4;                                            // 384 tick＝0.4s
+  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur }, { beat: 1, dur }, { beat: 2, dur }, { beat: 3, dur }] }), [['p0', 1]]);
+  d.tick(); const t0 = d.nowMs;
+  d.press();
+  assert(offMs(log, 40) === undefined, '剛按下，第一顆還在響');
+  d.runMs(500);
+  assert(near(offMs(log, 40) - t0, 400, TICK_MS), `第一次按之後還沒有速度可估（1×）：音照 MIDI 長度（0.4s）在 400ms 後收，實際 ${offMs(log, 40) - t0}`);
+  d.pressAt(t0 + 700);                                        // 第二下（比檔案慢：0.5s 的間隔花 700ms）
+  d.pressAt(t0 + 1400);                                       // 第三下
+  const t2 = t0 + 1400;
+  d.runMs(800);
+  const rate = 1.0 / ((t2 - t0) / 1000);                      // 兩個間隔共 1.0 樂譜秒、真實 1400ms
+  assert(near(rate, 0.714, 0.001) && near(1000 * 0.4 / rate, 560, 1), '前提：估到的速度約 0.714×，0.4s 的音真實約 560ms');
+  assert(near(offMs(log, 42) - t2, 400 / rate, TICK_MS + 2), `第三顆音（0.4s）在估到的速度 ${rate.toFixed(3)}× 下真實約 ${(400 / rate).toFixed(0)}ms 收，實際 ${offMs(log, 42) - t2}`);
+});
+
+run('同音高重疊（先進先出）：兩顆同音高的重疊音各自在自己的時刻收，不留卡音', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 1.0, note: 60 }, { beat: 1, dur: 1.0, note: 60 }] }), [['p0', 1]]);
+  d.tick(); const t0 = d.nowMs;
+  d.press(); d.pressAt(t0 + 500);                             // 準時按（速度 1×）
+  d.runMs(2500);
+  const offs = log.filter((e) => e.t === 'off' && e.note === 60).map((e) => e.ms);
+  assert(count(log, 'on', 60) === 2 && offs.length === 2, `兩個 noteOn、兩個 noteOff，實際 ${count(log, 'on', 60)}／${offs.length}`);
+  assert(near(offs[0] - t0, 1000, 30) && near(offs[1] - t0, 1500, 30), `先進先出：第一顆在樂譜 1.0s、第二顆在 1.5s 收，實際 ${offs.map((m) => m - t0)}`);
+  assert(hp.isFinished(), '全部放行、收音之後算播完');
 });
 
 run('零長度的音（起點＝終點，軌尾收尾的音）：照樣發聲、收音，每個 noteOn 一個 noteOff', () => {
@@ -204,115 +455,33 @@ run('零長度的音（起點＝終點，軌尾收尾的音）：照樣發聲、
   assert(hp.isFinished(), '放行完而且沒有音在響＝播完');
 });
 
-run('沒有 tick 換算的檔案（SMPTE division，timeDivision＝null）也能逐段觸發：不丟例外，相連音不撐', () => {
-  const smpte = { ...buildBeatScore({ p0: [{ beat: 0, dur: ONE_TICK_SHORT }, 1] }), timeDivision: null };
-  const { log, d } = makeHp(smpte, [['p0', 1]]);
-  d.tick(); d.press(); d.runMs(700);
-  assert(count(log, 'off', 40) === 1, '沒有 tick 換算就沒有相連音判斷：照檔案收音，不撐');
-  d.press();
-  assert(count(log, 'on', 41) === 1, '照常放行下一個 segment');
-});
-
-/* ═══════════════════════════════════════════
-   播放頭：兩次觸發之間只管收音與進度，永遠不自己放出起音
-   ═══════════════════════════════════════════ */
-
-run('沒有人觸發就不放出任何起音：有指派時 tick() 空跑 10 秒，電腦輔助聲部也不出聲，進度停在 0', () => {
-  // 第一個 segment 在拍 2（tick 960）：如果播放頭在沒人觸發時就開始走，10 秒內會走到 960，進度就不是 0。
-  const { hp, log, d } = makeHp(buildBeatScore({ p0: [2, 4], a1: [2, 3] }), [['p0', 1]]);
-  d.runMs(10000);
-  assert(onNotes(log).length === 0, `不該有任何音，實際 ${onNotes(log)}`);
-  assert(hp.getPositionTicks() === 0 && !hp.isFinished(), `進度停在 0、不算播完（還在等你開始），實際 ${hp.getPositionTicks()}`);
-});
-
-run('兩次觸發之間播放頭照 playbackRate 前進，最多走到下一個 segment 就停格，不會自己放起音', () => {
-  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 4] }), [['p0', 1]]); // segment：tick 0、1920
-  d.tick(); d.press();
-  assert(hp.getPositionTicks() === 0, '剛放行 segment 0，播放頭在它的 tick（0）');
-  d.runMs(1000);
-  assert(near(hp.getPositionTicks(), 960, 30), `第一次觸發後速度是 1×，1 秒＝2 拍＝960 tick，實際 ${hp.getPositionTicks()}`);
-  d.runMs(3000);
-  assert(near(hp.getPositionTicks(), 1920, 1e-6), `停格在下一個 segment（tick 1920），不會越過，實際 ${hp.getPositionTicks()}`);
-  assert(onNotes(log).join() === '40', '一直沒按，第二個 segment 的音不會自己放出來');
-});
-
-run('playbackRate 取自最近兩次觸發的間隔（樂譜秒 ÷ 真實秒），夾在 [0.25, 4]；第一次觸發前後都是 1', () => {
-  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3] }), [['p0', 1]]);
-  d.tick();
-  assert(hp.playbackRate === 1, '還沒觸發：1');
-  const t0 = d.nowMs;
-  d.press();
-  assert(hp.playbackRate === 1, '第一次觸發沒有間隔可估，維持 1');
-  d.pressAt(t0 + 250);
-  assert(near(hp.playbackRate, 2, 1e-9), `一拍（0.5s）在 0.25s 內按完＝2×，實際 ${hp.playbackRate}`);
-  d.pressAt(t0 + 250);
-  assert(hp.playbackRate === 4, `同一毫秒連按（估出趨近無限大）夾在上限 4，實際 ${hp.playbackRate}`);
-  const slow = makeHp(buildBeatScore({ p0: [0, 1] }), [['p0', 1]]);
-  slow.d.tick(); slow.d.press(); slow.d.gap(30000); slow.d.press();
-  assert(slow.hp.playbackRate === 0.25, `隔很久才按（估出趨近 0）夾在下限 0.25，實際 ${slow.hp.playbackRate}`);
-});
-
-run('你停手超過閒置門檻之後再按：那一段不當成演奏速度，playbackRate 維持原本的值', () => {
-  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2] }), [['p0', 1]]);
-  d.tick(); const t0 = d.nowMs;
-  d.press(); d.pressAt(t0 + 250);               // rate ＝ 2
-  d.runMs(3000);                                // 播放頭停在下一個 segment，停格 > 800ms
-  d.press();
-  assert(near(hp.playbackRate, 2, 1e-9), `停手 3 秒不該把速度拉到 0.25，實際 ${hp.playbackRate}`);
-});
-
-run('音長在 tick 軸上隨 playbackRate 縮放：你按快（2×），0.4s 的音真實只響 0.2s；按慢則照檔案收', () => {
-  const dur = 0.4;                               // 384 tick
-  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur }, { beat: 1, dur }, { beat: 2, dur }] }), [['p0', 1]]);
-  d.tick(); const t0 = d.nowMs;
-  d.press(); d.pressAt(t0 + 250);               // rate ＝ 2；播放頭跳到 tick 480
-  const t1 = d.nowMs;
-  assert(offMs(log, 40) === t1, '第二次按下時第一顆音（結尾 tick 384 ≤ 480）已到期：先收再放，在按下的那一刻收掉');
-  d.runMs(600);
-  assert(near(offMs(log, 41) - t1, 200, 30), `第二顆音（384 tick）在 2× 下真實約 200ms 收掉，實際 ${offMs(log, 41) - t1}ms`);
-});
-
-run('同音高重疊（先進先出）：兩顆同音高的重疊音各自在自己的 tick 收，不留卡音', () => {
-  const { hp, log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 1.0, note: 60 }, { beat: 1, dur: 1.0, note: 60 }] }), [['p0', 1]]);
-  d.tick(); const t0 = d.nowMs;
-  d.press(); d.pressAt(t0 + 500);               // 準時按（速度 1×）
-  d.runMs(2500);
-  const offs = log.filter((e) => e.t === 'off' && e.note === 60).map((e) => e.ms);
-  assert(count(log, 'on', 60) === 2 && offs.length === 2, `兩個 noteOn、兩個 noteOff，實際 ${count(log, 'on', 60)}／${offs.length}`);
-  assert(near(offs[0] - t0, 1000, 30) && near(offs[1] - t0, 1500, 30), `先進先出：第一顆在樂譜 1.0s、第二顆在 1.5s 收，實際 ${offs.map((m) => m - t0)}`);
-  assert(hp.isFinished(), '全部放行、收音之後算播完');
-});
-
-run('停格超過閒置門檻（800ms）：還在響的長音收掉，不能無限期掛著；之後照常往下按', () => {
-  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 5 }, 1] }), [['p0', 1]]); // 長音 5s，下一個 segment 在 0.5s
-  d.tick(); const t0 = d.nowMs;
-  d.press();
-  d.runMs(1100);                                 // 播放頭 0.5s 到達下一個 segment 停格，停格約 600ms：還沒到門檻
-  assert(count(log, 'off', 40) === 0, '停格還沒超過 800ms，長音還在響');
-  d.runMs(500);
-  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40) - t0, 500 + 800, 40), `停格超過 800ms 收掉，實際在 ${offMs(log, 40) - t0}ms`);
-  d.press();
-  assert(count(log, 'on', 41) === 1 && count(log, 'off', 40) === 1, '之後照常放行，長音不會再收第二次');
-});
-
-run('相連音在播放頭停格等你時撐住：後繼音放行的那一刻先關舊音再開新音，中間沒有空白（你的聲部）', () => {
-  // 第一顆音比下一拍短 1 tick（MuseScore 的相連音寫法）：播放頭走到 tick 479 它到期，但後繼音還沒放行，撐住。
+run('相連音（你的聲部）在等你按下一個起音時撐住：下一個起音放行的那一刻先關舊音再開新音，中間沒有空白', () => {
+  // 第一顆音比下一拍短 1 tick（MuseScore 的相連音寫法）：到期了但後繼音還沒放行，撐住。
   const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: ONE_TICK_SHORT }, { beat: 1, dur: 0.4 }] }), [['p0', 1]]);
   d.tick(); d.press();
-  d.runMs(700);                                  // 停格約 200ms，未超過閒置門檻
+  d.runMs(700);                                               // 停格約 200ms，未超過閒置門檻
   assert(count(log, 'off', 40) === 0, '後繼音還沒放行，相連音撐住不收');
   d.press();
   const iOff = log.findIndex((e) => e.t === 'off' && e.note === 40), iOn = log.findIndex((e) => e.t === 'on' && e.note === 41);
   assert(iOff !== -1 && iOff < iOn && log[iOff].ms === log[iOn].ms, `後繼音放行的同一刻：先關舊音、再開新音，實際 off#${iOff}@${log[iOff]?.ms} on#${iOn}@${log[iOn]?.ms}`);
 });
 
-run('相連音撐住同樣適用電腦輔助聲部：你按下一個 segment 的那一刻它才關', () => {
-  const { log, d } = makeHp(buildBeatScore({ p1: [0, 1], a0: [{ beat: 0, dur: ONE_TICK_SHORT }, { beat: 1, dur: 0.4 }] }), [['p1', 1]]);
+run('相連音撐住同樣適用電腦聲部：後繼音落在你的下一個起音那一段，要等你按下去那一刻才關', () => {
+  const { log, d } = makeHp(buildBeatScore({ a0: [{ beat: 0, dur: ONE_TICK_SHORT }, { beat: 1, dur: 0.4 }], p1: [0, 1] }), [['p1', 1]]);
   d.tick(); d.press();
   d.runMs(700);
-  assert(count(log, 'off', 52) === 0, '電腦輔助的相連音在你還沒按時撐住');
+  assert(count(log, 'off', 40) === 0, '電腦聲部的相連音（後繼音在你的下一個起音那一段）在你還沒按時撐住');
   d.press();
-  assert(offMs(log, 52, 'assist') === onMs(log, 53, 'assist') && log.findIndex((e) => e.t === 'off' && e.note === 52) < log.findIndex((e) => e.t === 'on' && e.note === 53), '你按下的那一刻先關舊音再開新音');
+  assert(offMs(log, 40, 'assist') === onMs(log, 41, 'assist') && log.findIndex((e) => e.t === 'off' && e.note === 40) < log.findIndex((e) => e.t === 'on' && e.note === 41), '你按下的那一刻先關舊音再開新音');
+});
+
+run('相連音的後繼音就在同一段裡（不用等你按）：不撐，照自己的時刻關、再開', () => {
+  // a0 的兩顆音在拍 0 與拍 0.5（相連），你的起音在拍 0 與拍 2：後繼音屬於同一段，自己會發聲
+  const { log, d } = makeHp(buildBeatScore({ a0: [{ beat: 0, dur: 239 / 960 }, { beat: 0.5, dur: 0.1 }], p1: [0, 2] }), [['p1', 1]]);   // a0 第一顆 239 tick（比下一顆早 1 tick 結束）
+  d.tick(); d.press();
+  d.runMs(400);
+  const iOff = log.findIndex((e) => e.t === 'off' && e.note === 40), iOn = log.findIndex((e) => e.t === 'on' && e.note === 41);
+  assert(iOff !== -1 && iOn !== -1 && iOff < iOn, `後繼音自己發聲，舊音先收、再開新音，實際 off#${iOff} on#${iOn}`);
 });
 
 run('相連音撐住也會被閒置收音收掉（停格超過 800ms），不能無限期掛著', () => {
@@ -324,12 +493,25 @@ run('相連音撐住也會被閒置收音收掉（停格超過 800ms），不能
 
 run('相連音遇到同音高重複：先關舊音再開新音，新音不會被連帶關掉', () => {
   const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: ONE_TICK_SHORT, note: 60 }, { beat: 1, dur: 0.4, note: 60 }] }), [['p0', 1]]);
-  d.tick(); d.press(); d.runMs(300); d.press(); d.runMs(1000);
+  d.tick(); d.press(); d.runMs(600); d.press(); d.runMs(1000);
   const seq = log.filter((e) => e.note === 60 && (e.t === 'on' || e.t === 'off')).map((e) => e.t).join();
   assert(seq === 'on,off,on,off', `應為 on,off,on,off，實際 ${seq}`);
 });
 
-run('每個 tick 的時間步長上限 100ms：分頁被節流後恢復，播放頭不會一次衝過一大段（手動、自動播放都一樣）', () => {
+run('沒有 tick 換算的檔案（SMPTE division，timeDivision＝null）也能照常按：不丟例外，相連音不撐', () => {
+  const smpte = { ...buildBeatScore({ p0: [{ beat: 0, dur: ONE_TICK_SHORT }, 1] }), timeDivision: null };
+  const { log, d } = makeHp(smpte, [['p0', 1]]);
+  d.tick(); d.press(); d.runMs(700);
+  assert(count(log, 'off', 40) === 1, '沒有 tick 換算就沒有相連音判斷：照檔案收音，不撐');
+  d.press();
+  assert(count(log, 'on', 41) === 1, '照常放行下一個 segment');
+});
+
+/* ═══════════════════════════════════════════
+   時間步長上限、暫停
+   ═══════════════════════════════════════════ */
+
+run('每個 tick 的時間步長上限 100ms：分頁被節流後恢復，不會一次衝過一大段（手動、自動播放都一樣）', () => {
   const manual = makeHp(buildBeatScore({ p0: [0, 8] }), [['p0', 1]]);
   manual.d.tick(); manual.d.press(); manual.d.tick();
   manual.d.gap(5000);
@@ -340,34 +522,26 @@ run('每個 tick 的時間步長上限 100ms：分頁被節流後恢復，播放
   assert(onNotes(auto.log).length === 1, `自動播放隔 5 秒才醒來，不會一次吐出一大段音，實際 ${onNotes(auto.log).length} 顆`);
 });
 
-run('暫停會收掉所有還在響的音（你的音、撐住的輔助音），恢復播放後不重複收，也不把暫停當成兩次觸發的間隔', () => {
-  const { hp, log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 3 }, 1], a1: [{ beat: 0, dur: ONE_TICK_SHORT }, 1] }), [['p0', 1]]);
+run('暫停收掉所有還在響的音；時鐘不計暫停的時間，恢復後排好的電腦音照剩下的時間放，也不把暫停當成兩次按鍵的間隔', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 3 }, 1], a1: [{ beat: 0, dur: 3 }, 0.5, 1] }), [['p0', 1]]);
   d.tick(); d.press(); d.runMs(100);
   const posBefore = hp.getPositionTicks();
   hp.pause();
-  assert(count(log, 'off', 40) === 1 && count(log, 'off', 52) === 1, '暫停對你的長音與撐住的輔助音各送一個 noteOff');
+  assert(count(log, 'off', 40) === 1 && count(log, 'off', 52) === 1, '暫停對你的長音與電腦的長音各送一個 noteOff');
   assert(log.some((e) => e.t === 'cc' && e.cc === 123), '另外送 CC123 當保險');
-  d.gap(5000);                                   // 暫停期間時間照樣過（tick 不處理），恢復後第一次按鍵距離上一次按鍵 5 秒
+  d.gap(5000);                                                // 暫停期間時間照樣過（tick 不處理）
   hp.play(); d.runMs(36);
   assert(count(log, 'off', 40) === 1 && count(log, 'off', 52) === 1, '恢復播放後不再重複收');
-  assert(hp.getPositionTicks() >= posBefore, '播放頭與 segment 游標都保留');
+  assert(hp.getPositionTicks() >= posBefore && hp.getPositionTicks() < posBefore + 200, `播放頭從原處繼續（不是跳過暫停的 5 秒），實際 ${posBefore} → ${hp.getPositionTicks()}`);
+  assert(onMs(log, 53, 'assist') === undefined, '拍 0.5 的電腦音（原本在按下後 250ms）還沒到時間');
+  d.runMs(400);
+  assert(count(log, 'on', 53) === 1, '暫停前排好的電腦音，恢復後照剩下的時間放出來（沒有丟）');
   d.press();
-  assert(count(log, 'on', 41) === 1 && hp.playbackRate === 1, `從原處繼續放行下一個 segment；暫停那 5 秒不拿來估速度，實際 ${hp.playbackRate}`);
-});
-
-run('放行完最後一個 segment 之後：播放頭不再受限，尾音照時值收完才算播完', () => {
-  const { hp, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 1.5 }] }), [['p0', 1]]);
-  d.tick();
-  assert(!hp.isFinished(), '還沒觸發，不算播完');
-  d.press();
-  assert(!hp.isFinished(), '放行完了但音還在響，不算播完');
-  d.runMs(6000);                                 // 播放頭不再受限，繼續走過整首的總長（8 拍＝3840 tick）
-  assert(hp.isFinished(), '尾音收完＝播完');
-  assert(hp.getPositionTicks() === hp._score.durationTicks, `進度夾在總長（${hp._score.durationTicks} tick），實際 ${hp.getPositionTicks()}`);
+  assert(count(log, 'on', 41) === 1 && near(hp.playbackRate, 0.5 / ((100 + 36 + 400 + 0) / 1000), 0.06), `暫停那 5 秒不拿來估速（0.5s ÷ 約 0.54s），實際 ${hp.playbackRate}`);
 });
 
 /* ═══════════════════════════════════════════
-   整首自動播放（沒有指派）：播放頭 1× 連續前進，走到的 segment 自動放行
+   整首自動播放（沒有指派）：同一條路徑，沒有 driver 就沒有按鍵，電腦聲部整首自己放
    ═══════════════════════════════════════════ */
 
 run('整首自動播放（沒有指派）：每顆音在樂譜時間發聲（誤差在兩個 tick 內），每個 noteOn 一個 noteOff，跑完算播完', () => {
@@ -395,45 +569,78 @@ run('整首自動播放：每顆音照編碼收，不撐——舊音在檔案寫
 });
 
 /* ═══════════════════════════════════════════
-   canon 實際樂譜：任何按鍵速度下，上下對齊（同一個 segment 的音同刻）、不跳音、每個 noteOn 一個 noteOff
+   canon 實際樂譜＋不變量：任何按鍵速度下，每顆音恰好一次、driver 在按下當下、follower 不擠、不丟
    ═══════════════════════════════════════════ */
 
 const canonScore = parseMidi(readFileSync(CANON_PATH));
 const canonCello = canonScore.parts.find((p) => p.name === '大提琴');
 const canonViolin = canonScore.parts.find((p) => p.name === '小提琴');
 
+// 用不變量假合成器跑一首：大提琴指派（driver）、小提琴電腦輔助（follower）。每個 driver segment 由 pressTimeOf(i) 決定想按的
+// 時刻；被去抖擋掉的按鍵，每隔 40ms 再按一次（就像你發現沒聲音會再按）。
+function playCanonWith(pressTimeOf) {
+  const rig = makeInvariantRig('canon');
+  const hp = rig.hp = new Scheduler();
+  hp.setSynths(rig.fake('assist'), rig.fake('human'));
+  hp.load(canonScore, new Map([[canonCello.id, 1]]));
+  hp.play();
+  let now = 12; hp.tick(now);
+  const segs = hp._driverSegs;
+  let blocked = 0, lastMs = now;
+  for (let i = 0; i < segs.length; i++) {
+    let want = Math.max(lastMs + 1, pressTimeOf(i, segs[i]));
+    for (;;) {
+      while (now + 12 <= want) { now += 12; rig.inTick = true; hp.tick(now); rig.inTick = false; rig.flush(); }
+      now = want;
+      rig.triggerTicks = segs[i].ticks; rig.inTrigger = true;
+      const ok = hp.trigger(1, now);
+      rig.inTrigger = false; rig.flush();
+      if (ok) { lastMs = now; break; }
+      blocked++; want = now + 40;
+    }
+  }
+  while (!hp.isFinished() && now < lastMs + 120000) { now += 12; rig.inTick = true; hp.tick(now); rig.inTick = false; rig.flush(); }
+  return { hp, rig, blocked, lastMs, segs };
+}
+
 const canonStyles = [
-  { name: '準時（每個 segment 在樂譜時間按）', k: 1, jitter: 0 },
-  { name: '比原譜快 2 倍', k: 0.5, jitter: 0 },
-  { name: '比原譜慢 2 倍（常常停手超過閒置門檻）', k: 2, jitter: 0 },
-  { name: '連珠炮（快 7 倍）', k: 0.15, jitter: 0 },
-  { name: '慢 25％＋抖動', k: 1.25, jitter: 40 },
+  { name: '準時（每個 driver segment 在樂譜時間按）', at: (i, seg) => 12 + canonScore.midiTicksToSeconds(seg.ticks) * 1000 },
+  { name: '比原譜快 2 倍', at: (i, seg) => 12 + canonScore.midiTicksToSeconds(seg.ticks) * 500 },
+  { name: '比原譜慢 2 倍（常常停手超過閒置門檻）', at: (i, seg) => 12 + canonScore.midiTicksToSeconds(seg.ticks) * 2000 },
+  { name: '連珠炮（快 7 倍，很多按鍵被去抖擋掉再重按）', at: (i, seg) => 12 + canonScore.midiTicksToSeconds(seg.ticks) * 150 },
+  { name: '慢 25％＋抖動', at: (i, seg) => 12 + canonScore.midiTicksToSeconds(seg.ticks) * 1250 + ((i * 7) % 5) * 10 },
 ];
 for (const style of canonStyles) {
-  run(`canon（大提琴指派、小提琴輔助）${style.name}：每次按下的 segment 裡所有音在這次呼叫內同刻發聲，全曲每顆音恰好一次`, () => {
-    const { hp, log, d } = makeHp(canonScore, [[canonCello.id, 1]]);
-    d.tick();
-    const base = d.nowMs;
-    let prevMs = base;
-    canonScore.segments.forEach((seg, i) => {
-      const ms = Math.max(prevMs + 1, base + canonScore.midiTicksToSeconds(seg.ticks) * 1000 * style.k + ((i * 7) % 5) * (style.jitter / 4));
-      prevMs = ms;
-      d.pressAt(ms);
-      // pressAt 回傳 trigger 的結果，但這裡要看那一次呼叫放出的音：用 log 裡蓋著 ms 這個時間戳的 noteOn 數量
-      const ons = log.filter((e) => e.t === 'on' && e.ms === ms);
-      assert(ons.length === seg.notes.length, `第 ${i} 個 segment（tick ${seg.ticks}）應在按下的那一刻放出 ${seg.notes.length} 顆音，實際 ${ons.length} 顆`);
-      assert(ons.map((e) => e.note).sort().join() === seg.notes.map((n) => n.midiNote).sort().join(), `第 ${i} 個 segment 的音高不符`);
-      assert(ons.filter((e) => e.label === 'human').length === seg.notes.filter((n) => n.partId === canonCello.id).length, `第 ${i} 個 segment 裡大提琴的音要走真人合成器、小提琴的音走電腦輔助`);
-    });
-    assert(d.press() === false, '全部放行完');
-    while (!hp.isFinished() && d.nowMs < prevMs + 60000) d.tick();
-    const ons = log.filter((e) => e.t === 'on'), offs = log.filter((e) => e.t === 'off');
-    assert(ons.length === canonScore.notes.length, `每顆音恰好發聲一次：樂譜 ${canonScore.notes.length} 顆、實際 ${ons.length}`);
-    assert(offs.length === ons.length, `note-on ${ons.length} 個、note-off ${offs.length} 個：每個 note-on 都要有一個 note-off`);
-    assert(ons.every((e) => e.vel >= 1), '不能送 velocity 0 的 noteOn（合成器會把它當 note-off）');
+  run(`canon（大提琴指派、小提琴電腦輔助）${style.name}：每顆音恰好一次，driver 在按下當下發聲，follower 不擠、不丟、不在被啟動之前發聲`, () => {
+    const { hp, rig, segs } = playCanonWith(style.at);
+    rig.flush();
+    assert(segs.length > 100, `前提：大提琴有足夠多的起音（實際 ${segs.length}）`);
+    assert(hp._sounded.size === canonScore.notes.length && rig.noteOns === canonScore.notes.length, `每顆音恰好發聲一次：樂譜 ${canonScore.notes.length} 顆、實際 ${rig.noteOns}（記錄 ${hp._sounded.size}）`);
+    for (const [k, v] of rig.balance) assert(v === 0, `${k} 的 noteOn 與 noteOff 差了 ${v} 個`);
     assert(hp.isFinished(), '全部放行、收音之後算播完');
   });
 }
+
+run('前奏鎖：卡農實譜，指派小提琴（大提琴 0 秒起、小提琴 14.22 秒才入場）▶ 後馬上按，大提琴前奏完整播完、不被跳過', () => {
+  const log = [], clock = { ms: 0 };
+  const hp = new Scheduler();
+  hp.setSynths(makeFakeSynth(log, 'assist', clock), makeFakeSynth(log, 'human', clock));
+  hp.load(canonScore, new Map([[canonViolin.id, 1]]));
+  hp.play();
+  const d = makeDriver(hp, clock);
+  d.tick();
+  const base = d.nowMs;
+  const entrySec = canonScore.midiTicksToSeconds(hp._driverSegs[0].ticks);
+  const prelude = canonScore.notes.filter((n) => n.partId === canonCello.id && n.startTick < hp._driverSegs[0].ticks);
+  assert(prelude.length >= 4 && entrySec > 10, `前提：大提琴前奏有足夠多的音（${prelude.length}）、小提琴很晚才入場（${entrySec.toFixed(2)}s）`);
+  assert(d.press() === false, '▶ 後馬上按：不放行');
+  d.runMs((entrySec - 2) * 1000);
+  assert(d.press() === false && onNotes(log, 'human').length === 0, '入場前 2 秒再按一下：仍不放行');
+  d.runMs(3000);
+  const preludeOns = log.filter((e) => e.t === 'on' && e.label === 'assist' && e.ms < base + entrySec * 1000 - TICK_MS);
+  assert(preludeOns.length >= prelude.length - 1, `大提琴前奏的 ${prelude.length} 顆音（扣掉剛好在入場 tick 的）都要發聲，實際 ${preludeOns.length}`);
+  assert(onNotes(log, 'human').length > 0 && near(log.find((e) => e.label === 'human' && e.t === 'on').ms - base, entrySec * 1000, TICK_MS), '預按過：小提琴在入場點（14.22s）自動入場');
+});
 
 /* ═══════════════════════════════════════════
    重設／重播：stop() 與 restart() 共用同一個重設函式 _resetPlayback()
@@ -444,8 +651,10 @@ for (const style of canonStyles) {
 function stateSnapshot(hp) {
   const state = {};
   for (const [k, v] of Object.entries(hp)) {
-    if (k === 'cfg' || k === '_score' || k === '_staves' || k === '_segments' || k === 'unplacedStaffIds') continue;
+    if (['cfg', '_score', '_staves', '_driverSegs', '_driverTicks', '_followers', '_sliceFirst', 'unplacedStaffIds'].includes(k)) continue;
     if (typeof v === 'function' || (v && typeof v.noteOn === 'function')) continue; // 函式、合成器物件
+    if (k === '_pending') { state[k] = v.map((p) => [p.dueMs, p.note.midiNote]); continue; } // 內含 staff／note 參照，只比時刻與音高
+    if (k === '_sounded') { state[k] = v.size; continue; }
     state[k] = v;
   }
   const staves = {};
@@ -465,15 +674,15 @@ function snapshotDiffs(a, b) {
   return out;
 }
 
-// p0 指派給演奏者 1（拍 0、2、4、6 各一顆短音）、a1 不指派＝電腦輔助（每拍一顆短音）：
-// 重設要同時覆蓋「指派聲部」與「電腦輔助聲部」兩條路徑。
+// p0 指派給演奏者 1（拍 0、2、4、6 各一顆短音，樂譜間隔 1 秒）、a1 不指派＝電腦輔助（每拍一顆短音）：
+// 重設要同時覆蓋「driver」與「follower」兩條路徑。
 const twoPartScore = () => buildBeatScore({ p0: [0, 2, 4, 6], a1: [0, 1, 2, 3, 4, 5, 6, 7] });
 
 run('重設把排程器退回「剛載入」的狀態：播放中／暫停／播完三種情況，stop() 與 restart() 結果都相同', () => {
   const scenarios = {
-    播放中: (hp, d) => { d.tick(); d.press(); d.runMs(480); d.press(); d.runMs(400); },
-    暫停: (hp, d) => { d.tick(); d.press(); d.runMs(480); d.press(); d.runMs(400); hp.pause(); },
-    播完: (hp, d) => { d.tick(); for (let i = 0; i < 8; i++) d.press(); d.runMs(6000); },
+    播放中: (hp, d) => { d.tick(); d.press(); d.runMs(1000); d.press(); d.runMs(400); },
+    暫停: (hp, d) => { d.tick(); d.press(); d.runMs(1000); d.press(); d.runMs(400); hp.pause(); },
+    播完: (hp, d) => { d.tick(); for (let i = 0; i < 4; i++) { d.press(); d.runMs(1000); } d.runMs(8000); },
   };
   const resets = { 'stop()': (hp) => hp.stop(), 'restart()': (hp) => { hp.restart(); hp.pause(); } };
   for (const [sName, dirty] of Object.entries(scenarios)) {
@@ -483,7 +692,7 @@ run('重設把排程器退回「剛載入」的狀態：播放中／暫停／播
       hp.play();
       dirty(hp, d);
       const dirtied = snapshotDiffs(fresh, stateSnapshot(hp));
-      for (const k of ['_segIndex', '_ticks', '_lastSegTicks', '_started', '_lastTrigger', 'playbackRate']) {
+      for (const k of ['_segIndex', '_clockMs', '_anchoredSlice', '_history', '_lastAcceptClock', 'playbackRate']) {
         assert(dirtied.includes(k), `${sName}：前提不成立——${k} 根本沒被弄髒（只有 ${dirtied}），這個比對什麼都沒驗證`);
       }
       reset(hp);
@@ -496,6 +705,7 @@ run('重設把排程器退回「剛載入」的狀態：播放中／暫停／播
 run('restart()：整首自動播放跑完後重播，每顆音恰好再發聲一次', () => {
   const { hp, log, d } = makeHp(buildBeatScore({ a0: [0, 2, 4, 6] }), []);
   const onCount = () => log.filter((e) => e.t === 'on').length;
+  d.tick();
   while (!hp.isFinished() && d.nowMs < 10000) d.tick();
   assert(hp.isFinished(), '前提：第一輪應該播完');
   assert(onCount() === 4, `第一輪 4 顆音都要發聲，實際 ${onCount()}`);
@@ -503,21 +713,23 @@ run('restart()：整首自動播放跑完後重播，每顆音恰好再發聲一
   assert(hp.isPlaying() && !hp.isFinished(), 'restart() 之後應該在播放中、而且不是已播完');
   assert(hp.getPositionTicks() < 5, `restart() 之後進度應該回到開頭，實際 ${hp.getPositionTicks()}`);
   const before = onCount();
+  d.tick();
   while (!hp.isFinished() && d.nowMs < 20000) d.tick();
   assert(hp.isFinished(), '重播後應該再次播完');
   assert(onCount() - before === 4, `重播後 4 顆音都要再發聲一次（不多不少），實際 ${onCount() - before}`);
 });
 
-run('restart() 之後要重新觸發才會發聲：segment 游標回到第一個，不沿用重播前的紀錄', () => {
-  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 2, 4, 6] }), [['p0', 1]]);
-  d.tick(); d.press(); d.press();
+run('restart() 之後要重新按才會放行 driver：segment 游標回到第一個，前奏重新播', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [2, 4, 6], a1: [0, 1, 2, 3, 4, 5, 6] }), [['p0', 1]]);
+  d.tick(); d.runMs(1500); d.press(); d.runMs(1000); d.press();
   hp.restart();
   const from = log.length;
-  d.runMs(3000);                                     // 重播後完全不按
-  assert(!log.slice(from).some((e) => e.t === 'on'), '重播後沒按鍵，不該有任何音發聲');
-  assert(!hp.isFinished() && hp.getPositionTicks() === 0, '還沒有人觸發，不算播完，進度停在 0');
+  d.tick(); d.runMs(1200);                                    // 重播後完全不按：前奏（拍 0、1）自己播、你的聲部不發聲
+  assert(onNotes(log.slice(from), 'assist').join() === '52,53' && !log.slice(from).some((e) => e.t === 'on' && e.label === 'human'), `重播後前奏重新播（52、53），你的聲部不發聲，實際 ${onNotes(log.slice(from))}`);
+  assert(!hp.isFinished(), '還沒有按到你的聲部，不算播完');
+  d.runMs(1000);
   d.press();
-  assert(log.slice(from).filter((e) => e.t === 'on' && e.note === 40).length === 1, '重播後第一次觸發應該是第一個 segment（音高 40）');
+  assert(log.slice(from).filter((e) => e.t === 'on' && e.note === 40).length === 1, '重播後第一次按應該是你的第一個起音（音高 40）');
 });
 
 run('命名：未指派＝電腦輔助的聲部（assistSynth／kind:assist），指派聲部走 humanSynth／kind:human', () => {
@@ -585,7 +797,7 @@ function buildStaffScore(spec, beatSec = 0.5) {
   return scoreTail(notes, parts, beatSec, totalBeats * tpq);
 }
 
-run('staff 化：一個 part 兩個 staff（鋼琴兩行譜）各拿一個輸出 channel、都走真人軌、共用同一個指派槽位；音符依 staffId 分給各自的 staff；一次觸發兩個譜表一起發聲', () => {
+run('staff 化：一個 part 兩個 staff（鋼琴兩行譜）各拿一個輸出 channel、都走真人軌、共用同一個指派槽位；音符依 staffId 分給各自的 staff；一次按鍵兩個譜表與同 tick 的電腦音一起發聲', () => {
   const score = buildStaffScore([
     { id: 'piano', staves: [{ id: 't1c0', notes: [0, 2], pitch: 72 }, { id: 't2c0', notes: [0, 2], pitch: 48 }] },
     { id: 'flute', staves: [{ id: 't3c1', notes: [0, 2], pitch: 80 }] },
@@ -600,7 +812,7 @@ run('staff 化：一個 part 兩個 staff（鋼琴兩行譜）各拿一個輸出
   assert(upper.notes.length === 2 && upper.notes.every((n) => n.midiNote === 72) && lower.notes.every((n) => n.midiNote === 48), '音符依 staffId 分組');
   d.tick(); d.press();
   const ons = log.filter((e) => e.t === 'on');
-  assert(ons.map((e) => e.note).sort().join() === '48,72,80' && new Set(ons.map((e) => e.ms)).size === 1, `一次觸發：兩個譜表與長笛同刻發聲，實際 ${ons.map((e) => `${e.note}@${e.ms}`)}`);
+  assert(ons.map((e) => e.note).sort().join() === '48,72,80' && new Set(ons.map((e) => e.ms)).size === 1, `一次按鍵：兩個譜表與同 tick 的長笛同刻發聲，實際 ${ons.map((e) => `${e.note}@${e.ms}`)}`);
   const humanOn = ons.filter((e) => e.label === 'human');
   assert(humanOn.map((e) => e.note).sort().join() === '48,72' && new Set(humanOn.map((e) => e.ch)).size === 2, '鋼琴兩個音走真人合成器、在不同的輸出 channel');
 });
@@ -625,7 +837,7 @@ run('staff 初始化：bank／program 之外，CC7／10／91／93 在該 channel
     `沒有 init 的 staff 明確送 GM 預設 100／64／0／0，實際 ${JSON.stringify(b)}`);
 });
 
-run('指派聲部的 CC7 只在載入時送一次（原音量），觸發與重播都不再動它', () => {
+run('指派聲部的 CC7 只在載入時送一次（原音量），按鍵與重播都不再動它', () => {
   const score = buildStaffScore([
     { id: 'p0', staves: [{ id: 'p0v', init: { volume: 90, pan: 64, reverb: 0, chorus: 0 }, notes: [0, 1, 2, 3] }] },
     { id: 'a0', staves: [{ id: 'a0v', notes: [0, 1, 2, 3] }] },
@@ -636,7 +848,7 @@ run('指派聲部的 CC7 只在載入時送一次（原音量），觸發與重�
   assert(cc7().join() === '90', `載入時送 init 的音量 90，實際 ${cc7()}`);
   d.tick(); d.press(); d.runMs(600); d.press();
   hp.restart();
-  assert(cc7().join() === '90', `觸發與重播都不該再送 CC7（沒有代打音量），實際 ${cc7()}`);
+  assert(cc7().join() === '90', `按鍵與重播都不該再送 CC7（沒有代打音量），實際 ${cc7()}`);
 });
 
 run('打擊 staff：依鼓組 program 分配到 9／25／41／57，同一個鼓組共用；第 5 種鼓組回報 unplaced；旋律 staff 不會落在打擊槽', () => {
@@ -662,13 +874,13 @@ run('輸出 channel 用完：多出來的 staff 回報在 unplacedStaffIds（列
   assert(hp._staves.size === 60 && hp.unplacedStaffIds.join() === 'v60,v61', `64 個 channel 扣掉 4 個打擊槽剩 60 個，實際 ${hp._staves.size} 個、unplaced ${hp.unplacedStaffIds}`);
 });
 
-run('排不進 channel 的 staff 的音不進 segment；整個 segment 都排不進就不收（一次觸發不會只推進一個不會響的 segment）', () => {
-  // 62 個旋律 staff：v60、v61 排不進 channel。把它們的音放在獨立的拍 5（只有它們）：這個 segment 應被丟掉。
+run('排不進 channel 的 driver 的音不進 segment；整個 segment 都排不進就不收（一次按鍵不會只推進一個不會響的 segment）', () => {
+  // 62 個旋律聲部都指派給演奏者 1：v60、v61 排不進 channel。把它們的音放在獨立的拍 5（只有它們）：這個 segment 應被丟掉。
   const spec = Array.from({ length: 60 }, (_, i) => ({ id: `p${i}`, staves: [{ id: `v${i}`, notes: [0] }] }));
   spec.push({ id: 'p60', staves: [{ id: 'v60', notes: [5] }] }, { id: 'p61', staves: [{ id: 'v61', notes: [5] }] });
-  const { hp, log, d } = makeStaffHp(buildStaffScore(spec), [], { play: false });
+  const { hp, log } = makeStaffHp(buildStaffScore(spec), spec.map((p) => [p.id, 1]), { play: false });
   assert(hp.unplacedStaffIds.join() === 'v60,v61', `前提：v60、v61 排不進，實際 ${hp.unplacedStaffIds}`);
-  assert(hp._segments.length === 1 && hp._segments[0].ticks === 0 && hp._segments[0].items.length === 60, `只剩拍 0 那個 segment（60 顆音），實際 ${hp._segments.map((s) => `${s.ticks}:${s.items.length}`)}`);
+  assert(hp._driverSegs.length === 1 && hp._driverSegs[0].ticks === 0 && hp._driverSegs[0].items.length === 60, `只剩拍 0 那個 segment（60 顆音），實際 ${hp._driverSegs.map((s) => `${s.ticks}:${s.items.length}`)}`);
   assert(onNotes(log).length === 0, '載入不發聲');
 });
 
@@ -706,7 +918,7 @@ run('舊資料形狀（part 沒有 staves，手工譜）：視為單一 staff，
 });
 
 /* ═══════════════════════════════════════════
-   整體不變量壓力測試：固定種子的隨機譜＋隨機觸發、停手、暫停、重播
+   整體不變量壓力測試：固定種子的隨機譜＋隨機按鍵、停手、暫停、重播
    ═══════════════════════════════════════════ */
 
 // 每個聲部是一條單音旋律：音長取 MuseScore 風格的「記譜長度 − 1 tick」（相連音間隙 1 tick），偶爾插入休止、
@@ -744,50 +956,7 @@ const mulberry32 = (seed) => {
   return () => { s = (s + 0x6d2b79f5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 };
 
-// 假合成器＋不變量檢查，壓力測試（手動／自動播放）共用。排程器用 try/catch 包住每一次 synth 呼叫（音源掛掉不能拖垮排程），
-// 假 synth 裡丟的例外會被吞掉：違規只記下來，每次呼叫排程器之後再檢查。
-function makeInvariantRig(seed) {
-  const state = {
-    hp: null, now: 0, silencing: false, inTick: false, inTrigger: false, triggerOns: 0, maxSimultaneous: 0,
-    balance: new Map(), pending: new Map(), emittedCount: new Map(), problems: [],
-  };
-  const check = (cond, msg) => { if (!cond) state.problems.push(`seed ${seed}：${msg}`); };
-  state.flush = () => assert(!state.problems.length, state.problems[0]);
-  state.check = check;
-  state.fake = (label) => ({
-    controllerChange() {}, programChange() {},
-    noteOn: (ch, note, vel) => {
-      const hp = state.hp;
-      const v = [...hp._staves.values()].find((x) => x.channel === ch && (label === 'human') === (x.kind === 'human'));
-      const n = state.emittedCount.get(v.id) ?? 0;
-      state.emittedCount.set(v.id, n + 1);
-      const note0 = v.notes[n];
-      check(vel >= 1, '送了 velocity 0 的 noteOn（合成器會把它當成 note-off）');
-      check(note0 && note0.midiNote === note, `${v.id} 第 ${n} 顆音應為音高 ${note0?.midiNote}，實際 ${note}（發聲順序不是樂譜順序，或發了第二次）`);
-      const seg = hp._segments[hp._segIndex - 1];
-      check(seg && seg.items.some((it) => it.staff === v && it.note === note0), `${v.id}#${n} 不在剛放行的 segment 裡`);
-      check(!(state.inTick && !hp._isAuto()), `有指派時 tick() 放出了起音（${v.id}#${n}）：起音只能來自 trigger()`);
-      const k = `${label}/${ch}/${note}`;
-      if (!state.pending.has(k)) state.pending.set(k, []);
-      state.pending.get(k).push(note0?.endTick);
-      state.balance.set(k, (state.balance.get(k) ?? 0) + 1);
-      state.maxSimultaneous = Math.max(state.maxSimultaneous, state.balance.get(k));
-      if (state.inTrigger) state.triggerOns++;
-    },
-    noteOff: (ch, note) => {
-      const hp = state.hp;
-      const k = `${label}/${ch}/${note}`;
-      state.balance.set(k, (state.balance.get(k) ?? 0) - 1);
-      check(state.balance.get(k) >= 0, `${k} 沒有對應的 noteOn 就 noteOff`);
-      const endTick = state.pending.get(k)?.shift();
-      // 收音只有三個理由：音到期（播放頭 ≥ endTick）、停格超過閒置門檻、暫停／重播的清場
-      if (!state.silencing) check(endTick !== undefined && (hp._ticks + 1e-6 >= endTick || hp._stallSec > 0.8), `${k} 提早收音（結尾 tick ${endTick}，播放頭 ${hp._ticks}）`);
-    },
-  });
-  return state;
-}
-
-run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者、隨機停手／暫停／重播，各 60 秒', () => {
+run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者、隨機停手／暫停／重播／手抖，各 60 秒', () => {
   for (const seed of [11, 22, 33, 44]) {
     const rand = mulberry32(seed);
     const score = buildRandomScore(rand, 5 + Math.floor(rand() * 2));
@@ -799,45 +968,44 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者、�
     hp.load(score, new Map(assignments));
     hp.play();
     const pPress = 12 / (beatSec * 1000 * 0.5);          // 平均約 0.5 拍按一次
-    // 一開始全體先不按 3.8 秒（播放頭沒開始），之後隨機全體停手 1.2~3 秒（壓到停格釋放）。
-    let prevPos = 0, presses = 0, stallReleases = 0, quietUntil = 320;
+    // 一開始全體先不按 3.8 秒（前奏自己播、停在入場點），之後隨機全體停手 1.2~3 秒（壓到停格釋放）；偶爾手抖連按（壓到去抖）。
+    let now = 0, prevPos = 0, accepted = 0, ignored = 0, idleSeen = 0, quietUntil = 320, burstUntil = -1;
     for (let i = 0; i < 5000; i++) {
-      rig.now += 12;
+      now += 12;
       if (i >= quietUntil && rand() < 0.002) quietUntil = i + 100 + Math.floor(rand() * 150);
+      if (i >= quietUntil && rand() < 0.003) burstUntil = i + 3;
       for (const slot of [1, 2, 3]) {
         if (slot === 3 && i > 1250) continue;           // 演奏者 3 在 15 秒後離開
-        if (i >= quietUntil && rand() < pPress) {
-          const before = hp._segIndex;
-          rig.triggerOns = 0; rig.inTrigger = true;
-          const ok = hp.trigger(slot, rig.now);
-          rig.inTrigger = false;
-          rig.flush();
-          rig.check(hp._segIndex === before + (ok ? 1 : 0), `trigger 回傳 ${ok}，segment 游標卻從 ${before} 變成 ${hp._segIndex}（一次觸發只能放行一個 segment）`);
-          if (ok) {
-            presses++;
-            rig.check(rig.triggerOns === hp._segments[before].items.length, `一次觸發要讓 segment 的 ${hp._segments[before].items.length} 顆音全部在這次呼叫內發聲，實際 ${rig.triggerOns} 顆`);
-          }
-        }
+        const wants = i >= quietUntil && (rand() < pPress || (i < burstUntil && rand() < 0.5));
+        if (!wants) continue;
+        const next = hp._driverSegs[hp._segIndex];
+        const before = hp._segIndex;
+        rig.triggerTicks = next?.ticks ?? null; rig.inTrigger = true;
+        const ok = hp.trigger(slot, now);
+        rig.inTrigger = false;
+        rig.flush();
+        rig.check(hp._segIndex === before + (ok ? 1 : 0), `trigger 回傳 ${ok}，segment 游標卻從 ${before} 變成 ${hp._segIndex}（一次觸發只能放行一個 segment）`);
+        if (ok) accepted++; else if (next) ignored++;
       }
-      if (rand() < 0.0008) { rig.silencing = true; hp.pause(); rig.silencing = false; for (let k = 0; k < 150; k++) { rig.now += 12; hp.tick(rig.now); } hp.play(); }
-      if (rand() < 0.0003) { rig.silencing = true; hp.restart(); rig.silencing = false; prevPos = 0; rig.emittedCount.clear(); rig.pending.clear(); }
-      rig.inTick = true; hp.tick(rig.now); rig.inTick = false;
+      if (rand() < 0.0008) { rig.silencing = true; hp.pause(); rig.silencing = false; for (let k = 0; k < 150; k++) { now += 12; hp.tick(now); } hp.play(); }
+      if (rand() < 0.0003) { rig.silencing = true; hp.restart(); rig.silencing = false; prevPos = 0; }
+      rig.inTick = true; hp.tick(now); rig.inTick = false;
       rig.flush();
 
       const pos = hp.getPositionTicks();
       assert(pos >= prevPos - 1e-9, `seed ${seed}：進度倒退了（${prevPos} → ${pos}）`);
       prevPos = pos;
-      const next = hp._segments[hp._segIndex];
-      assert(!next || hp._ticks <= next.ticks + 1e-6, `seed ${seed}：播放頭 ${hp._ticks} 越過下一個 segment（tick ${next?.ticks}）`);
-
-      if (hp._stallSec > 0.8 + 1e-9) {                   // 停格超過閒置門檻：沒有任何音還在響
-        stallReleases++;
+      const next = hp._driverSegs[hp._segIndex];
+      assert(!next || pos <= next.ticks + 1e-6, `seed ${seed}：播放頭 ${pos} 越過你的下一個起音（tick ${next?.ticks}）`);
+      if (hp._stallMsAt(hp._clockMs) > 800 + 1e-9) {     // 停格超過閒置門檻：沒有任何音還在響
+        idleSeen++;
         const sounding = [...hp._staves.values()].reduce((a, v) => a + [...v.sounding.values()].reduce((b, q) => b + q.length, 0), 0);
-        assert(sounding === 0, `seed ${seed}：停格 ${hp._stallSec}s 超過門檻，還有 ${sounding} 個音在響`);
+        assert(sounding === 0, `seed ${seed}：停格超過門檻，還有 ${sounding} 個音在響`);
       }
     }
-    assert(presses > 50, `seed ${seed}：前提：60 秒內應該真的放行很多個 segment（實際 ${presses} 次）`);
-    assert(stallReleases > 0, `seed ${seed}：前提：這個壓力測試應該真的壓到停格釋放`);
+    assert(accepted > 50, `seed ${seed}：前提：60 秒內應該真的放行很多個 segment（實際 ${accepted} 次）`);
+    assert(ignored > 0, `seed ${seed}：前提：這個壓力測試應該真的壓到去抖（有按鍵被忽略）`);
+    assert(idleSeen > 0, `seed ${seed}：前提：這個壓力測試應該真的壓到停格釋放`);
     assert(rig.maxSimultaneous >= 2, `seed ${seed}：前提：這個壓力測試應該真的壓到同音高重疊`);
     rig.silencing = true; hp.pause(); rig.silencing = false;    // 收掉還在響的音之後，每個 noteOn 都剛好有一個 noteOff
     rig.flush();
@@ -849,25 +1017,163 @@ run('固定種子的自動播放壓力測試：隨機譜整首自動播放，每
   for (const seed of [11, 22, 33, 44]) {
     const rand = mulberry32(seed);
     const score = buildRandomScore(rand, 4 + Math.floor(rand() * 3));
-    const stepTicks = (12 / (score.midiTicksToSeconds(480) * 1000)) * 480 + 1e-6; // 一個排程 tick 在 1× 下走多少 tick
+    const stepMs = 12 + 1e-6;                                  // 一個排程 tick 的長度：自動播放（1×）下起音最多晚這麼久
     const rig = makeInvariantRig(seed);
     const hp = rig.hp = new Scheduler();
-    // 自動播放（沒有指派）時：起音必須在播放頭剛走到它的那個 tick（≤ 一個步長）
-    const fake = rig.fake('assist');
-    const origOn = fake.noteOn;
-    fake.noteOn = (ch, note, vel) => {
-      origOn(ch, note, vel);
-      const seg = hp._segments[hp._segIndex - 1];
-      rig.check(hp._ticks - seg.ticks >= -1e-6 && hp._ticks - seg.ticks <= stepTicks, `起音 tick ${seg.ticks} 在播放頭 ${hp._ticks} 才發聲（落後超過一個步長 ${stepTicks}）`);
-    };
-    hp.setSynths(fake, rig.fake('human'));
+    const assistSynth = rig.fake('assist');
+    const origOn = assistSynth.noteOn;
+    const onTimes = [];
+    assistSynth.noteOn = (ch, note, vel) => { origOn(ch, note, vel); const s = [...hp._sounded]; onTimes.push({ note: s[s.length - 1], clock: hp._clockMs }); };
+    hp.setSynths(assistSynth, rig.fake('human'));
     hp.load(score, new Map());
     hp.play();
-    let guard = 0;
-    while (!hp.isFinished() && guard++ < 20000) { rig.now += 12; rig.inTick = true; hp.tick(rig.now); rig.inTick = false; rig.flush(); }
+    let now = 0, guard = 0;
+    while (!hp.isFinished() && guard++ < 20000) { now += 12; rig.inTick = true; hp.tick(now); rig.inTick = false; rig.flush(); }
     assert(hp.isFinished(), `seed ${seed}：自動播放應該自己播完`);
-    for (const v of hp._staves.values()) assert(rig.emittedCount.get(v.id) === v.notes.length, `seed ${seed}：${v.id} 應發聲 ${v.notes.length} 次，實際 ${rig.emittedCount.get(v.id)}`);
+    assert(hp._sounded.size === score.notes.length, `seed ${seed}：每顆音恰好發聲一次：樂譜 ${score.notes.length} 顆、實際 ${hp._sounded.size}`);
+    for (const { note, clock } of onTimes) {
+      const due = score.midiTicksToSeconds(note.startTick) * 1000;
+      assert(clock - due >= -1e-6 && clock - due <= stepMs, `seed ${seed}：音高 ${note.midiNote} 的起音應在樂譜時間 ${due.toFixed(1)}ms 後一個 tick 內發聲，實際 ${clock.toFixed(1)}ms`);
+    }
     for (const [k, v] of rig.balance) assert(v === 0, `seed ${seed}：${k} 的 noteOn 與 noteOff 差了 ${v} 個`);
+  }
+});
+
+/* ═══════════════════════════════════════════
+   lookahead：電腦音提早（LOOKAHEAD_MS）帶時間戳送進合成器，由音訊執行緒準時發聲；你的音永遠不帶時間戳
+   ═══════════════════════════════════════════ */
+
+const AUDIO0 = 100; // 假的 AudioContext 時間原點（秒）
+
+// 記下第四個參數（eventOptions）的假合成器：time＝時間戳（秒，undefined＝沒帶）、ms＝呼叫當下的假時間。
+function makeTimedSynth(log, label, clock) {
+  return {
+    controllerChange: () => {}, programChange: () => {},
+    noteOn: (ch, note, vel, opts) => log.push({ t: 'on', label, ch, note, ms: clock.ms, time: opts?.time }),
+    noteOff: (ch, note, opts) => log.push({ t: 'off', label, ch, note, ms: clock.ms, time: opts?.time }),
+  };
+}
+
+// 每個 tick 把「假的 AudioContext 時間」一起交給排程器（跟假時間同步前進）；withAudio＝false 時跟舊的呼叫方式一樣只給 nowMs。
+function makeAudioHp(score, assignments, { withAudio = true } = {}) {
+  const log = [], clock = { ms: 0 };
+  const hp = new Scheduler();
+  hp.setSynths(makeTimedSynth(log, 'assist', clock), makeTimedSynth(log, 'human', clock));
+  hp.load(score, new Map(assignments));
+  hp.play();
+  const d = {
+    tick() { clock.ms += TICK_MS; withAudio ? hp.tick(clock.ms, clock.ms / 1000 + AUDIO0) : hp.tick(clock.ms); },
+    runMs(ms) { const end = clock.ms + ms; while (clock.ms < end) d.tick(); },
+    press(slot = 1) { return hp.trigger(slot, clock.ms); },
+    get nowMs() { return clock.ms; },
+  };
+  return { hp, log, d, clock };
+}
+
+run('lookahead：電腦音在到期之前（50ms 內）就帶時間戳送出，時間戳＝預定發聲的 AudioContext 時間；你的音與按鍵當下同刻的電腦音不帶時間戳', () => {
+  const { log, d } = makeAudioHp(buildBeatScore({ p0: [0, 2, 4], a1: [0, 1, 2, 3, 4] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  assert(d.press() === true, '第一下');
+  d.runMs(700);
+  const on = log.find((e) => e.t === 'on' && e.note === 53);              // 拍 1 的電腦音：按下後 500ms 到期
+  assert(on, '拍 1 的電腦音 53 要發聲');
+  assert(Math.abs(on.time - ((t0 + 500) / 1000 + AUDIO0)) < 1e-6, `時間戳要等於預定發聲的 AudioContext 時間 ${(t0 + 500) / 1000 + AUDIO0}，實際 ${on.time}`);
+  assert(on.ms >= t0 + 450 - 1e-6 && on.ms < t0 + 500, `在到期前 50ms 內的那個 tick 送出（${t0 + 450}~${t0 + 500}），實際 ${on.ms}`);
+  const off = log.find((e) => e.t === 'off' && e.note === 53);
+  assert(off && off.time !== undefined && Math.abs(off.time - on.time - 0.025) < 1e-6, `收音也帶時間戳：發聲後 25ms（音長），實際 ${off?.time - on.time}`);
+  assert(off.ms < (off.time - AUDIO0) * 1000, `收音也是提早送出（呼叫時刻 ${off.ms} 早於預定 ${(off.time - AUDIO0) * 1000}）`);
+  const mine = log.find((e) => e.t === 'on' && e.label === 'human'), sameTick = log.find((e) => e.t === 'on' && e.note === 52);
+  assert(mine.time === undefined && sameTick.time === undefined && sameTick.ms === t0, '你的音與按鍵當下同刻的電腦音（52）都不帶時間戳，在按鍵呼叫內立即發聲');
+  assert(log.filter((e) => e.label === 'human').every((e) => e.time === undefined), '真人合成器的所有呼叫都不帶時間戳');
+  const mineOff = log.find((e) => e.t === 'off' && e.label === 'human');
+  assert(mineOff && mineOff.ms >= t0 + 25 - 1e-6, `你的音照舊在時鐘到了才收（按下後 25ms），不因為 lookahead 提早收，實際 ${mineOff?.ms - t0}ms`);
+});
+
+run('lookahead：前奏預按在 tick 裡自動放行的你的第一個起音，也不帶時間戳（你的聲部永遠立即發聲）', () => {
+  const { log, d } = makeAudioHp(buildBeatScore({ p0: [4, 5], a1: [0, 1, 2, 3, 4, 5] }), [['p0', 1]]);
+  d.tick();
+  d.runMs(500);
+  assert(d.press() === false, '前奏中預按');
+  d.runMs(2000);
+  const mine = log.filter((e) => e.t === 'on' && e.label === 'human');
+  assert(mine.length === 1 && mine[0].time === undefined, `前奏播完自動放行入場音 40，不帶時間戳，實際 ${JSON.stringify(mine)}`);
+});
+
+run('lookahead：沒有交 AudioContext 時間（audioNow 缺席）就不提早、不帶時間戳，行為跟以前一樣', () => {
+  const { log, d } = makeAudioHp(buildBeatScore({ p0: [0, 2, 4], a1: [0, 1, 2, 3, 4] }), [['p0', 1]], { withAudio: false });
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.runMs(700);
+  const on = log.find((e) => e.t === 'on' && e.note === 53);
+  assert(on.time === undefined && on.ms >= t0 + 500 - 1e-6, `沒有 audioNow：到期之後才發聲、不帶時間戳，實際 ${JSON.stringify(on)}`);
+});
+
+run('lookahead：暫停時已經送出、還沒響的電腦音，另外送一個帶時間戳的收音（不然 noteOff 先到、之後那顆 noteOn 就卡住）', () => {
+  // 拍 1 的 53 長 200ms：noteOn 已送出（時間戳在未來），收音時刻（發聲後 200ms）還在 lookahead 範圍外、沒送
+  const { hp, log, d } = makeAudioHp(buildBeatScore({ p0: [0, 2, 4], a1: [0, { beat: 1, dur: 0.2 }, 2, 3, 4] }), [['p0', 1]]);
+  d.tick();
+  d.press();
+  d.runMs(470);                                                           // 拍 1 的電腦音（按下後 500ms）已送出、還沒到期
+  const on = log.find((e) => e.t === 'on' && e.note === 53);
+  assert(on && on.time > d.nowMs / 1000 + AUDIO0, `前提：53 已經送出、時間戳在未來，實際 ${JSON.stringify(on)}`);
+  hp.pause();
+  const offs = log.filter((e) => e.t === 'off' && e.note === 53);
+  assert(offs.length === 1 && offs[0].time !== undefined && Math.abs(offs[0].time - (on.time + 0.001)) < 1e-9, `暫停要送一個帶時間戳（發聲後 1ms）的收音，實際 ${JSON.stringify(offs)}`);
+  assert(!log.some((e) => e.t === 'off' && e.note === 53 && e.time === undefined), '不能送立刻處理的 noteOff（會比那顆 noteOn 早到）');
+});
+
+run('lookahead：相連音撐住照舊——後繼音落在還沒被按鍵啟動的段，收音就不能提早送出', () => {
+  // a1 在拍 1 的 60 與拍 2 的 61 是相連音（間隙 1 tick）；拍 2 是你的下一個起音（p0），61 在還沒啟動的段裡
+  const { log, d } = makeAudioHp(buildBeatScore({ p0: [0, 2], a1: [{ beat: 1, dur: ONE_TICK_SHORT, note: 60 }, { beat: 2, dur: 0.025, note: 61 }] }), [['p0', 1]]);
+  d.tick();
+  d.press();
+  d.runMs(1100);                                                          // 60 的收音時刻（約 998ms）早已落在 lookahead 範圍內
+  assert(log.some((e) => e.t === 'on' && e.note === 60) && !log.some((e) => e.t === 'off' && e.note === 60), `還沒按：60 被撐住、不能送收音，實際 ${JSON.stringify(log.filter((e) => e.note === 60))}`);
+  const t1 = d.nowMs;
+  assert(d.press() === true, '第二下');
+  const off60 = log.find((e) => e.t === 'off' && e.note === 60), on61 = log.find((e) => e.t === 'on' && e.note === 61);
+  assert(off60 && off60.ms === t1 && on61 && on61.ms === t1, '按下的那一刻先收 60、再放 61（相連音在後繼音放行時才收）');
+});
+
+// 依 worklet 的規則重播事件：時間戳在未來才排進佇列、已過就在送出的當下立刻處理，同一刻依送出順序。
+// 每個 (合成器, channel, 音高) 的 noteOn／noteOff 配對：noteOff 不能比 noteOn 早處理（會讓後來那顆 noteOn 永遠卡住）。
+run('lookahead 壓力測試：隨機譜、不規則的 tick 間隔（含停頓）、隨機按鍵／暫停／重播，依 worklet 規則重播事件後沒有搶先的 noteOff、結束時沒有卡音', () => {
+  for (const seed of [5, 17, 29, 41]) {
+    const rand = mulberry32(seed);
+    const score = buildRandomScore(rand, 5);
+    const events = [];
+    let seq = 0, now = 0;
+    const audio = () => now / 1000 + AUDIO0;
+    const rec = (label) => ({
+      controllerChange: () => {}, programChange: () => {},
+      noteOn: (ch, note, vel, o) => events.push({ key: `${label}/${ch}/${note}`, d: +1, at: Math.max(audio(), o?.time ?? -Infinity), seq: seq++ }),
+      noteOff: (ch, note, o) => events.push({ key: `${label}/${ch}/${note}`, d: -1, at: Math.max(audio(), o?.time ?? -Infinity), seq: seq++ }),
+    });
+    const hp = new Scheduler();
+    hp.setSynths(rec('assist'), rec('human'));
+    hp.load(score, new Map([['p0', 1], ['p1', 1]]));
+    hp.play();
+    let committedAhead = 0;
+    for (let i = 0; i < 4000; i++) {
+      now += rand() < 0.03 ? 40 + Math.floor(rand() * 60) : 5 + Math.floor(rand() * 15);   // 偶爾主執行緒停頓 40~100ms
+      if (rand() < 0.05) hp.trigger(1, now);
+      if (rand() < 0.0015) { hp.pause(); now += 30 + Math.floor(rand() * 200); hp.play(); }
+      if (rand() < 0.0008) hp.restart();
+      const before = events.length;
+      hp.tick(now, audio());
+      committedAhead += events.slice(before).filter((e) => e.at > audio() + 1e-9).length;
+    }
+    hp.pause();
+    assert(committedAhead > 100, `seed ${seed}：前提：要真的有很多事件是提早（時間戳在未來）送出的，實際 ${committedAhead}`);
+    const running = new Map();
+    for (const e of events.sort((a, b) => a.at - b.at || a.seq - b.seq)) {
+      const n = (running.get(e.key) || 0) + e.d;
+      assert(n >= 0, `seed ${seed}：${e.key} 的 noteOff 在對應的 noteOn 之前被處理（會讓後來那顆 noteOn 卡住）`);
+      running.set(e.key, n);
+    }
+    for (const [k, v] of running) assert(v === 0, `seed ${seed}：${k} 結束時還有 ${v} 顆音沒收（卡音）`);
   }
 });
 

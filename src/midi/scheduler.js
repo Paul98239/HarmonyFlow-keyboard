@@ -2,32 +2,43 @@
 //  scheduler.js — 排程器（純邏輯，無 DOM／CDN）
 //
 //  時間單位：整份總譜只有一條時間軸，單位是 MIDI tick（SMF 規格唯一的時間單位；秒只是用速度表換算出來的衍生值）。
-//  所有比較（起音、收音、相連音）都在 tick 上做，跟 note 的 startTick／endTick 同一個座標系。
+//  電腦聲部的音符對應到「你的聲部」的 tick，不是第二條時鐘。
 //
-//  總譜觸發：parser 把全曲所有音依 startTick 分成 segment（同一個 tick 上所有聲部、所有譜表的音，借自 MuseScore 的
-//  Segment）。一次觸發（`trigger(slot, nowMs)`，鍵盤或日後的手勢）放行「全曲的下一個 segment」：這個 segment 裡所有音——
-//  你的聲部與電腦輔助的聲部——在這次呼叫內立刻 noteOn。上下對齊由結構保證（同一個 tick 的音一定在同一次呼叫裡出聲），
-//  不靠兩條時鐘去對時；下一個 segment 就是全曲緊接著的下一個起音 tick，所以任何速度下都不會跳過任何一顆音。
-//  指派（演奏者槽位）只決定兩件事：哪些聲部走真人合成器（`humanSynth`，音量凸顯）、哪些槽位有資格推進全曲；
-//  電腦輔助聲部＝沒被指派的聲部（`assistSynth`）。
+//  兩種聲部（模仿同事 SmartEnsemble 的「主控／伴奏」，但以這個專案的做法為主）：
+//    · driver（kind: 'human'，走 humanSynth）＝被指派的聲部。每個起音要你按一次：parser 的 segment（同一個 startTick 的所有音）
+//      裡屬於 driver 的音，一次按鍵（`trigger(slot, nowMs)`，鍵盤或日後的手勢）放行一個 segment，在這次呼叫內立刻 noteOn（0ms）。
+//    · follower（kind: 'assist'，走 assistSynth）＝沒被指派的電腦輔助聲部。不用按：它的音依 tick 分屬 driver 起音之間的「段」，
+//      按鍵啟動它負責的那一段。
+//  沒有任何 driver（沒有指派，或指派的聲部都沒有音符）＝整首自動播放：只有第 0 段，從開頭照原速放完（同一條程式路徑）。
 //
-//  播放頭（playhead，`_ticks`）：兩次觸發之間以 `playbackRate`（模仿官方 Sequencer 的命名：樂譜秒 ÷ 真實秒）往前走，
-//  最多走到下一個 segment 的 tick 就停格等你；它只負責收音與進度條，永遠不會自己放出起音。`playbackRate` 取自你最近
-//  兩次觸發的間隔（夾在 [MIN, MAX]），你按快，休止與音長照比例變短；你按慢，音照檔案收，停格等你。
-//  沒有任何指派（或指派的聲部都沒有音符）時整首自動播放：播放頭以 1× 連續前進，走到的 segment 自動放行。
+//  按鍵啟動它負責的那一段：第 k 次按鍵放行 driver 起音 T_k，同時記下錨點 { T_k, 按下的時刻, 速度 }，並把落在 [T_k, T_{k+1})
+//  的 follower 音各自排好發聲時刻：`按下時刻 + (樂譜秒(startTick) − 樂譜秒(T_k)) ÷ playbackRate`（startTick == T_k 的在這次呼叫內
+//  同刻發聲）。第 0 段（第一個 driver 起音之前的前奏）在 play() 後用 1× 起算，所以前奏照原速播、停在你的入場點。前奏還沒播完
+//  時按鍵不放行（前奏鎖：不然第 1 段重新對時，前奏剩下的音就被跳過），只記預按，播到入場點由 tick() 自動放行第一個起音。
+//    · 你按得比預估早：上一段沒放完的 follower 音照自己排好的時刻繼續放完（長度照 MIDI 音符長度，依速度換算），不跳、不一次
+//      放出（不擠）、不丟；它們最多比該有的時間晚「你早按的量」，下一次按鍵重新對時就歸零（不累積）。
+//    · 你按得比預估晚：這一段放完就靜止等你，不會越過你的下一個起音；停格超過 IDLE_MS 把還在響的音全部收掉。
+//  playbackRate（命名同官方 Sequencer：樂譜秒 ÷ 真實秒）＝最近 8 個按鍵的頭尾比值（pressTiming.js，模擬評估選出來的）。
+//  去抖（pressTiming.js）：兩次按鍵太近就忽略第二次（擋手抖、手勢重複觸發）。
 //
-//  收音：音的 endTick ≤ 播放頭才收（同音高重疊依發聲順序先進先出，跟官方合成器對 note-off 的解讀一致，每個 noteOn 都送出
-//  一個對應的 noteOff）。相連音（結尾到同一個譜表下一顆起音的間隙 ≤ θ）在後繼音還沒放行時撐住，免得停格那一下出現檔案裡沒有的
-//  空白；停格超過 IDLE_MS 就把所有還在響的音收掉，不會無限期掛著。放行一個 segment 時先收再放：相連的舊音在後繼音發聲的
-//  同一刻已經關掉。
+//  收音：driver 的音到期（對應時刻）或下一次按鍵時 endTick ≤ 新錨點的先收掉，follower 的音從它發聲的時刻起算原始時值。
+//  相連音（結尾到同一個譜表下一顆起音的間隙 ≤ θ）在後繼音還沒被按鍵啟動時撐住，免得停格那一下出現檔案裡沒有的空白；放行時
+//  先收再放。同音高重疊的音依發聲順序先進先出收音（跟官方合成器對 note-off 的解讀一致），每個 noteOn 都送出一個 noteOff。
 //
-//  velocity 一律用樂譜原值；不重播 CC／pitch-bend，每個 staff 的初始狀態（bank／program 與 CC7／10／91／93）只在
-//  load() 時送一次，而且一定在該 channel 的第一個 noteOn 之前。
+//  lookahead：tick(nowMs, audioNow) 有給 AudioContext 時間時，電腦輔助聲部 LOOKAHEAD_MS 以內要發聲／收音的事件提早帶時間戳（eventOptions.time）
+//  送進合成器，由 worklet 依取樣時鐘準時放，不受主執行緒卡頓影響；你的聲部永遠立即發聲、不帶時間戳。worklet 沒有取消已排程事件的
+//  辦法，所以暫停時「已送出、還沒響」的音要另外送帶時間戳的 noteOff（見 _offOpts）。
+//
+//  排程器自己的時鐘（`_clockMs`）只在 tick() 前進、暫停時不走，所以暫停的時間不會被當成按鍵間隔，恢復後排好的時刻照剩下的時間放。
+//  velocity 一律用樂譜原值；不重播 CC／pitch-bend，每個 staff 的初始狀態（bank／program 與 CC7／10／91／93）只在 load() 時送一次，
+//  而且一定在該 channel 的第一個 noteOn 之前。
 //
 //  聲部單位：parser 把一個 MuseScore 樂器切成 part，part 底下有一個以上的 staff（一個譜表 × 一個樂器 channel，例如鋼琴
 //  兩行譜是兩個 staff）。指派以 part 為單位，part 的所有 staff 共用同一個槽位；發聲與輸出 channel 以 staff 為單位。
 //  沒有 staves 的 part（手工組的舊資料形狀）自動視為單一 staff。
 // ============================================================
+
+import { estimatePlaybackRate, debounceWindowMs, summarizeMs } from './pressTiming.js';
 
 export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
   drumChannel: 9, // MIDI 規格：第 10 個 channel（索引 9）是打擊
@@ -44,22 +55,25 @@ export const DEFAULT_PORTS = 4;
 /* ═══════════════════════════════════════════
    應用層常數——不是規格
    ═══════════════════════════════════════════ */
-// 「播放頭停在下一個 segment 多久就把還在響的音全部收掉」的門檻：相連音撐住與長音只是不在停格那一下提早收，不能無限期響著。
-// 800ms 吸收你按鍵的停頓；你完全停手時播放頭停在原地，超過這個時間就安靜下來。
+// 「播放頭停在你的下一個起音多久就把還在響的音全部收掉」的門檻：相連音撐住與長音只是不在停格那一下提早收，不能無限期響著。
+// 800ms 吸收你按鍵的停頓；你完全停手時電腦聲部放完這一段就靜止，超過這個時間就安靜下來。
 const IDLE_MS = 800;
-// 相連音的「小間隙」門檻 θ ＝ timeDivision / LEGATO_GAP_DIVISOR（480 tpq 時 30 tick）：音符結尾到同一個譜表
-// 下一個起音點的間隙 ≤ θ 才算相連的音。MuseScore 把相連音符寫成「記譜長度 − 1 tick」（間隙固定 1 tick），真正的
+// 相連音的「小間隔」門檻 θ ＝ timeDivision / LEGATO_GAP_DIVISOR（480 tpq 時 30 tick）：音符結尾到同一個譜表
+// 下一個起音點的間隔 ≤ θ 才算相連的音。MuseScore 把相連音符寫成「記譜長度 − 1 tick」（間隙固定 1 tick），真正的
 // 最短休止（三十二分休止）≥ 60 tick，θ 落在兩者中間的空檔；用 tick 不用秒，跟速度無關。
 const LEGATO_GAP_DIVISOR = 16;
-// 每個 tick 的時間步長上限：分頁被瀏覽器節流（背景分頁的計時器可能隔好幾秒才醒來）後恢復時，播放頭最多只前進這麼多，
-// 不會一次把空窗期的音全部收掉（自動播放時也不會一次放出一大段）。
-const MAX_TICK_DT_SEC = 0.1;
-// 播放頭是一路換算（tick → 秒 → 加 dt → tick）累積出來的浮點數，跟整數 tick 比大小時不能要求逐位元相等。
-const EPS_TICKS = 1e-6;
-// playbackRate 的合理範圍：你連按兩下幾乎同時（估出極大的速度）或隔很久才按（估出趨近 0），都夾在這個範圍內，
-// 免得播放頭瞬間衝到下一個 segment、或幾乎不動。
-const MIN_PLAYBACK_RATE = 0.25;
-const MAX_PLAYBACK_RATE = 4;
+// 每個 tick 的時間步長上限：分頁被瀏覽器節流（背景分頁的計時器可能隔好幾秒才醒來）後恢復時，時鐘最多只前進這麼多，
+// 不會一次把空窗期的音全部放出來或收掉。
+const MAX_TICK_DT_MS = 100;
+// 排程時刻是一路加法算出來的浮點數，跟時鐘比大小時不能要求逐位元相等。
+const EPS_MS = 1e-6;
+// lookahead：tick() 把「這麼久以內就要發聲／收音」的電腦音提早帶時間戳（eventOptions.time，AudioContext 時間）送進合成器，
+// 由 worklet 依取樣時鐘準時放，主執行緒被影像算繪卡住幾十毫秒也不會晚。取捨：送出去的事件 worklet 沒有取消的辦法
+// （spessasynth_core 的 eventQueue 只有 push／shift），所以這段時間內的音「一定會響」。50ms 是蓋過實機量到的主執行緒
+// 停頓（攝影機開著，最大約 40ms）的最小值；只用在電腦輔助聲部，你的音永遠立即發聲、不帶時間戳。
+const LOOKAHEAD_MS = 50;
+// 量測用：電腦音遲到量最多留幾筆（超過就丟最舊的），避免長時間播放無限成長。
+const LATE_SAMPLES_MAX = 5000;
 // GM 預設的混音值（CC121 不會重設音量、聲像、Program，見 GML-v1 §3.2.5.2；channel 又是跨曲重複使用，所以沒有 init 的 staff
 // 也要明確送一次，避免沿用到別的曲子在同一個 channel 上留下的設定）。
 const GM_DEFAULT_VOLUME = 100, GM_DEFAULT_PAN = 64, GM_DEFAULT_REVERB = 0, GM_DEFAULT_CHORUS = 0;
@@ -127,7 +141,7 @@ function makeStaff(spec, slot, notes, kind, channel) {
     id: spec.id, partId: spec.partId, slot, kind, channel, notes,
     program: spec.program ?? 0, bank: spec.bank, init: spec.init ?? null, percussionKit: !!spec.percussionKit,
     baseVolume: spec.init?.volume ?? GM_DEFAULT_VOLUME, // 檔案 tick 0 的 CC7，沒有就是 GM 預設 100；載入時送一次
-    sounding: new Map(),    // 音高 → [{ endTick, legatoTo }]：正在響的音；同音高重疊時依發聲順序排隊，先進先出收音
+    sounding: new Map(),    // 音高 → [{ endTick, offMs, legatoTo }]：正在響的音；同音高重疊時依發聲順序排隊，先進先出收音
   };
 }
 
@@ -190,23 +204,37 @@ function buildStaves(score, assignments, assistSynth, humanSynth, cfg, ports) {
 export class Scheduler {
   constructor(config = {}) {
     this.cfg = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
-    this.assistSynth = null;   // 電腦輔助聲部的合成器（未指派聲部）
-    this.humanSynth = null;    // 真人聲部合成器（被指派聲部）
+    this.assistSynth = null;   // 電腦輔助聲部（follower）的合成器
+    this.humanSynth = null;    // 被指派聲部（driver）的合成器
     this.ports = DEFAULT_PORTS; // 合成器目前有幾個 port（每個 16 個 channel）；synth.js 補 channel 之後用 setPortCount() 更新
-    this.playbackRate = 1;     // 播放頭的速度（樂譜秒 ÷ 真實秒），命名同官方 Sequencer；每次觸發依你的按鍵間隔更新
+    this.playbackRate = 1;     // 你現在的速度（樂譜秒 ÷ 真實秒），命名同官方 Sequencer；依最近 8 個按鍵估（pressTiming.js）
+    this.unplacedStaffIds = []; // 輸出 channel 排不進去（旋律 staff 超過 60 個、鼓組超過 4 種）的 staff，這一輪不出聲
     this._score = null;
     this._staves = new Map();  // staffId → staff
-    this._segments = [];       // 全曲的垂直切片：[{ ticks, items: [{ staff, note }] }]，只含有輸出 channel 的 staff 的音
+    // 載入後不變的計畫
+    this._driverSegs = [];     // [{ ticks, items: [{ staff, note }] }]：driver 的 segment，一次按鍵放行一個
+    this._driverTicks = [];    // 每個 driver segment 的 tick（二分搜尋「某個 tick 屬於第幾段」用）
+    this._followers = [];      // [{ staff, note }]：所有 follower 音，依 startTick 排序
+    this._sliceFirst = [];     // _sliceFirst[s]＝第 s 段的第一個 follower 在 _followers 裡的位置（長度 = 段數 + 1）
     this._assignedSlots = new Set(); // 有資格觸發的演奏者槽位（指派了有音符的聲部）；空＝整首自動播放
-    this._segIndex = 0;        // 下一個要放行的 segment（同官方 Sequencer 的 index）
-    this._ticks = 0;           // 播放頭（可為小數 tick）
-    this._lastSegTicks = -1;   // 最近放行的 segment 的 tick：起音 tick ≤ 它的音都已經發聲（相連音撐住的判斷用）
-    this._lastTrigger = null;  // { ticks, ms }：上一次觸發的 segment tick 與時刻（估 playbackRate 用）
-    this._started = false;     // 重設後有沒有被觸發過：沒有就不推進播放頭（沒人開始，進度停在 0）
-    this._stallSec = 0;        // 播放頭停在下一個 segment 已經多久（真實秒）
-    this.unplacedStaffIds = []; // 輸出 channel 排不進去（旋律 staff 超過 60 個、鼓組超過 4 種）的 staff，這一輪不出聲
+    this._hasPrelude = false;  // 第一個 driver 起音之前有 follower 的音（別的聲部先進）：前奏鎖要不要生效
+    this._totalNotes = 0;      // 所有排得進 channel 的音（isFinished 要全部發過聲才算）
+    // 播放狀態（_resetPlayback() 要全部重設）
     this._playing = false;
-    this._lastTickMs = null;   // null＝下一次 tick() 不推進播放頭，只記錄基準
+    this._segIndex = 0;        // 下一個要放行的 driver segment
+    this._clockMs = 0;         // 排程器時鐘（只在 tick／trigger 前進，暫停不走）
+    this._lastTickMs = null;   // null＝下一次 tick() 的 dt 是 0
+    this._anchor = null;       // 目前這一段的錨點 { slice, clockMs, scoreSec, rate }
+    this._anchoredSlice = -1;  // 已經被啟動的最大段（第 0 段＝前奏，第 k+1 段由第 k 次按鍵啟動）
+    this._pending = [];        // 排好時刻、還沒發聲的 follower 音：[{ dueMs, offMs, staff, note }]，依 dueMs 排序
+    this._preludeCredit = false; // 前奏鎖期間有人預按過（布林）：播放頭到入場點時自動放行第一個起音
+    this._lateMs = [];         // 量測：tick() 放出的電腦音，比排好的時刻晚了幾毫秒（見 lateStats()）
+    this._audioBase = null;    // 只在 tick() 執行期間有值：{ audio: AudioContext 時間（秒）, clock: 這一刻的排程器時鐘 }，lookahead 換算時間戳用
+    this._sounded = new Set(); // 已經發過聲的音（每顆音恰好一次）
+    this._history = [];        // 有效按鍵 [{ scoreSec, ms }]，估速用
+    this._lastAcceptClock = null;     // 上一次有效按鍵的時鐘（去抖用）
+    this._lastAttemptClock = null;    // 上一次按鍵嘗試（含被忽略的）的時鐘
+    this._lastAttemptIntervalMs = Infinity; // 前兩次按鍵嘗試之間的間隔（去抖窗口用）
   }
 
   setSynths(assistSynth, humanSynth) {
@@ -222,13 +250,21 @@ export class Scheduler {
     return staff.kind === 'human' ? this.humanSynth : this.assistSynth;
   }
 
-  // 沒有任何有資格觸發的槽位：整首自動播放（播放頭 1× 連續前進，走到的 segment 自動放行）。
-  _isAuto() {
-    return this._assignedSlots.size === 0;
+  _secOf(tick) {
+    return this._score.midiTicksToSeconds(tick);
+  }
+
+  // 某個 tick 屬於第幾段：落在第 k 個 driver 起音（含）到第 k+1 個之前＝第 k+1 段；第一個 driver 起音之前＝第 0 段（前奏）。
+  // 二分搜尋「≤ tick 的 driver 起音有幾個」（upper bound）。
+  _sliceOfTick(tick) {
+    const a = this._driverTicks;
+    let lo = 0, hi = a.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (a[mid] <= tick) lo = mid + 1; else hi = mid; }
+    return lo;
   }
 
   /**
-   * 載入這首歌：建立 staff、套初始音色，把 parser 的 segment 配上各自的 staff。
+   * 載入這首歌：建立 staff、套初始音色，把全曲的音分成 driver segment 與 follower。
    * @param {import('./midiParser.js').ParsedMidi} score  parseMidi() 的結果（每顆音會被標上 legatoTo，同一份譜重新載入的
    *        結果相同；其餘不會被修改）
    * @param {Map<string,number>|[string,number][]} assignments  partId → 演奏者槽位
@@ -237,14 +273,16 @@ export class Scheduler {
     this.stop();
     this._score = score || null;
     this._staves = new Map();
-    this._segments = [];
+    this._driverSegs = []; this._driverTicks = []; this._followers = []; this._sliceFirst = [];
     this._assignedSlots = new Set();
+    this._hasPrelude = false;
+    this._totalNotes = 0;
     this.unplacedStaffIds = [];
     if (score) this._createStaves(score, assignments);
-    // 沒有樂譜時 staves 與 segments 都是空的：tick() 空轉。
+    // 沒有樂譜時 staves 與計畫都是空的：tick() 空轉。
   }
 
-  // 建立 staff、套初始音色、標記每顆音的相連後繼音、把全曲的 segment 配上 staff。
+  // 建立 staff、套初始音色、標記每顆音的相連後繼音、建立 driver segment 與 follower 清單。
   _createStaves(score, assignments) {
     const assignMap = assignments instanceof Map ? assignments : new Map(assignments || []);
 
@@ -255,25 +293,41 @@ export class Scheduler {
     for (const staff of this._staves.values()) this._applyInitialPatch(this._synthOf(staff), staff);
 
     this._tagLegato();
-    this._buildSegments();
+    this._buildPlan();
   }
 
-  // parser 的 segment（全曲同一個 startTick 的所有音）→ 排程用的 segment：每顆音換成 { staff, note }。沒有輸出 channel 的
-  // staff 的音被丟掉；整個 segment 都被丟光就不收（一次觸發不該只推進一個不會響的 segment）。
-  _buildSegments() {
+  // driver segment：沿用 parser 的 segment（同一個 startTick 的所有音），只留 driver staff 的音；整個 segment 沒有 driver 的音
+  // 或都排不進 channel 就不收（一次按鍵不該只推進一個不會響的 segment）。follower：所有 follower staff 的音依 startTick 排序
+  // （score.notes 本來就排好了），並記下每一段的第一個在哪。
+  _buildPlan() {
+    for (const staff of this._staves.values()) this._totalNotes += staff.notes.length;
     for (const seg of this._score.segments) {
       const items = [];
       for (const note of seg.notes) {
         const staff = this._staves.get(staffKeyOf(note));
-        if (staff) items.push({ staff, note });
+        if (staff && staff.kind === 'human') items.push({ staff, note });
       }
-      if (items.length) this._segments.push({ ticks: seg.ticks, items });
+      if (items.length) { this._driverSegs.push({ ticks: seg.ticks, items }); this._driverTicks.push(seg.ticks); }
     }
-    // 指派了有音符的 staff 的槽位才有資格觸發；指派了但完全沒有音符（或都排不進 channel）的槽位不算，
-    // 全都不算就是自動播放。
+    // 指派了有音符的 staff 的槽位才有資格觸發；指派了但完全沒有音符（或都排不進 channel）的槽位不算，全都不算就是自動播放。
     for (const staff of this._staves.values()) {
       if (staff.kind === 'human' && staff.notes.length) this._assignedSlots.add(staff.slot);
     }
+    for (const note of this._score.notes) {
+      const staff = this._staves.get(staffKeyOf(note));
+      if (staff && staff.kind === 'assist') this._followers.push({ staff, note });
+    }
+    // _sliceFirst[s]：第一個屬於第 s 段（含）以後的 follower 位置，第 s 段的 follower ＝ [_sliceFirst[s], _sliceFirst[s+1])。
+    // followers 依 startTick 排序，段編號因此遞增：掃一遍，每遇到一個 follower，把還沒設定、編號 ≤ 它的段都設成這個位置。
+    const slices = this._driverSegs.length + 1;
+    this._sliceFirst = new Array(slices + 1).fill(this._followers.length);
+    let s = 0;
+    for (let i = 0; i < this._followers.length; i++) {
+      const slice = this._sliceOfTick(this._followers[i].note.startTick);
+      while (s <= slice) this._sliceFirst[s++] = i;
+    }
+    // 第 0 段（第一個 driver 起音之前）有 follower 的音就是前奏。純 tick 比較，沒有誤差；沒有 driver 時（整首自動播放）不鎖。
+    this._hasPrelude = this._driverSegs.length > 0 && this._sliceFirst[1] > this._sliceFirst[0];
   }
 
   // 標記每顆音的相連後繼音（見檔頭「收音」）：音符結尾到同一個譜表下一個起音點的間隙 ≤ θ（LEGATO_GAP_DIVISOR）
@@ -309,15 +363,15 @@ export class Scheduler {
 
   play() {
     this._playing = true;
-    // 避免暫停期間累積的時間被當成一次巨大的 dt，也不能把暫停那段當成兩次觸發的間隔去估速度。第一個 tick 的 dt 是 0。
+    // 第一個 tick 的 dt 是 0；暫停的時間不會算進時鐘（時鐘只在 tick() 前進），所以不用重設任何排好的時刻。
     this._lastTickMs = null;
-    this._lastTrigger = null;
   }
 
-  // 暫停：收掉還在響的音，播放頭與 segment 游標都保留（下次播放從原處繼續）。
+  // 暫停：收掉還在響的音，時鐘、錨點與排好的 follower 音都保留（下次播放從原處繼續）。
   pause() {
     this._playing = false;
     this._lastTickMs = null;
+    this._preludeCredit = false; // 預按作廢：續播後要重新按
     this.silence();
   }
 
@@ -333,8 +387,8 @@ export class Scheduler {
     for (const staff of this._staves.values()) {
       const synth = this._synthOf(staff);
       for (const [pitch, queue] of staff.sounding) {
-        for (let i = 0; i < queue.length; i++) {
-          try { synth?.noteOff(staff.channel, pitch); } catch (err) {}
+        for (const entry of queue) {
+          try { synth?.noteOff(staff.channel, pitch, this._offOpts(staff, entry)); } catch (err) {}
         }
       }
       staff.sounding.clear();
@@ -359,21 +413,27 @@ export class Scheduler {
   // 直接失敗）。呼叫端負責先收音（pause()）與決定要不要接著播放。
   _resetPlayback() {
     this._segIndex = 0;
-    this._ticks = 0;
-    this._lastSegTicks = -1;
-    this._lastTrigger = null;
-    this._started = false;
-    this._stallSec = 0;
-    this.playbackRate = 1;
+    this._clockMs = 0;
     this._lastTickMs = null;
+    this._anchor = null;
+    this._anchoredSlice = -1;
+    this._pending = [];
+    this._preludeCredit = false;
+    this._lateMs = [];
+    this._sounded.clear();
+    this._history = [];
+    this._lastAcceptClock = null;
+    this._lastAttemptClock = null;
+    this._lastAttemptIntervalMs = Infinity;
+    this.playbackRate = 1;
   }
 
   isPlaying() { return this._playing; }
 
-  // 播完：所有 segment 都放行完而且沒有還在響的音。有指派聲部但還沒有人觸發過，segment 一個都還沒放行，不算播完（還在等你開始）。
+  // 播完：所有音（你的與電腦的）都發過聲而且沒有還在響的音。有指派聲部但還沒按到，driver 的音沒發過，不算播完。
   isFinished() {
     if (!this._score) return false;
-    if (this._segIndex < this._segments.length) return false;
+    if (this._sounded.size < this._totalNotes) return false;
     for (const staff of this._staves.values()) {
       if (staff.sounding.size > 0) return false;
     }
@@ -381,113 +441,233 @@ export class Scheduler {
   }
 
   /**
-   * 播放頭目前在第幾個 tick（跟 note 的 startTick／endTick 同一個座標系）。唯讀、無副作用。
-   * @returns {number} tick（可為小數），夾在 [0, score.durationTicks]；沒有樂譜或沒有 staff 時 0
+   * 播放頭目前在第幾個 tick（跟 note 的 startTick／endTick 同一個座標系）：從這一段的錨點起，依速度往前走，最多走到你的
+   * 下一個起音（停格等你）。唯讀、無副作用。
+   * @returns {number} tick（可為小數），夾在 [0, score.durationTicks]；沒有樂譜、沒有 staff、還沒開始播時 0
    */
   getPositionTicks() {
-    if (!this._score || this._staves.size === 0) return 0;
+    const a = this._anchor;
+    if (!this._score || this._staves.size === 0 || !a) return 0;
+    let sec = a.scoreSec + ((this._clockMs - a.clockMs) * a.rate) / 1000;
+    const next = this._driverSegs[this._segIndex];
+    if (next) sec = Math.min(sec, this._secOf(next.ticks));
+    const ticks = this._score.secondsToMIDITicks(sec);
     const total = this._score.durationTicks;
-    return total > 0 ? Math.min(this._ticks, total) : this._ticks; // 放行完最後一個 segment 後播放頭不再受限，夾住不超過總長
+    return total > 0 ? Math.min(ticks, total) : ticks;
+  }
+
+  // 排程器時鐘在 nowMs 這一刻的值：上一個 tick 的時鐘，加上之後經過的真實時間（跟 tick() 一樣有步長上限）。
+  _clockAt(nowMs) {
+    if (this._lastTickMs == null) return this._clockMs;
+    return this._clockMs + Math.min(MAX_TICK_DT_MS, Math.max(0, nowMs - this._lastTickMs));
+  }
+
+  // 播放頭停在你的下一個起音已經多久（毫秒）：這一段依錨點速度預計走完的時刻之後的時間；沒有下一個起音（最後一段、
+  // 整首自動播放）就不會停格。
+  _stallMsAt(clockMs) {
+    const reach = this._reachClockMs();
+    return reach === null ? 0 : Math.max(0, clockMs - reach);
+  }
+
+  // 播放頭依這一段的錨點速度走到你的下一個起音的時鐘時刻；沒有錨點或沒有下一個起音（最後一段、整首自動播放）回 null。
+  _reachClockMs() {
+    const a = this._anchor;
+    const next = this._driverSegs[this._segIndex];
+    if (!a || !next) return null;
+    return a.clockMs + ((this._secOf(next.ticks) - a.scoreSec) * 1000) / a.rate;
+  }
+
+  // 第 0 段（前奏）在第一次需要時（第一個 tick 或第一次按鍵）用目前時鐘、1× 起算。
+  _ensureAnchored() {
+    if (this._anchoredSlice < 0) this._anchorSlice(0, this._clockMs, 0, 1);
+  }
+
+  // 啟動第 slice 段：記下錨點，把這一段的 follower 音各自排好發聲時刻（按下時刻 ＋ 樂譜秒差 ÷ 速度）與收音時刻（發聲時刻 ＋
+  // 音符原始時值 ÷ 速度），併進排程佇列（依 dueMs 排序）。上一段還沒放完的 follower 音留在佇列裡，照自己的時刻放完。
+  _anchorSlice(slice, clockMs, scoreSec, rate) {
+    this._anchor = { slice, clockMs, scoreSec, rate };
+    this._anchoredSlice = slice;
+    const from = this._sliceFirst[slice], to = this._sliceFirst[slice + 1];
+    const fresh = [];
+    for (let i = from; i < to; i++) {
+      const { staff, note } = this._followers[i];
+      const startSec = this._secOf(note.startTick);
+      const dueMs = clockMs + ((startSec - scoreSec) * 1000) / rate;
+      fresh.push({ dueMs, offMs: dueMs + ((this._secOf(note.endTick) - startSec) * 1000) / rate, staff, note });
+    }
+    // 兩個都已依 dueMs 排好的清單合併（穩定：同時刻舊的在前）
+    const merged = [], old = this._pending;
+    let a = 0, b = 0;
+    while (a < old.length || b < fresh.length) {
+      if (b >= fresh.length || (a < old.length && old[a].dueMs <= fresh[b].dueMs)) merged.push(old[a++]);
+      else merged.push(fresh[b++]);
+    }
+    this._pending = merged;
   }
 
   /**
-   * 觸發一次：放行全曲的下一個 segment，裡面所有 staff（你的與電腦輔助的）的音在這次呼叫內立刻 noteOn（不等 tick）。
-   * @param {number} slot   演奏者槽位（要有指派聲部才有資格推進全曲）
-   * @param {number} nowMs  performance.now()：用來估 playbackRate
-   * @returns {boolean} 有沒有放行（沒在播放、槽位沒有指派聲部、整首自動播放中、segment 都放行完了都回 false）
+   * 觸發一次：放行 driver 的下一個 segment，裡面的音在這次呼叫內立刻 noteOn；同時啟動它負責的那一段 follower。
+   * @param {number} slot   演奏者槽位（要有指派聲部才有資格）
+   * @param {number} nowMs  performance.now()
+   * @returns {boolean} 有沒有放行（沒在播放、槽位沒有指派聲部、整首自動播放中、segment 都放行完了、被去抖忽略都回 false）
    */
   trigger(slot, nowMs) {
-    if (!this._playing || !this._assignedSlots.has(slot) || this._segIndex >= this._segments.length) return false;
-    const seg = this._segments[this._segIndex++];
-    this._updatePlaybackRate(seg.ticks, nowMs);
-    this._emitSegment(seg);
-    this._started = true;
-    this._stallSec = 0;
+    if (!this._playing || !this._assignedSlots.has(slot) || this._segIndex >= this._driverSegs.length) return false;
+    this._ensureAnchored();
+    const clock = this._clockAt(nowMs);
+    const j = this._segIndex, seg = this._driverSegs[j];
+    const scoreSec = this._secOf(seg.ticks);
+
+    // 前奏鎖：別的聲部在你的第一個起音之前有音（例如卡農：大提琴先進、你控制後進的小提琴），前奏還沒播到你的入場點時，
+    // 按鍵不放行——放行會讓第 1 段用「現在」重新對時，前奏剩下的音就被跳過。這一下只記成「預按」（布林，按幾下都一樣），
+    // 播放頭走到入場點的那一刻由 tick() 自動放行第一個起音。不動估速、去抖與錨點。
+    if (j === 0 && this._hasPrelude && clock < this._reachClockMs() - EPS_MS) {
+      this._preludeCredit = true;
+      return false;
+    }
+
+    // 去抖：窗口依「這一步預估的真實長度」與「你上一次的按鍵間隔」；不論這次被接受與否，都算一次按鍵嘗試（只算被接受的，
+    // 一開始就比檔案快的人每隔一下的按鍵會一直被擋，速度學不起來）。第一次按鍵沒有前一個 segment 可比，不去抖。
+    let blocked = false;
+    if (this._lastAcceptClock != null) {
+      const expectedMs = ((scoreSec - this._secOf(this._driverSegs[j - 1].ticks)) * 1000) / this.playbackRate;
+      blocked = clock - this._lastAcceptClock < debounceWindowMs(expectedMs, this._lastAttemptIntervalMs);
+    }
+    if (this._lastAttemptClock != null) this._lastAttemptIntervalMs = clock - this._lastAttemptClock;
+    this._lastAttemptClock = clock;
+    if (blocked) return false;
+
+    // 接受：把按下的時刻納入時鐘（tick 之間的那一小段）
+    this._clockMs = clock;
+    this._lastTickMs = nowMs;
+    this._release(clock);
     return true;
   }
 
-  // 依「這次與上一次觸發」的樂譜秒數差 ÷ 真實秒數差估 playbackRate，夾在合理範圍。第一次觸發沒有間隔可估；你停手超過閒置門檻
-  // 代表中斷了，那一段不當成演奏速度，維持原本的值。
-  _updatePlaybackRate(ticks, nowMs) {
-    const prev = this._lastTrigger;
-    this._lastTrigger = { ticks, ms: nowMs };
-    if (!prev || this._stallSec > IDLE_MS / 1000) return;
-    const scoreSec = this._score.midiTicksToSeconds(ticks) - this._score.midiTicksToSeconds(prev.ticks);
-    const realSec = Math.max(1e-3, (nowMs - prev.ms) / 1000); // 兩次觸發同一毫秒時避免除以 0
-    this.playbackRate = Math.min(MAX_PLAYBACK_RATE, Math.max(MIN_PLAYBACK_RATE, scoreSec / realSec));
+  // 放行 _segIndex 這個 driver segment（按鍵 trigger() 與前奏結束時的預按放行共用），時刻 clock（排程器時鐘）。
+  _release(clock) {
+    const j = this._segIndex, seg = this._driverSegs[j];
+    const scoreSec = this._secOf(seg.ticks);
+    const idleBreak = this._stallMsAt(clock) > IDLE_MS;     // 停手超過閒置門檻：這次間隔不拿來估速（速度維持原本的值）
+    if (idleBreak) this._history = [];
+    this._history.push({ scoreSec, ms: clock });
+    this.playbackRate = estimatePlaybackRate(this._history, this.playbackRate);
+    this._lastAcceptClock = clock;
+    this._segIndex = j + 1;
+
+    this._anchorSlice(j + 1, clock, scoreSec, this.playbackRate);   // 先更新錨點與已啟動的段：解除這次放行的音所接續的相連音的撐住
+    this._closeByTick(seg.ticks);                                   // driver 的音 endTick ≤ 這個起音的，先收
+    this._closeDue();
+    for (const { staff, note } of seg.items) this._sound(staff, note, clock + ((this._secOf(note.endTick) - scoreSec) * 1000) / this.playbackRate);
+    this._emitPending();                                            // 同 tick 的 follower 音（dueMs ＝ 這一刻）跟你的音同刻
+    this._closeDue();                                               // 零長度的音
   }
 
-  // 放行一個 segment：播放頭到這個 segment 的 tick（只往前），先收掉 endTick ≤ 它的音，再讓裡面所有音 noteOn，最後再收一次
-  // （同一個 tick 內起音又結束的零長度音）。先收再放保證相連的舊音在後繼音發聲的同一刻已經關掉。
-  // trigger() 與自動播放共用；自動播放時播放頭可能已經超過這個 segment 的 tick（一個 tick 步長涵蓋好幾個 segment），所以收音
-  // 的基準用 segment 自己的 tick，不用播放頭。
-  _emitSegment(seg) {
-    this._lastSegTicks = seg.ticks; // 先更新：這個 segment 裡的音是被撐住的相連音的後繼音，要先解除撐住才收得掉
-    this._ticks = Math.max(this._ticks, seg.ticks);
-    this._closeDueNotes(seg.ticks);
-    for (const { staff, note } of seg.items) {
-      try { this._synthOf(staff)?.noteOn(staff.channel, note.midiNote, note.velocity); } catch (err) {}
-      this._pushSounding(staff, note);
+  // 讓一顆音發聲：記進 _sounded（每顆音恰好一次），noteOn，記進正在響的佇列（同音高先進先出）。dueMs＝預定發聲的時鐘時刻，
+  // 只有 tick() 裡的電腦音（lookahead）才會帶時間戳；onTime 記下那顆 noteOn 的 AudioContext 時間（沒帶時間戳＝undefined）。
+  _sound(staff, note, offMs, dueMs) {
+    this._sounded.add(note);
+    let queue = staff.sounding.get(note.midiNote);
+    if (!queue) staff.sounding.set(note.midiNote, (queue = []));
+    const opts = this._stamp(staff, dueMs);
+    queue.push({ endTick: note.endTick, offMs, legatoTo: note.legatoTo, note, onTime: opts?.time }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
+    try { this._synthOf(staff)?.noteOn(staff.channel, note.midiNote, note.velocity, opts); } catch (err) {}
+  }
+
+  // 時鐘時刻 ms 對應的 AudioContext 時間，包成 eventOptions。只有 tick() 裡（_audioBase 有值）的電腦輔助聲部才有；
+  // 你的聲部（human）與按鍵、暫停裡的呼叫回傳 undefined＝立刻處理。時刻已經過去時 worklet 也是立刻處理。
+  _stamp(staff, ms) {
+    if (staff.kind === 'human' || !this._audioBase || ms === undefined) return undefined;
+    return { time: this._audioBase.audio + (ms - this._audioBase.clock) / 1000 };
+  }
+
+  // 收音的 eventOptions：tick() 裡依預定時刻（offMs）帶時間戳；其餘情況（按鍵、暫停、閒置收音）立刻處理。但這顆音的 noteOn
+  // 如果是提早送出、還沒響（時間戳在未來），noteOff 一定要排在它後面（發聲後 1ms）：立刻處理的 noteOff 會比它早到，
+  // 之後那顆 noteOn 響了就再也收不掉（卡音）；兩個時間戳的換算來自不同的 tick，差幾毫秒的誤差也靠這個下限擋掉。
+  _offOpts(staff, entry, offMs) {
+    const stamp = this._stamp(staff, offMs);
+    if (entry.onTime === undefined) return stamp;
+    return { time: Math.max(stamp?.time ?? -Infinity, entry.onTime + 0.001) };
+  }
+
+  // 排好時刻已到的 follower 音依序發聲（佇列已依 dueMs 排序）。fromTick＝由 tick() 呼叫：只有這種放出才記遲到量，
+  // 按鍵呼叫內同刻放出的音（時鐘就是按下的那一刻）沒有「等 tick」這回事，記進去只會把統計稀釋成 0。
+  _emitPending(limitMs = this._clockMs, fromTick = false) {
+    let n = 0;
+    while (n < this._pending.length && this._pending[n].dueMs <= limitMs + EPS_MS) {
+      const p = this._pending[n++];
+      if (fromTick) {
+        this._lateMs.push(Math.max(0, this._clockMs - p.dueMs));
+        if (this._lateMs.length > LATE_SAMPLES_MAX) this._lateMs.shift();
+      }
+      this._sound(p.staff, p.note, p.offMs, p.dueMs);
     }
-    this._closeDueNotes(seg.ticks);
+    if (n) this._pending.splice(0, n);
   }
 
   /**
-   * 由 midiPlayer.js 的排程 tick（~12ms）每次呼叫：推進播放頭、（自動播放時）放出走到的 segment、收掉到期的音。
-   * 有指派聲部時這裡永遠不會放出起音，起音只來自 trigger()。
-   * @param {number} nowMs  performance.now()
+   * 量測：tick() 放出的電腦音比排好的時刻晚了多少（排程器時鐘 − dueMs，毫秒）的統計。這是 tick 間隔（12ms 計時器被主執行緒
+   * 的影像算繪／姿勢推論延後）造成的遲到；不含 AudioWorklet 的一個 render quantum（約 2.7ms）與瀏覽器輸出延遲。
+   * 重設（stop／restart／換歌）時清空。
    */
-  tick(nowMs) {
+  lateStats() { return summarizeMs(this._lateMs); }
+
+  /**
+   * 由 midiPlayer.js 的排程 tick（~12ms）每次呼叫：推進時鐘、放出到時間的 follower 音、收掉到期的音。
+   * driver 的起音永遠不在這裡放出，只來自 trigger()。
+   * @param {number} nowMs  performance.now()
+   * @param {number} [audioNow]  AudioContext 的目前時間（秒）。有給就啟用 lookahead：LOOKAHEAD_MS 以內要發聲／收音的電腦音
+   *        提早帶時間戳送出；沒給（單元測試、AudioContext 還沒就緒）就照到期時刻才發聲、不帶時間戳。
+   */
+  tick(nowMs, audioNow) {
     if (!this._playing || !this._score) return; // 沒有樂譜（load(null)）時空轉
-    const dt = this._lastTickMs == null ? 0 : Math.min(MAX_TICK_DT_SEC, (nowMs - this._lastTickMs) / 1000);
+    this._ensureAnchored();
+    const dt = this._lastTickMs == null ? 0 : Math.min(MAX_TICK_DT_MS, Math.max(0, nowMs - this._lastTickMs));
     this._lastTickMs = nowMs;
-    this._advancePlayhead(dt);
-    if (this._isAuto()) this._emitDueSegments();
-    this._closeDueNotes(this._ticks);
+    this._clockMs += dt;
+    const timed = Number.isFinite(audioNow);
+    this._audioBase = timed ? { audio: audioNow, clock: this._clockMs } : null;  // 只在這個 tick 內有效：按鍵、暫停的呼叫一律立刻處理
+    try { this._tickBody(timed ? this._clockMs + LOOKAHEAD_MS : this._clockMs); }
+    finally { this._audioBase = null; }
   }
 
-  // 播放頭前進 dt 真實秒：速度是 playbackRate（自動播放固定 1×），換算成 tick 的做法是 tick → 秒 → 加 dt × 速度 → tick
-  // （速度表在 tick ↔ 秒之間是分段線性，不能直接把 dt 乘上固定的 tick／秒），最多走到下一個 segment 的 tick（有指派時）。
-  // 碰到上限就停格，停格超過閒置門檻把所有還在響的音收掉（相連音撐住只是不在停格那一下提早收，不是延音效果）。
-  _advancePlayhead(dt) {
-    if (dt <= 0) return;
-    const auto = this._isAuto();
-    if (!auto && !this._started) return; // 還沒有人觸發：沒人開始，播放頭停在 0
-    const next = this._segments[this._segIndex];
-    const cap = !auto && next ? next.ticks : Infinity;
-    const rate = auto ? 1 : this.playbackRate;
-    const score = this._score;
-    const target = score.secondsToMIDITicks(score.midiTicksToSeconds(this._ticks) + dt * rate);
-    // 外層 Math.max：播放頭只前進、不倒退
-    this._ticks = Math.max(this._ticks, Math.min(target, cap));
-
-    if (cap !== Infinity && this._ticks >= cap - EPS_TICKS) {
-      this._stallSec += dt;
-      if (this._stallSec > IDLE_MS / 1000) this._noteOffAll();
-    } else {
-      this._stallSec = 0;
+  _tickBody(horizonMs) {
+    this._closeDue(horizonMs);     // 先收再放：到期的舊音在同一個 tick 要發聲的新音之前關掉（同音高相連音才不會被連帶關掉）
+    this._emitPending(horizonMs, true);
+    this._closeDue(horizonMs);     // 剛發聲就到期的短音
+    // 前奏鎖期間有人預按過：播放頭到了入場點就放行第一個起音。放行時刻取「剛好到達」的那一刻（不是這個 tick 的時鐘），
+    // 第 1 段的錨點因此接在前奏的 1× 時間軸上；落在這一刻到現在之間的電腦音由 _release() 裡的 _emitPending() 補放。
+    if (this._preludeCredit && this._segIndex === 0) {
+      const reach = this._reachClockMs();
+      if (reach !== null && this._clockMs >= reach - EPS_MS) { this._preludeCredit = false; this._release(reach); }
     }
+    if (this._stallMsAt(this._clockMs) > IDLE_MS) this._noteOffAll(); // 停格太久：長音、相連音都不能無限期響著
   }
 
-  // 自動播放：放出所有起音 tick ≤ 播放頭的 segment（同一個 tick 步長可能涵蓋好幾個，依序放）。
-  _emitDueSegments() {
-    while (this._segIndex < this._segments.length && this._segments[this._segIndex].ticks <= this._ticks + EPS_TICKS) {
-      this._emitSegment(this._segments[this._segIndex++]);
-    }
-  }
-
-  _pushSounding(staff, note) {
-    let queue = staff.sounding.get(note.midiNote);
-    if (!queue) staff.sounding.set(note.midiNote, (queue = []));
-    queue.push({ endTick: note.endTick, legatoTo: note.legatoTo });
-  }
-
-  // 收掉到期的音（endTick ≤ ticks，沒被撐住）。同音高重疊時只看佇列最前面那一顆（先進先出）。
-  _closeDueNotes(ticks) {
+  // 收掉到期的音（offMs ≤ limitMs，沒被撐住）。同音高重疊時只看佇列最前面那一顆（先進先出）。limitMs 預設是時鐘；tick()
+  // 帶 lookahead 時是時鐘 + LOOKAHEAD_MS，只對電腦輔助聲部生效——你的音永遠在時鐘到了才收。
+  _closeDue(limitMs = this._clockMs) {
     for (const staff of this._staves.values()) {
       const synth = this._synthOf(staff);
+      const limit = staff.kind === 'human' ? this._clockMs : limitMs;
       for (const [pitch, queue] of staff.sounding) {
-        while (queue.length && queue[0].endTick <= ticks + EPS_TICKS && !this._isHeld(staff, queue[0])) {
+        while (queue.length && queue[0].offMs <= limit + EPS_MS && !this._isHeld(staff, queue[0])) {
+          try { synth?.noteOff(staff.channel, pitch, this._offOpts(staff, queue[0], queue[0].offMs)); } catch (err) {}
+          queue.shift();
+        }
+        if (!queue.length) staff.sounding.delete(pitch);
+      }
+    }
+  }
+
+  // 下一次按鍵時，driver 的音 endTick ≤ 新錨點 tick 的先收掉（你的下一個起音發聲時，之前該結束的音已經結束，不管估到的
+  // 速度怎樣）。只收 driver：follower 的音照自己的時刻（MIDI 音符長度）放完，不被你的按鍵切斷。
+  _closeByTick(ticks) {
+    for (const staff of this._staves.values()) {
+      if (staff.kind !== 'human') continue;
+      const synth = this._synthOf(staff);
+      for (const [pitch, queue] of staff.sounding) {
+        while (queue.length && queue[0].endTick <= ticks && !this._isHeld(staff, queue[0])) {
           try { synth?.noteOff(staff.channel, pitch); } catch (err) {}
           queue.shift();
         }
@@ -496,11 +676,10 @@ export class Scheduler {
     }
   }
 
-  // 相連音要不要繼續撐：它的後繼音還沒放行（起音 tick 在最近放行的 segment 之後）。後繼音一放行就不再撐，在後繼音
-  // 發聲的同一刻先關再開；整首自動播放永遠不撐，每個 noteOff 都照檔案。
+  // 相連音要不要繼續撐：它的後繼音還沒發聲，而且落在還沒被按鍵啟動的段（要等你按才會發聲）。後繼音在已啟動的段裡就不撐——
+  // 它自己有排好的時刻；整首自動播放只有第 0 段，永遠不撐，每個 noteOff 都照檔案。
   _isHeld(staff, entry) {
-    if (this._isAuto()) return false;
     const successor = staff.notes[entry.legatoTo]; // legatoTo ＝ -1 時是 undefined
-    return !!successor && successor.startTick > this._lastSegTicks;
+    return !!successor && !this._sounded.has(successor) && this._sliceOfTick(successor.startTick) > this._anchoredSlice;
   }
 }

@@ -8,7 +8,13 @@
 import * as midiPlayer from './midi/midiPlayer.js';
 import { initUi, setLoadingStatus, dismissLoading, showError } from './ui.js';
 import { startVision, setPoseCountListener } from './vision/vision.js';
-import { startKeyboardTrigger } from './keyboard.js';
+import { startKeyboardTrigger, getInputDelays } from './keyboard.js';
+import { summarizeMs } from './midi/pressTiming.js';
+
+// 開發用量測：在 console 輸入 __stats() 讀取。電腦音遲到量（12ms 的排程 tick 放出電腦音，比排好的時刻晚多少）與鍵盤事件
+// 在主執行緒佇列裡等待的時間——用來判斷影像算繪／姿勢推論把主執行緒卡住的程度，在你的機器上是不是真的聽得出來。
+// 兩個都只量 JS 層，不含音訊 worklet 的一個 render quantum（約 2.7ms）與瀏覽器輸出延遲。
+window.__stats = () => ({ 電腦音遲到ms: midiPlayer.lateStats(), 按鍵事件等待ms: summarizeMs(getInputDelays()) });
 
 async function bootSystem() {
   midiPlayer.startPlayer(); // 200ms UI tick 與 12ms 排程 tick，不靠 import 副作用

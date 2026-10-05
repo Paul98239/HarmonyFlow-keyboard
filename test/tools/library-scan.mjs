@@ -4,13 +4,14 @@
 //  四種掃描（--only=parse,autoplay,perform,scenarios，預設全跑）：
 //    parse      每首歌解析與聲部切分：沒有例外、至少 1 個 part、每個 staff 都分得到輸出 channel、警告分類統計、
 //               多聲部（可指派）的歌有幾首；〈蝸牛與黃鸝鳥〉必須切成「長笛、大鋼琴」（使用者用原始 MuseScore 檔確認過的金標準）；
-//               另外印出按鍵負擔：一次觸發放行一個 segment，每首歌要按幾下、原速下每秒要按幾下。
+//               另外印出按鍵負擔：只有被指派的聲部要按（這裡取音符最多的聲部），每首歌要按幾下、原速下每秒要按幾下。
 //    autoplay   每首歌整首自動播放（沒有人被指派）：每顆音都發聲、每個 noteOn 一個 noteOff（「成對」以音為單位，
 //               原檔用 Note Off 還是 velocity 0 的 Note On 結束都一樣）、起訖時間誤差 ≤ 一個排程 tick（12ms）。
-//    perform    多聲部歌曲 × 5 種逐 segment 觸發風格（準時／快 20％／快 3 倍＋抖動／慢 25％＋抖動／慢 2 倍＋抖動），指派音符最多的
-//               聲部：每個 segment 都放行、每顆音（你的與電腦輔助的）在放行它的那一次觸發當下發聲（0ms）、不卡音、
-//               同一個 tick 的音同刻（差 0ms）——任何按鍵速度都成立，沒有放寬的選項。
-//    scenarios  情境掃描：一人兩聲部、多人（2～4 位輪流按）、連按（比樂譜快很多）、中途停手（不再回來／回來）、第一下提早按——
+//    perform    多聲部歌曲 × 5 種按鍵風格（準時／快 20％／快 3 倍＋抖動／慢 25％＋抖動／慢 2 倍＋抖動），指派音符最多的聲部：
+//               你的每個起音都放行、你的每顆音在按鍵當下發聲（0ms）、電腦聲部不用按而且一顆不丟、每個 noteOn 一個 noteOff、
+//               同一個 tick 的音（你的與電腦的）同刻（差 0ms）——任何按鍵速度都成立，沒有放寬的選項。被去抖擋掉的按鍵會重按。
+//    scenarios  情境掃描：一人兩聲部、多人（2～4 位輪流按，聲部都被指派）、連按（每 24ms 一下，被去抖擋掉的重按）、中途停手
+//               （不再回來／回來）、第一下提早按——
 //               每個情境都用同一組不變量判定通過與否。
 //
 //  曲庫：預設放在 test/tools/library/（不進 git）。第一次先 `--download` 從遠端曲庫抓下來（單連線＋間隔，已有的
@@ -25,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { parseMidi } from '../../src/midi/midiParser.js';
 import { Scheduler } from '../../src/midi/scheduler.js';
-import { autoPlayStats, makeRng, measure, onsetPresses, pressLoad, rankedParts, segmentSecs, simulate } from './sim.mjs';
+import { autoPlayStats, driverPressLoad, driverSecs, makeRng, measure, onsetPresses, rankedParts, simulate } from './sim.mjs';
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'library'));
@@ -101,10 +102,10 @@ function scanParse(songs, fileCount) {
   if (unplaced.length) problems++;
   const multi = songs.filter((s) => s.score.parts.length >= 2);
   console.log(`多聲部（≥2 個 part，可以指派演奏者）：${multi.length} 首／${songs.length} 首；單一 part：${songs.length - multi.length} 首`);
-  // 一次觸發放行一個 segment：按鍵數＝全曲 segment 數。原速（樂譜速度）下平均／最忙 1 秒要按幾下，決定這個模型實際好不好彈。
-  const loads = songs.map((x) => pressLoad(x.score)).filter((l) => l.segments > 0);
+  // 只有被指派的聲部要按，電腦聲部不用按：按鍵數＝這個聲部的不同起音數。原速（樂譜速度）下平均／最忙 1 秒要按幾下，決定好不好彈。
+  const loads = songs.map((x) => { const main = rankedParts(x.score)[0]; return main ? driverPressLoad(x.score, [main.id]) : null; }).filter((l) => l && l.presses > 0);
   const med = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
-  console.log(`按鍵負擔（一次觸發放行一個 segment）：每首 segment 數 中位 ${med(loads.map((l) => l.segments))}、最多 ${Math.max(...loads.map((l) => l.segments))}；原速每秒平均要按 中位 ${med(loads.map((l) => l.perSecAvg)).toFixed(1)} 下、最大 ${Math.max(...loads.map((l) => l.perSecAvg)).toFixed(1)} 下；最忙的 1 秒內要按 中位 ${med(loads.map((l) => l.perSecPeak))} 下、最多 ${Math.max(...loads.map((l) => l.perSecPeak))} 下`);
+  console.log(`按鍵負擔（只按主聲部＝音符最多的聲部）：每首要按 中位 ${med(loads.map((l) => l.presses))} 下、最多 ${Math.max(...loads.map((l) => l.presses))} 下；原速每秒平均 中位 ${med(loads.map((l) => l.perSecAvg)).toFixed(1)} 下、最大 ${Math.max(...loads.map((l) => l.perSecAvg)).toFixed(1)} 下；最忙的 1 秒內 中位 ${med(loads.map((l) => l.perSecPeak))} 下、最多 ${Math.max(...loads.map((l) => l.perSecPeak))} 下`);
   const warnKinds = new Map();
   for (const s of songs) for (const w of s.score.warnings) {
     const k = w.replace(/\d+(\.\d+)?/g, 'N').slice(0, 48);
@@ -148,8 +149,8 @@ function scanAutoplay(songs) {
 
 const STYLES = [['準時', 1, 0], ['快 20％', 0.8, 0], ['快 3 倍＋抖動 30％', 0.3, 0.3], ['慢 25％＋抖動 15％', 1.25, 0.15], ['慢 2 倍＋抖動 20％', 2, 0.2]];
 
-// 每次模擬共用的不變量（任何按鍵速度與人數都成立，沒有放寬的選項）：該放行的都發聲、每個 noteOn 一個 noteOff、每顆音都在放行它的
-// 那一次觸發當下發聲、同一個 tick 的音同刻（差 0ms）；completePresses＝每個 segment 都有被按到，這時一個都不能沒被放行。
+// 每次模擬共用的不變量（任何按鍵速度與人數都成立，沒有放寬的選項）：該放行的都發聲（你的音與電腦的音）、每個 noteOn 一個 noteOff、
+// 你的每顆音都在按鍵當下發聲、同一個 tick 的音同刻（差 0ms）；completePresses＝你的每個起音都有被按到，這時一個都不能沒被放行。
 const violations = (m, { completePresses = true } = {}) => m.releasedMissing || m.unpaired || m.strayOff || m.badVelocity
   || m.offTrigger || m.syncMax > 0 || (completePresses && m.notReleased);
 
@@ -157,17 +158,17 @@ function scanPerform(songs) {
   const multi = songs.filter((s) => s.score.parts.length >= 2 && rankedParts(s.score).length);
   const rows = [];
   for (const s of multi) {
-    const main = rankedParts(s.score)[0], secs = segmentSecs(s.score);
+    const main = rankedParts(s.score)[0], secs = driverSecs(s.score, [main.id]);
     for (const [styleName, factor, jitter] of STYLES) {
       const presses = onsetPresses(secs, { factor, jitter, rnd: makeRng(21) });
-      rows.push({ s, main, styleName, m: measure(simulate(s.score, [{ partIds: [main.id], presses }])) });
+      rows.push({ s, main, styleName, m: measure(simulate(s.score, [{ partIds: [main.id], presses, keepGoing: true }])) });
     }
   }
   const sum = (key) => rows.reduce((a, r) => a + r.m[key], 0), count = (f) => rows.filter((r) => f(r.m)).length;
-  console.log(`\n=== 多聲部歌曲 ${multi.length} 首 × ${STYLES.length} 種逐 segment 觸發風格 ＝ ${rows.length} 次模擬（各指派音符最多的聲部）===`);
-  console.log(`該放行卻沒發聲的音：${sum('releasedMissing')} 顆（${count((m) => m.releasedMissing)} 次模擬）；沒被放行的音（觸發不夠多）：${sum('notReleased')} 顆`);
+  console.log(`\n=== 多聲部歌曲 ${multi.length} 首 × ${STYLES.length} 種按鍵風格 ＝ ${rows.length} 次模擬（各指派音符最多的聲部）===`);
+  console.log(`該放行卻沒發聲的音：${sum('releasedMissing')} 顆（${count((m) => m.releasedMissing)} 次模擬）；沒被放行的音（按得不夠多）：${sum('notReleased')} 顆；被去抖擋掉再重按的次數：${sum('blocked')}`);
   console.log(`每個 noteOn 一個 noteOff：沒收的音 ${sum('unpaired')} 個（${count((m) => m.unpaired)} 次）、多餘的 noteOff ${sum('strayOff')} 個、velocity 0 的 noteOn ${sum('badVelocity')} 個`);
-  console.log(`不在放行它的那一次觸發當下發聲的音：${sum('offTrigger')} 顆；同刻音發聲差 > 0ms：${count((m) => m.syncMax > 0)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）`);
+  console.log(`你的音不在按鍵當下發聲：${sum('offTrigger')} 顆；同刻音發聲差 > 0ms：${count((m) => m.syncMax > 0)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）`);
   const bad = rows.filter((r) => violations(r.m));
   for (const r of bad.slice(0, 8)) console.log('  ✗', r.s.title, r.main.name, r.styleName, JSON.stringify(r.m));
   return bad.length;
@@ -177,25 +178,26 @@ function scanPerform(songs) {
    掃描 3：情境
    ═══════════════════════════════════════════ */
 
-// 每個情境：players（每位演奏者的聲部與觸發時間表）。沒有按完整首的情境（停手）notReleased 不算違規（complete: false）。
+// 每個情境：players（每位演奏者的聲部與按鍵時間表）。沒有按完整首的情境（停手）notReleased 不算違規（complete: false）。
+// 被指派的聲部（driver）才要按：按鍵時間表依「被指派聲部的起音」排；沒被指派的聲部是電腦輔助，不用按。
 function buildScenarios(score, rnd) {
   const [A, B, C, D] = rankedParts(score).map((p) => p.id);
-  const secs = segmentSecs(score);
+  const secsA = driverSecs(score, [A]);
   const out = [];
   const add = (name, players, o = {}) => out.push({ name, players, ...o });
-  const solo = (name, o, extra = {}) => add(name, [{ partIds: [A], presses: onsetPresses(secs, { rnd, ...o }) }], extra);
-  // 同一張時間表輪流交給多位演奏者按（第 i 下由第 i % n 位按）：任何有指派聲部的演奏者按一下都推進全曲。
-  const roundRobin = (ids, o) => { const all = onsetPresses(secs, { rnd, ...o }); return ids.map((id, k) => ({ partIds: [id], presses: all.filter((_, i) => i % ids.length === k) })); };
+  const solo = (name, o, extra = {}) => add(name, [{ partIds: [A], presses: onsetPresses(secsA, { rnd, ...o }) }], extra);
+  // 同一張時間表（被指派聲部的起音聯集）輪流交給多位演奏者按（第 i 下由第 i % n 位按）：任何有指派聲部的演奏者按一下都推進。
+  const roundRobin = (ids, o) => { const all = onsetPresses(driverSecs(score, ids), { rnd, ...o }); return ids.map((id, k) => ({ partIds: [id], presses: all.filter((_, i) => i % ids.length === k) })); };
 
   solo('準時（單人）', {});
-  solo('第一下提早按（單人，落在第一個 segment 之前 70％處，之後準時）', { leadMs: -secs[0] * 700 });
+  solo('第一下提早按（單人，落在你的第一個起音之前 70％處，之後準時）', { leadMs: -secsA[0] * 700 });
   solo('按得比樂譜快很多（單人，間隔 ×0.3、抖動 ±30％）', { factor: 0.3, jitter: 0.3 });
   solo('按得比樂譜慢很多（單人，間隔 ×3、抖動 ±30％）', { factor: 3, jitter: 0.3 });
-  solo('連按（單人，每 24ms 一下，比樂譜快很多）', { burst: true });
-  solo('中途停手（單人，第 20 個 segment 之後不再按）', { pause: [19, Infinity] }, { complete: false });
-  for (const sec of [0.6, 2, 8]) solo(`停手 ${sec} 秒後回來（單人，第 20 個 segment 之後）`, { pause: [19, sec * 1000] });
+  solo('連按（單人，每 24ms 一下，被去抖擋掉的重按，比樂譜快很多）', { burst: true });
+  solo('中途停手（單人，第 20 個起音之後不再按）', { pause: [19, Infinity] }, { complete: false });
+  for (const sec of [0.6, 2, 8]) solo(`停手 ${sec} 秒後回來（單人，第 20 個起音之後）`, { pause: [19, sec * 1000] });
   if (B) {
-    add('一人兩個聲部', [{ partIds: [A, B], presses: onsetPresses(secs, { rnd, jitter: 0.1 }) }]);
+    add('一人兩個聲部', [{ partIds: [A, B], presses: onsetPresses(driverSecs(score, [A, B]), { rnd, jitter: 0.1 }) }]);
     add('兩位演奏者（輪流按、抖動）', roundRobin([A, B], { jitter: 0.1 }));
     const [pa, pb] = roundRobin([A, B], {});
     add('兩位演奏者，其中一位中途停手不再回來（剩下的人按不完全曲）', [pa, { ...pb, presses: pb.presses.slice(0, 10) }], { complete: false });
@@ -211,12 +213,12 @@ function scanScenarios(songs) {
   const byName = new Map();
   for (const s of songs.filter((x) => rankedParts(x.score).length >= 1)) {
     for (const sc of buildScenarios(s.score, makeRng(7))) {
-      const m = measure(simulate(s.score, sc.players));
+      const m = measure(simulate(s.score, sc.players.map((p) => ({ ...p, keepGoing: sc.complete !== false }))));
       if (!byName.has(sc.name)) byName.set(sc.name, []);
       byName.get(sc.name).push({ s, m, opts: { completePresses: sc.complete !== false } });
     }
   }
-  console.log(`\n=== 情境掃描（每個情境的不變量：該放行的音都發聲、每個 noteOn 一個 noteOff、每顆音在放行它的觸發當下發聲、同刻音差 0ms）===`);
+  console.log(`\n=== 情境掃描（每個情境的不變量：該放行的音都發聲、每個 noteOn 一個 noteOff、你的音在按鍵當下發聲、同刻音差 0ms）===`);
   let failures = 0;
   for (const [name, runs] of byName) {
     const sum = (key) => runs.reduce((a, r) => a + r.m[key], 0);

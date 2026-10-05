@@ -279,6 +279,31 @@ async function checkWorkletReadback(page, problems) {
   check(drumStaff?.channel === 9 && JSON.stringify(got.drums) === '[9,25,41,57]', '打擊 staff 在 channel 9，且載入後 worklet 的打擊配置仍是 GM（9／25／41／57）', problems, JSON.stringify({ channel: drumStaff?.channel, drums: got.drums }));
 }
 
+// 時間戳（lookahead 的前提）：WorkletSynthesizer 的 eventOptions.time 跟 AudioContext.currentTime 是同一條時鐘——時間戳在未來的事件
+// worklet 排隊、到時才處理，已經過去的立刻處理。用 worklet 回報的 noteOn 抵達時間驗證（回報是非同步的，所以容許幾百毫秒的誤差）。
+// 時鐘對不上時（例如差了一個時間原點）未來的事件會馬上響或永遠不響，整個 lookahead 就沒有意義，單元測試看不到這一點。
+async function checkTimedEvents(page, problems) {
+  console.log('▶ 時間戳：worklet 依 AudioContext 時間排隊（未來的事件到時才響、過去的立刻響）…');
+  const r = await page.evaluate(async () => {
+    const { scheduler, audioNow } = await import('/src/midi/synth.js');
+    const syn = scheduler.assistSynth, arrived = {};
+    syn.eventHandler.addEvent('noteOn', 'smoke-timed', (e) => { arrived[e.midiNote] ??= performance.now(); });
+    const ctxNow = audioNow();
+    if (ctxNow === undefined) return { running: false };
+    const t0 = performance.now();
+    syn.noteOn(0, 70, 100, { time: ctxNow + 0.8 });      // 未來 800ms
+    syn.noteOn(0, 71, 100, { time: ctxNow - 1 });        // 過去：立刻處理
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    syn.noteOff(0, 70); syn.noteOff(0, 71);
+    syn.eventHandler.removeEvent('noteOn', 'smoke-timed');
+    return { running: true, future: arrived[70] - t0, past: arrived[71] - t0 };
+  });
+  check(r.running, 'AudioContext 在跑（audioNow() 有值）', problems, JSON.stringify(r));
+  if (!r.running) return;
+  check(Number.isFinite(r.future) && r.future >= 650 && r.future <= 1500, '時間戳在未來 800ms 的 noteOn：約 800ms 後才被 worklet 處理（不是馬上、也不是永遠不響）', problems, `實際 ${r.future}ms`);
+  check(Number.isFinite(r.past) && r.past <= 500, '時間戳已經過去的 noteOn：立刻處理', problems, `實際 ${r.past}ms`);
+}
+
 // 試聽基本操作（選好範例、演奏還沒播過的 ready 狀態開始）：♪ 進入試聽 → 時間真的往前走 → ❚❚ 暫停
 // （時間停住）→ ▶ 續播（從暫停處繼續，不是從頭）→ 再暫停 → ↻ 重播（回到第一個音附近）→ ♪ 離開，
 // 回到演奏「已載入、還沒播過」。這也是第一次在 AudioContext 還沒恢復時用到官方 Sequencer：時間會動
@@ -400,10 +425,12 @@ async function driveAppToPlaying(page, problems) {
 
   await drivePreviewControls(page, problems);
   await checkWorkletReadback(page, problems);
+  await checkTimedEvents(page, problems);
   await loadLocalFile(page, { name: 'canon-violin-cello.mid', mimeType: 'audio/midi', buffer: readFileSync(SAMPLE_MIDI) }); // 換回範例樂譜，後面的流程照舊
 
   console.log('▶ 把第一個聲部指派給演奏者 1…');
-  await page.locator('.score-part-id').first().selectOption('1');
+  // 下拉要等姿勢模型（landmarker）建好、現場人數生效才列出「演奏者 1」：模型是懶惰載入，慢的機器上要 40 秒以上，超過 Playwright 預設的 30 秒
+  await page.locator('.score-part-id').first().selectOption('1', { timeout: 120000 });
 
   console.log('▶ 按下播放…');
   await page.click('#btnPlay');
@@ -435,30 +462,66 @@ async function driveAppToPlaying(page, problems) {
   if (!finOk) problems.push(`播完後按 ▶ 沒有從頭播：${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s`);
 }
 
-// 鍵盤觸發（接在 driveAppToPlaying 後面，此時演奏播放中、第一個聲部指派給演奏者 1）：觀察點是排程器的 segment 游標
-// （segIndex＝已放行的 segment 數、started＝重設後被觸發過）。trigger() 在 keydown 事件裡同步執行，按鍵送出之後游標立刻就變了，
-// 不用等排程 tick——所以讀取前不需要任何等待。
+// 鍵盤觸發（接在 driveAppToPlaying 後面，此時演奏播放中、第一個聲部指派給演奏者 1）：觀察點是排程器的 driver segment 游標
+// （segIndex＝已放行的 driver segment 數）。trigger() 在 keydown 事件裡同步執行，按鍵送出之後游標立刻就變了，不用等排程 tick——
+// 所以讀取前不需要任何等待。但兩次有效按鍵之間要隔過去抖窗口（最長 500ms，見 pressTiming.js），預期「被放行」的按鍵前先
+// waitDebounce()，不然會被當成手抖忽略。等的是「排程器時鐘」走過窗口，不是真實時間：headless 同時跑姿勢推論時排程器時鐘只有真實時間的三成左右。
+const waitDebounce = (page) => page.waitForFunction(() => {
+  const sch = window.__hf.synth.scheduler;
+  return sch._lastAcceptClock == null || sch._clockMs - sch._lastAcceptClock >= 600;
+}, null, { timeout: 120000 });
 async function driveKeyboardTrigger(page, problems) {
   console.log('▶ 鍵盤觸發：四排字元鍵＝演奏者 1 放行全曲的下一個 segment，防呆（repeat／組合鍵／打字／下拉 type-ahead）…');
   const slot = () => page.evaluate(() => {
     const sch = window.__hf.synth.scheduler;
     const sounding = [...sch._staves.values()].some((v) => v.sounding.size > 0);
-    return { seg: sch._segIndex, started: sch._started, sounding };
+    const humanSounding = [...sch._staves.values()].some((v) => v.kind === 'human' && v.sounding.size > 0);
+    return { seg: sch._segIndex, sounding, humanSounding, credit: sch._preludeCredit };
   });
   await page.evaluate(() => document.activeElement?.blur());
 
+  // 前奏鎖：範例樂譜是卡農，第一個聲部（小提琴，目前指派給演奏者 1）要等大提琴先進的前奏播完（約 14 秒）才入場，
+  // ▶ 之後馬上按不能放行（放行就會跳過大提琴的前奏）；只記成預按。
   let s = await slot();
-  check(s.seg === 0 && !s.started, '按鍵之前：還沒有任何 segment 被放行', problems, JSON.stringify(s));
+  check(s.seg === 0, '按鍵之前：還沒有任何 driver segment 被放行', problems, JSON.stringify(s));
   await page.keyboard.press('KeyF');
   let t = await slot();
-  check(t.seg === 1 && t.started && t.sounding, '按一下 F：放行第一個 segment、音當下就在響', problems, JSON.stringify(t));
+  check(t.seg === 0 && !t.humanSounding && t.credit === true, '前奏鎖：小提琴入場之前（大提琴前奏中）按鍵不放行、只記預按', problems, JSON.stringify(t));
+
+  // 後面的鍵盤檢查要「按一下就放行」，所以改指派給沒有前奏的大提琴（第二個聲部，tick 0 起音），暫停後重播讓新指派生效。
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+  await page.locator('.score-part-id').nth(0).selectOption('');
+  await page.locator('.score-part-id').nth(1).selectOption('1');
+  await page.click('#btnReplay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 15000 });
+  await page.evaluate(() => document.activeElement?.blur());
+
+  s = await slot();
+  check(s.seg === 0 && s.credit === false, '換成大提琴重播之後：游標歸零、預按已作廢', problems, JSON.stringify(s));
+  await page.keyboard.press('KeyF');
+  t = await slot();
+  check(t.seg === 1 && t.sounding, '按一下 F：放行第一個 driver segment、音當下就在響', problems, JSON.stringify(t));
 
   s = t;
+  await waitDebounce(page);
   await page.keyboard.down('KeyG');
+  await waitDebounce(page); // 隔過去抖窗口再送重複事件：不然就算 event.repeat 的防呆壞了，重複的 keydown 也會被去抖擋掉，測不到
   await page.keyboard.down('KeyG'); // 第二次 down 沒有 up＝瀏覽器的自動重複（event.repeat）
   await page.keyboard.up('KeyG');
   t = await slot();
   check(t.seg === s.seg + 1, '按住不放的自動重複只算一次', problems, `${s.seg} → ${t.seg}`);
+
+  // 去抖：同一個 JS task 內連按兩下（間隔 0ms），第二下被當成手抖忽略，只放行一個 segment。
+  await waitDebounce(page);
+  const burst = await page.evaluate(() => {
+    const sch = window.__hf.synth.scheduler;
+    const before = sch._segIndex;
+    for (let i = 0; i < 2; i++) window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyD', bubbles: true }));
+    return { before, after: sch._segIndex };
+  });
+  check(burst.after === burst.before + 1, '去抖：同一刻連按兩下只放行一個 segment', problems, `${burst.before} → ${burst.after}`);
+  t = await slot();
 
   s = t;
   await page.keyboard.press('Control+KeyJ');
@@ -491,6 +554,7 @@ async function driveKeyboardTrigger(page, problems) {
     sel.focus();
     return sel.selectedIndex;
   });
+  await waitDebounce(page);
   await page.keyboard.press('KeyB');
   t = await slot();
   const idx = await page.evaluate(() => { const el = document.getElementById('kbTestSelect'); const i = el.selectedIndex; el.remove(); return i; });
@@ -508,9 +572,22 @@ async function driveKeyboardTrigger(page, problems) {
   await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
   await page.evaluate(() => document.activeElement?.blur());
   s = t;
+  await waitDebounce(page);
   await page.keyboard.press('KeyH');
   t = await slot();
   check(t.seg === s.seg + 1, '恢復播放後按鍵照常放行', problems, `${s.seg} → ${t.seg}`);
+
+  // 量測：window.__stats() 讀得到鍵盤事件等待時間（前面按了好幾次）與電腦音遲到量
+  const stats = await page.evaluate(() => window.__stats());
+  check(stats.按鍵事件等待ms.count > 0 && stats.按鍵事件等待ms.max >= 0 && typeof stats.電腦音遲到ms.count === 'number', 'window.__stats()：鍵盤事件等待時間有記錄、電腦音遲到量可讀', problems, JSON.stringify(stats));
+
+  // 換回原本的指派（第一個聲部給演奏者 1），後面的測試照舊
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+  await page.locator('.score-part-id').nth(1).selectOption('');
+  await page.locator('.score-part-id').nth(0).selectOption('1');
+  await page.click('#btnReplay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 15000 });
 }
 
 // 試聽 vs 演奏（接在 driveAppToPlaying 後面，此時演奏正在播放）：播放中 ♪ 是灰的、暫停後按 ♪ 會

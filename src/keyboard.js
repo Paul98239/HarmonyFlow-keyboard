@@ -15,6 +15,12 @@ const TRIGGER_CODES = new Set([
 ]);
 const KEYBOARD_SLOT = 1; // 目前只有一位演奏者（開發者）；一個人可以被指派多個聲部
 
+// 量測：鍵盤事件從瀏覽器產生，到我們的 handler 開始跑，在主執行緒佇列裡等了多久（毫秒）。主執行緒被影像算繪／姿勢推論
+// 卡住時這個值會變大——你的音雖然在 handler 內同步發聲，但 handler 本身晚了就等於音晚了。只留最近一批，避免無限成長。
+const INPUT_DELAY_MAX = 5000;
+const inputDelays = [];
+export const getInputDelays = () => inputDelays;
+
 // 焦點在這些元素時，鍵盤是拿來打字的，不是觸發。
 const isTyping = (el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAREA'
   || (el.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'file', 'range'].includes(el.type)));
@@ -31,6 +37,8 @@ export function startKeyboardTrigger(onTrigger) {
     if (isTyping(document.activeElement)) return;        // 搜尋欄打字不觸發
     // 焦點停在 <select>（選歌、分譜指派）時，字母鍵會觸發瀏覽器的 type-ahead 跳選項，選歌下拉一跳就換歌，所以擋掉預設行為
     e.preventDefault();
+    inputDelays.push(performance.now() - e.timeStamp); // e.timeStamp 跟 performance.now() 同一個時間原點（事件產生的時刻）
+    if (inputDelays.length > INPUT_DELAY_MAX) inputDelays.shift();
     onTrigger(KEYBOARD_SLOT);
   });
 }

@@ -10,8 +10,9 @@
 //
 //  三層比對：
 //    L1 解析：parseMidi() 解出來的音，跟官方播放器送出的音一致嗎？
-//    L2 播放：整首自動播放、以及被「完美演奏者」逐 segment 觸發（每個 segment 準時按一下）時，排程器發出的音跟官方一致嗎？
-//    L3 同步：不靠官方，直接檢查「樂譜上同一時刻的音，不論指派或電腦輔助，實際發聲要同時」——任何按鍵速度下都成立。
+//    L2 播放：整首自動播放、以及被「完美演奏者」逐 driver segment 觸發（我的聲部每個起音準時按一下，電腦聲部不用按）時，
+//       排程器發出的音跟官方一致嗎？
+//    L3 同步：不靠官方，直接檢查「樂譜上同一個 tick 的音，不論指派或電腦輔助，實際發聲要同時」——任何按鍵速度下都成立。
 //
 //  run() ＝ 應該一致，不一致就是失敗。
 //
@@ -276,8 +277,9 @@ function autoPlay(score) {
   return log;
 }
 
-// 排程器被「完美演奏者」驅動：slot 1 指派 assignedPartIds，每個 segment 依樂譜秒數 × speed（從第 12ms 起算，跟排程 tick
-// 的第一個時刻同一個原點）準時觸發一次。pressMs：segment 的 tick → 實際觸發的假時間。
+// 排程器被「完美演奏者」驅動：slot 1 指派 assignedPartIds（driver），每個 driver segment 依樂譜秒數 × speed（從第 12ms 起算，
+// 跟排程 tick 的第一個時刻同一個原點）準時按一次；沒被指派的聲部（follower）不用按。被去抖擋掉的按鍵，下一個 tick 再按
+// （就像你發現沒聲音會再按）。pressMs：driver segment 的 tick → 實際被接受的按鍵時刻。
 function perform(score, assignedPartIds, speed) {
   const clock = { now: 0 };
   let hp;
@@ -286,7 +288,7 @@ function perform(score, assignedPartIds, speed) {
   hp.setSynths(assist, human);
   hp.load(score, new Map(assignedPartIds.map((id) => [id, 1])));
   hp.play();
-  const segs = score.segments;
+  const segs = hp._driverSegs;
   const waveAt = (seg) => 12 + score.midiTicksToSeconds(seg.ticks) * 1000 * speed;
   const pressMs = new Map();
   hp.tick(0);
@@ -297,8 +299,9 @@ function perform(score, assignedPartIds, speed) {
     // 有 ±12ms 的雜訊，排程器依間隔估的 playbackRate 跟著抖，尾音長度就會偏離官方——那是測試造成的，不是排程器的問題。
     while (hp._segIndex < segs.length && waveAt(segs[hp._segIndex]) <= tickAt) {
       clock.now = Math.max(clock.now, waveAt(segs[hp._segIndex]));
-      pressMs.set(segs[hp._segIndex].ticks, clock.now);
-      hp.trigger(1, clock.now);
+      const seg = segs[hp._segIndex];
+      if (hp.trigger(1, clock.now)) pressMs.set(seg.ticks, clock.now);
+      else break;                                               // 被去抖擋掉：下一個 tick 再按
     }
     clock.now = tickAt;
     hp.tick(tickAt);
@@ -395,21 +398,22 @@ await run('L2 完美演奏者（×1）：音高、力度、顆數跟官方一致
   assertNotesMatch(withoutEnds(pairOfficialNotes(events)).map((n) => ({ ...n, start: 0 })), withoutEnds(notesOfLog(perform(score, [cello.id], 1).log)).map((n) => ({ ...n, start: 0 })), { channelOf: ignoreChannel });
 });
 
-await run('L2 完美演奏者（×1）：每顆音都在官方時間之後 12ms（時間原點）精確發聲、收音在官方之後 0～12ms 內（排程 tick 量化）', async () => {
+await run('L2 完美演奏者（×1）：每顆音都在官方時間之後 12ms（時間原點）起 0～12ms 內發聲、收音在官方之後 0～12ms 內（follower 的音每 12ms 檢查一次，量化到排程 tick）', async () => {
   const { events } = await officialPlayback(readAsset('canon-violin-cello.mid'));
   const { score, cello } = canonPerformer();
-  // 時間原點是第 12ms（第一次觸發的時刻）：每個 segment 在觸發的那一刻整個發聲（你的音與輔助音都一樣），所以起音跟官方只差
-  // 這個固定的 12ms；收音靠播放頭走到 endTick，每 12ms 的排程 tick 檢查一次，最多晚一個 tick。
+  // 時間原點是第 12ms（第一次觸發的時刻）：你的音（driver）在按鍵的那一刻精確發聲，跟官方只差這個固定的 12ms；電腦聲部
+  // （follower）的音依估到的速度排好時刻（完美演奏者的速度＝1×），由每 12ms 的排程 tick 檢查放出，所以起音與收音都最多晚一個 tick。
   const official = pairOfficialNotes(events).map((n) => ({ ...n, start: n.start + 0.012, end: n.end == null ? null : n.end + 0.012 }));
-  assertNotesMatch(official, notesOfLog(perform(score, [cello.id], 1).log), { channelOf: ignoreChannel, tolStartMs: 0.01, tolEndMs: 12.5 });
+  assertNotesMatch(official, notesOfLog(perform(score, [cello.id], 1).log), { channelOf: ignoreChannel, tolStartMs: 12.5, tolEndMs: 12.5 });
 });
 
 /* ═══════════════════════════════════════════
    L3 同步不變量（不靠官方）
    ═══════════════════════════════════════════ */
 
-// 樂譜上同一時刻（startTick 相同）的「電腦輔助小提琴」與「指派大提琴」音，實際發聲時間差；以及每顆音是不是剛好在放行它所屬
-// segment 的那一下觸發發聲（不早也不晚）。
+// 樂譜上同一個 tick（startTick 相同）的「電腦輔助小提琴」與「指派大提琴」音，實際發聲時間差；以及每顆大提琴（driver）音是不是
+// 剛好在放行它所屬 segment 的那一下按鍵發聲（不早也不晚）。小提琴（follower）在 driver 起音之間的音跟著按鍵啟動的那一段走，
+// 不要求在按鍵當下發聲。
 function simultaneityReport(speed) {
   const { score, cello, violin } = canonPerformer();
   const { log, pressMs } = perform(score, [cello.id], speed);
@@ -419,17 +423,18 @@ function simultaneityReport(speed) {
     const c = onsets.find((o) => o.note.partId === cello.id && o.note.startTick === v.note.startTick);
     if (c) pairs.push(v.ms - c.ms);
   }
-  const offTrigger = onsets.filter((o) => Math.abs(o.ms - pressMs.get(o.note.startTick)) > 1e-6).length; // log 存的是秒，換回毫秒有浮點誤差
-  return { pairs: pairs.length, maxAbs: Math.max(...pairs.map(Math.abs)), offTrigger, total: onsets.length };
+  const drivers = onsets.filter((o) => o.note.partId === cello.id);
+  const offTrigger = drivers.filter((o) => Math.abs(o.ms - pressMs.get(o.note.startTick)) > 1e-6).length; // log 存的是秒，換回毫秒有浮點誤差
+  return { pairs: pairs.length, maxAbs: Math.max(...pairs.map(Math.abs)), offTrigger, total: drivers.length };
 }
 
 // 任何按鍵速度（比原譜快、準時、慢）：同一個 tick 的指派音與電腦輔助音都在同一次 trigger() 呼叫內發聲，差 0ms；
-// 每顆音都剛好在放行它的那一下觸發發聲。這是「總譜觸發」的核心保證，不靠速度估計。
+// 每顆指派音都剛好在放行它的那一下按鍵發聲。這是上下對齊的核心保證，不靠速度估計。
 for (const speed of [0.3, 0.8, 1, 1.3, 2]) {
-  await run(`L3 同步：演奏者速度 ×${speed}，同一樂譜時刻的指派音與電腦輔助音實際發聲差 0ms，每顆音剛好在放行它的那一下觸發發聲`, async () => {
+  await run(`L3 同步：演奏者速度 ×${speed}，同一個 tick 的指派音與電腦輔助音實際發聲差 0ms，每顆指派音剛好在按鍵當下發聲`, async () => {
     const r = simultaneityReport(speed);
     assert(r.pairs > 30, `前提：要有足夠的配對（實際 ${r.pairs} 對）`);
-    assert(r.maxAbs === 0 && r.offTrigger === 0, `${r.pairs} 對中最大發聲差 ${r.maxAbs.toFixed(0)}ms；${r.total} 顆音裡有 ${r.offTrigger} 顆不在放行它的觸發當下發聲`);
+    assert(r.maxAbs === 0 && r.offTrigger === 0, `${r.pairs} 對中最大發聲差 ${r.maxAbs.toFixed(0)}ms；${r.total} 顆指派音裡有 ${r.offTrigger} 顆不在放行它的按鍵當下發聲`);
   });
 }
 
