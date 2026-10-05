@@ -144,6 +144,11 @@ export function lateStats() {
   return synth.scheduler.lateStats();
 }
 
+// 量測（同上）：AudioContext 回報的音訊輸出延遲，見 synth.js 的 audioLatencyInfo()。
+export function audioLatency() {
+  return synth.audioLatencyInfo();
+}
+
 /* ═══════════════════════════════════════════
    分譜載入
    ═══════════════════════════════════════════ */

@@ -282,6 +282,23 @@ async function checkWorkletReadback(page, problems) {
 // 時間戳（lookahead 的前提）：WorkletSynthesizer 的 eventOptions.time 跟 AudioContext.currentTime 是同一條時鐘——時間戳在未來的事件
 // worklet 排隊、到時才處理，已經過去的立刻處理。用 worklet 回報的 noteOn 抵達時間驗證（回報是非同步的，所以容許幾百毫秒的誤差）。
 // 時鐘對不上時（例如差了一個時間原點）未來的事件會馬上響或永遠不響，整個 lookahead 就沒有意義，單元測試看不到這一點。
+// __stats() 的音訊輸出延遲（AudioContext 回報的 baseLatency／outputLatency／getOutputTimestamp）：這個測試跑在 Chromium，
+// 欄位都該有值；實際數字看跑的機器（無頭模式用軟體輸出），所以只驗結構與換算，不驗大小。
+async function checkAudioLatencyStats(page, problems) {
+  console.log('▶ 音訊輸出延遲量測：__stats() 回報 AudioContext 的延遲欄位、並串成「估計按下到出聲」…');
+  const s = await page.evaluate(() => window.__stats());
+  const a = s.音訊輸出, est = s.估計按下到出聲ms;
+  check(a && a.狀態 === 'running', 'AudioContext 在跑時 __stats().音訊輸出 有值', problems, JSON.stringify(a));
+  if (!a) return;
+  const num = (x) => Number.isFinite(x) && x >= 0;
+  check(num(a.內部延遲ms) && num(a.輸出延遲ms), 'baseLatency／outputLatency 都有數字（Chromium 提供）', problems, JSON.stringify(a));
+  check(Math.abs(a.渲染區塊ms - (128 / a.取樣率Hz) * 1000) < 0.1, '渲染區塊 ＝ 128 個取樣的長度', problems, `${a.渲染區塊ms}ms @ ${a.取樣率Hz}Hz`);
+  check(num(a.輸出時間戳落後ms), 'getOutputTimestamp 換算出的落差有數字', problems, JSON.stringify(a));
+  const fixed = a.渲染區塊ms / 2 + a.內部延遲ms + a.輸出延遲ms;
+  check(est && Math.abs(est.固定音訊段ms - fixed) < 0.2, '估計的固定音訊段 ＝ 半個渲染區塊 ＋ 內部延遲 ＋ 輸出延遲', problems, JSON.stringify(est));
+  check(est && est.count === s.按鍵事件等待ms.count, '估計用的樣本就是按鍵事件等待的那一批', problems, `${est?.count} vs ${s.按鍵事件等待ms.count}`);
+}
+
 async function checkTimedEvents(page, problems) {
   console.log('▶ 時間戳：worklet 依 AudioContext 時間排隊（未來的事件到時才響、過去的立刻響）…');
   const r = await page.evaluate(async () => {
@@ -426,6 +443,7 @@ async function driveAppToPlaying(page, problems) {
   await drivePreviewControls(page, problems);
   await checkWorkletReadback(page, problems);
   await checkTimedEvents(page, problems);
+  await checkAudioLatencyStats(page, problems);
   await loadLocalFile(page, { name: 'canon-violin-cello.mid', mimeType: 'audio/midi', buffer: readFileSync(SAMPLE_MIDI) }); // 換回範例樂譜，後面的流程照舊
 
   console.log('▶ 把第一個聲部指派給演奏者 1…');

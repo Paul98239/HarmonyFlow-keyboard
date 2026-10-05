@@ -13,8 +13,20 @@ import { summarizeMs } from './midi/pressTiming.js';
 
 // 開發用量測：在 console 輸入 __stats() 讀取。電腦音遲到量（12ms 的排程 tick 放出電腦音，比排好的時刻晚多少）與鍵盤事件
 // 在主執行緒佇列裡等待的時間——用來判斷影像算繪／姿勢推論把主執行緒卡住的程度，在你的機器上是不是真的聽得出來。
-// 兩個都只量 JS 層，不含音訊 worklet 的一個 render quantum（約 2.7ms）與瀏覽器輸出延遲。
-window.__stats = () => ({ 電腦音遲到ms: midiPlayer.lateStats(), 按鍵事件等待ms: summarizeMs(getInputDelays()) });
+// 這兩個只量 JS 層；音訊這一段（worklet 的 render quantum、AudioContext 的內部與輸出延遲）由「音訊輸出」補上，
+// 「估計按下到出聲ms」＝每個按鍵的事件等待 ＋ 固定的音訊段，把整條路串起來，看延遲主要落在哪一段。
+window.__stats = () => {
+  const audio = midiPlayer.audioLatency();
+  const keyWaits = getInputDelays();
+  // 固定音訊段：worklet 平均等半個渲染區塊 ＋ 內部延遲 ＋ 輸出延遲。瀏覽器沒提供的欄位（null）算 0，所以是下限、不是上限。
+  const audioFixedMs = audio ? Math.round(((audio.渲染區塊ms ?? 0) / 2 + (audio.內部延遲ms ?? 0) + (audio.輸出延遲ms ?? 0)) * 10) / 10 : null;
+  return {
+    電腦音遲到ms: midiPlayer.lateStats(),
+    按鍵事件等待ms: summarizeMs(keyWaits),
+    音訊輸出: audio,
+    估計按下到出聲ms: audioFixedMs === null ? null : { 固定音訊段ms: audioFixedMs, ...summarizeMs(keyWaits.map((x) => x + audioFixedMs)) },
+  };
+};
 
 async function bootSystem() {
   midiPlayer.startPlayer(); // 200ms UI tick 與 12ms 排程 tick，不靠 import 副作用

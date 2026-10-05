@@ -274,6 +274,10 @@ const MUTATIONS = [
     expect: ['開機後'] },
   { name: '試聽失敗時畫面沒有提示', target: PLAYER, suites: ['smoke'], edits: [["      notice: PREVIEW_NOTICE[err.kind] ?? `試聽失敗：${source.name}`,\n", '']],
     expect: ['試聽錯誤路徑'] },
+  { name: '__stats()：固定音訊段把渲染區塊算成整個（不是平均半個）', target: 'src/main.js', suites: ['smoke'], edits: [['(audio.渲染區塊ms ?? 0) / 2', '(audio.渲染區塊ms ?? 0)']],
+    expect: ['估計的固定音訊段'] },
+  { name: '__stats()：音訊輸出延遲不併進估計（只算內部延遲）', target: 'src/main.js', suites: ['smoke'], edits: [[' + (audio.輸出延遲ms ?? 0)) * 10) / 10', ') * 10) / 10']],
+    expect: ['估計的固定音訊段'] },
 ];
 
 // 瀏覽器測試：用真實 repo 的 test/browser/smoke-test.mjs 跑 dir 這份被破壞的複本（HF_ROOT）。變紅的判斷＝它印出的

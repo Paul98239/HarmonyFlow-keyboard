@@ -267,6 +267,26 @@ export function pause() {
 // AudioContext 的目前時間（秒），給排程器的 lookahead 換算時間戳用（WorkletSynthesizer 的 eventOptions.time 就是這條時鐘）。
 // AudioContext 還沒建起來或沒在跑（被瀏覽器暫停）時回傳 undefined，排程器就不提早送、不帶時間戳。
 export function audioNow() { return audioCtx?.state === 'running' ? audioCtx.currentTime : undefined; }
+// 量測（main.js 的 window.__stats 用）：AudioContext 自己回報的音訊延遲，跟「按鍵事件等待」「電腦音遲到」並列，
+// 看「按下去到聽到聲音」這條路上音訊這一段佔多少。這些是瀏覽器／驅動的估計值，不是實際量到的聲學延遲
+// （藍牙耳機等裝置常回報得不準）；瀏覽器沒提供的欄位（例如 Safari 沒有 outputLatency）是 null。AudioContext 還沒建起來回傳 null。
+export function audioLatencyInfo() {
+  if (!audioCtx) return null;
+  // 秒 → 毫秒（留一位小數）；undefined／NaN 轉成 null，免得後面的加總變 NaN
+  const toMs = (sec) => (Number.isFinite(sec) ? Math.round(sec * 10000) / 10 : null);
+  const ts = audioCtx.getOutputTimestamp?.();
+  return {
+    狀態: audioCtx.state,
+    取樣率Hz: audioCtx.sampleRate,
+    // worklet 一次處理 128 個取樣（render quantum）：事件送進去後要等到下一個區塊才被處理，平均半個、最多一個
+    渲染區塊ms: toMs(128 / audioCtx.sampleRate),
+    內部延遲ms: toMs(audioCtx.baseLatency),     // baseLatency：音訊圖內部處理與緩衝
+    輸出延遲ms: toMs(audioCtx.outputLatency),   // outputLatency：從音訊系統送出到實際出聲（作業系統＋硬體）
+    // getOutputTimestamp().contextTime＝此刻正從喇叭輸出的那一小段在音訊時鐘上的時間；currentTime（正在渲染的）比它
+    // 大多少，就是「渲染到輸出」的落差，拿來跟 outputLatency 互相對照。沒在跑的時候 contextTime 沒有意義，不回報。
+    輸出時間戳落後ms: audioCtx.state === 'running' && ts ? toMs(audioCtx.currentTime - ts.contextTime) : null,
+  };
+}
 export function isLoaded() { return isSongLoaded; }
 export function isPaused() { return !isSongLoaded || !scheduler.isPlaying(); }
 export function isFinished() { return isSongLoaded && scheduler.isFinished(); }
