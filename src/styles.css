@@ -194,6 +194,7 @@ body, html {
    .tl-select／.tl-trigger 共用同一組數值，整排工作列（鏡頭、人數、重置、選歌）看起來是
    同一個系列，不再分「主要／次要動作」兩種粗細。 */
 .tl-text-btn {
+  position: relative;      /* 給滑鼠提示（::after，寫在 .tb-btn 那一段）定位 */
   flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
   padding: 0.3em 0.65em;
@@ -594,11 +595,13 @@ body, html {
 .tb-play.is-loading .tb-ico-play { display: none; }
 .tb-play.is-loading .tb-ico-loading { display: inline; }
 
-/* 滑鼠移上去顯示按鈕名稱：純 CSS，文字直接讀按鈕的 aria-label（♪ 試聽中 JS 會把它改成「結束試聽」，
-   提示就自動跟著變）。只在有 hover 的裝置、且按鈕可按時顯示（disabled 的 opacity 0.4 會連提示一起
-   變淡，看不清楚）；pointer-events:none 讓提示不會搶走按鈕的 hover。 */
+/* 滑鼠移上去顯示按鈕名稱：純 CSS，文字直接讀按鈕的 aria-label（♪、鏡頭開關的文字 JS 會依狀態在
+   「開啟○○／關閉○○」之間切換，提示就自動跟著變）。播放列四顆鈕與系統控制的鏡頭／重置鈕共用這一條，
+   提示框長得一樣；不用瀏覽器原生的 title（樣式與出現延遲都不同，會跟這個不一致）。只在有 hover 的裝置、
+   且按鈕可按時顯示（disabled 的 opacity 0.4 會連提示一起變淡，看不清楚）；pointer-events:none 讓提示
+   不會搶走按鈕的 hover。 */
 @media (hover: hover) {
-  .tb-btn::after {
+  .tb-btn::after, .tl-text-btn::after {
     content: attr(aria-label);
     position: absolute; top: calc(100% + 0.65em); left: 50%;
     transform: translateX(-50%);
@@ -609,7 +612,7 @@ body, html {
     opacity: 0; pointer-events: none;
     transition: opacity var(--dur-fast);
   }
-  .tb-btn:hover:not(:disabled)::after { opacity: 1; }
+  .tb-btn:hover:not(:disabled)::after, .tl-text-btn:hover:not(:disabled)::after { opacity: 1; }
 }
 
 /* 頂端 pill 的歌名：完整顯示，不用省略號截斷，優先維持單行。--song-title-scale 是「JS 可以直接寫

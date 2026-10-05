@@ -532,7 +532,7 @@ function renderTransportPill({ player }) {
   btnPreview.disabled = !state.preview;
   btnPause.classList.toggle('is-current', state.current.includes('pause'));
   btnPreview.classList.toggle('is-current', state.current.includes('preview'));
-  btnPreview.setAttribute('aria-label', player.mode === 'preview' ? '結束試聽' : '試聽');
+  btnPreview.setAttribute('aria-label', player.mode === 'preview' ? '關閉試聽' : '開啟試聽'); // 跟鏡頭開關同一個「開啟／關閉」格式
   btnPlay.classList.toggle('is-loading', player.transport === 'loading');
   pill.classList.toggle('is-empty', state.empty);
 

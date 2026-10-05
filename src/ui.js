@@ -233,10 +233,8 @@ function mountSystemBar() {
 
 function renderSystemBar({ ui, camera, poseCount }) {
   const label = camera.on ? '關閉鏡頭' : '開啟鏡頭';
-  if (cameraBtn.title !== label) {
-    cameraBtn.title = label;
-    cameraBtn.setAttribute('aria-label', label);
-  }
+  // 只寫 aria-label：滑鼠提示由 styles.css 的 .tl-text-btn::after 讀它顯示，不再用原生 title
+  if (cameraBtn.getAttribute('aria-label') !== label) cameraBtn.setAttribute('aria-label', label);
   cameraBtn.classList.toggle('is-on', camera.on);
   cameraBtn.disabled = camera.busy;
 
