@@ -396,18 +396,51 @@ run('secondsToMIDITicks：SMPTE division 直接乘 ticksPerSecond（速度事件
 
 // ── 沒有 note on 的 note off：MuseScore 的演奏法 channel ──
 
-run('沒有對應 note on 的 note off 依「軌＋channel」彙整成一則警告（MuseScore 每個音起音時對其他演奏法 channel 補送 note off），不洗版、音符不受影響', () => {
+run('MuseScore 補送的 note off（同軌、同 tick、同音高、別的 channel 有 note on）認出來就不警告，音符不受影響', () => {
   // ch0 是普通演奏（有音），ch1、ch2 是同一樂器的撥奏／震音 channel：每個音起音時各補一個同音高的 note off。
-  const stray = (ch, p) => ({ deltaTick: 0, bytes: [0x80 | ch, p, 0] });
+  // ch1 用 0x80，ch2 用「力度 0 的 note on」（MuseScore 實際匯出的寫法）；60、64 先寫 note on，62 先寫補送的 note off，
+  // 驗證認定跟同一個 tick 內的事件順序無關。
+  const strayOff = (ch, p) => ({ deltaTick: 0, bytes: [0x80 | ch, p, 0] });
+  const strayVel0 = (ch, p) => ({ deltaTick: 0, bytes: [0x90 | ch, p, 0] });
+  const on = (p) => ({ deltaTick: 0, bytes: [0x90, p, 100] });
   const events = [nameEv('Violin'), ...initBlock(0, 40), ...initBlock(1, 45), ...initBlock(2, 44)];
-  [60, 62, 64].forEach((p) => events.push({ deltaTick: 0, bytes: [0x90, p, 100] }, stray(1, p), stray(2, p), { deltaTick: 480, bytes: [0x80, p, 0] }));
+  [60, 62, 64].forEach((p) => {
+    if (p === 62) events.push(strayOff(1, p), strayVel0(2, p), on(p));
+    else events.push(on(p), strayOff(1, p), strayVel0(2, p));
+    events.push({ deltaTick: 480, bytes: [0x80, p, 0] });
+  });
   const parsed = parseMidi(midiFile([track(events)]));
   const warns = parsed.warnings.filter((w) => w.includes('沒有對應的 note on'));
   assert(parsed.notes.length === 3 && parsed.parts.length === 1, `3 顆音、1 個 part 不受影響，實際 ${parsed.notes.length} 顆／${parsed.parts.length} 個 part`);
-  assert(warns.length === 2, `ch1、ch2 各一則（共 2 則），不是每個 note off 一則（6 則），實際 ${warns.length} 則：${warns}`);
-  assert(warns.every((w) => w.includes('3 個')), `每則要寫出這個 channel 有幾個，實際 ${warns}`);
-  assert(warns.some((w) => w.includes('channel 1：')) && warns.some((w) => w.includes('channel 2：')), `要分別指出是哪個 channel，實際 ${warns}`);
-  assert(warns[0].includes('tick 0') && warns[0].includes('音高 60'), `要附第一個的位置方便追查，實際 ${warns[0]}`);
+  assert(warns.length === 0, `每個 note off 都在同 tick 同音高的別的 channel 找得到 note on，不該警告，實際 ${warns.length} 則：${warns}`);
+});
+
+run('對不上 MuseScore 模式的孤立 note off（音高不同、tick 不同）照舊依「軌＋channel」彙整成一則警告，位置取第一個對不上的', () => {
+  const strayOff = (ch, p, delta = 0) => ({ deltaTick: delta, bytes: [0x80 | ch, p, 0] });
+  const events = [nameEv('Violin'), ...initBlock(0, 40), ...initBlock(1, 45), ...initBlock(2, 44),
+    { deltaTick: 0, bytes: [0x90, 60, 100] },
+    strayOff(1, 60),                                  // 配得上：ch0 在 tick 0 有音高 60 的 note on，不警告
+    strayOff(1, 61), strayOff(1, 62),                 // 同 tick 但沒有這個音高的 note on，對不上
+    { deltaTick: 480, bytes: [0x80, 60, 0] },
+    strayOff(2, 60)];                                 // 音高對但 tick 不同（ch0 在 tick 480 只有 note off），對不上
+  const parsed = parseMidi(midiFile([track(events)]));
+  const warns = parsed.warnings.filter((w) => w.includes('沒有對應的 note on'));
+  assert(parsed.notes.length === 1, `音符不受影響，實際 ${parsed.notes.length} 顆`);
+  assert(warns.length === 2, `ch1、ch2 各一則（共 2 則），實際 ${warns.length} 則：${warns}`);
+  const w1 = warns.find((w) => w.includes('channel 1：')), w2 = warns.find((w) => w.includes('channel 2：'));
+  assert(w1 && w1.includes('2 個') && w1.includes('tick 0') && w1.includes('音高 61'), `ch1 要寫 2 個（配得上的那個不算），位置取第一個對不上的（tick 0、音高 61），實際 ${w1}`);
+  assert(w2 && w2.includes('1 個') && w2.includes('tick 480') && w2.includes('音高 60'), `ch2 要寫 1 個、tick 480、音高 60，實際 ${w2}`);
+});
+
+run('孤立 note off 只認「別的 channel」的 note on：同一個 channel 在同 tick 同音高重新起音不算配對，要警告', () => {
+  const events = [nameEv('Violin'), ...initBlock(0, 40),
+    { deltaTick: 0, bytes: [0x90, 60, 100] }, { deltaTick: 480, bytes: [0x80, 60, 0] },
+    { deltaTick: 0, bytes: [0x80, 60, 0] },           // 前一顆已收掉，這個 note off 沒有對應的 note on
+    { deltaTick: 0, bytes: [0x90, 60, 100] }, { deltaTick: 480, bytes: [0x80, 60, 0] }];
+  const parsed = parseMidi(midiFile([track(events)]));
+  const warns = parsed.warnings.filter((w) => w.includes('沒有對應的 note on'));
+  assert(parsed.notes.length === 2, `2 顆音不受影響，實際 ${parsed.notes.length} 顆`);
+  assert(warns.length === 1 && warns[0].includes('channel 0：') && warns[0].includes('1 個'), `同 channel 不算配對，要警告 1 則，實際 ${warns}`);
 });
 
 // ── 容器容錯：RMID 外包裝、檔頭雜訊、tick 過大（只改「怎麼讀」，音符資料不動）──

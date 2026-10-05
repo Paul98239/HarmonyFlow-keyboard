@@ -930,10 +930,16 @@ function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIn
     // key = channel * 128 + 音高。同一 key 可能同時有多顆未收尾的音（同音重疊），
     // 以先進先出配對：先響的音先被關掉，這是最貼近演奏直覺的解讀。
     const pending = new Map();
-    // 沒有對應 note on 的 note off：依 channel 計數、軌處理完才各報一則。MuseScore 的樂器有多個演奏法 channel（普通、撥奏、
-    // 震音），每個音起音時會對其他演奏法的 channel 補送一個同音高的 note off（把它們切掉），一首歌可以有上千個，
-    // 逐個報警會洗版、還會撞到警告數量上限，把後面真正的警告吃掉。
-    const strayOffs = new Map(); // channel → { count, ticks, pitch }（第一個的位置，方便追查）
+    // 沒有對應 note on 的 note off（孤立 note off）：先收集，軌處理完才分類。MuseScore 的樂器有多個演奏法 channel（普通、
+    // 撥奏、震音），每個音起音時會對其他演奏法的 channel 補送一個同音高的 note off（把它們切掉），一首歌可以有上千個。
+    // 認得出這種補送（同一軌、同一個 tick、同一個音高，別的 channel 有 note on）就不警告；認不出的才依 channel 計數、
+    // 各報一則（逐個報警會洗版、還會撞到警告數量上限，把後面真正的警告吃掉）。
+    // 這是匯出器的慣例，不是 SMF 規格（見 CLAUDE.md A16）；孤立 note off 不管有沒有警告都是被忽略的，不影響音符。
+    const strayOffs = [];        // { channel, ticks, pitch }
+    // (tick, 音高) → 在這個位置有 note on 的 channel 集合。集合用 16 位元的整數表示：第 c 位是 1 ＝ channel c 在場
+    // （位元遮罩 bitmask，像指示向量 indicator vector；`1 << c` 是只有第 c 位為 1 的向量）。key 用 tick * 128 + 音高，
+    // 音高 0～127 所以不會撞（tick 最大約 1e7，乘 128 仍遠小於 2^53，number 能精確表示）。
+    const onChannelsAt = new Map();
     for (const ev of track.events) {
       if (ev.kind !== 'channel') continue;
       if (ev.type === 'programChange') { programResolver.noteProgramChange(ev.channel, ev.data1); continue; }
@@ -958,20 +964,29 @@ function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIn
         if (!queue) pending.set(key, (queue = []));
         if (queue.length) st.overlaps++;
         queue.push({ ev, vk });
+        const at = ev.ticks * 128 + ev.data1;
+        onChannelsAt.set(at, (onChannelsAt.get(at) ?? 0) | (1 << ev.channel)); // | ＝ 把 channel 加進集合（聯集）
         continue;
       }
       const queue = pending.get(key);
       if (!queue || !queue.length) {
-        const stray = strayOffs.get(ev.channel);
-        if (stray) stray.count++;
-        else strayOffs.set(ev.channel, { count: 1, ticks: ev.ticks, pitch: ev.data1 });
+        strayOffs.push({ channel: ev.channel, ticks: ev.ticks, pitch: ev.data1 });
         continue;
       }
       const { ev: onEv, vk } = queue.shift();
       emit(vk, track.index, onEv, ev.ticks);
     }
-    for (const [channel, { count, ticks, pitch }] of strayOffs) {
-      warn(`track ${track.index} 的 channel ${channel}：${count} 個 note off 沒有對應的 note on，已忽略（第一個在 tick ${ticks}、音高 ${pitch}；MuseScore 匯出的樂器會對其他演奏法的 channel 補送這種 note off，通常無害）`);
+    // 要等整條軌掃完才分類：補送的 note off 跟 note on 在同一個 tick，誰先寫沒有規定，不能邊掃邊判。
+    const unexplained = new Map(); // channel → { count, ticks, pitch }（第一個對不上的位置，方便追查）
+    for (const { channel, ticks, pitch } of strayOffs) {
+      // & ~(1 << channel)：取「別的 channel」的集合（`~` 是補集、`&` 是交集），非 0 ＝ 別的 channel 在這裡有 note on
+      if ((onChannelsAt.get(ticks * 128 + pitch) ?? 0) & ~(1 << channel)) continue;
+      const entry = unexplained.get(channel);
+      if (entry) entry.count++;
+      else unexplained.set(channel, { count: 1, ticks, pitch });
+    }
+    for (const [channel, { count, ticks, pitch }] of unexplained) {
+      warn(`track ${track.index} 的 channel ${channel}：${count} 個 note off 沒有對應的 note on，已忽略（第一個在 tick ${ticks}、音高 ${pitch}；不是 MuseScore 補送的那種：同 tick、同音高在別的 channel 找不到 note on）`);
     }
     for (const [key, queue] of pending) {
       for (const { ev: on, vk } of queue) {
