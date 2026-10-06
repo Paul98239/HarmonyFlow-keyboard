@@ -89,6 +89,8 @@ const MUTATIONS = [
     expect: ['零長度的音'] },
   { name: '停格太久又把所有還在響的音全部收掉（切掉有固定長度的長音）', edits: [['this._closeDue(horizonMs);     // 剛發聲就到期的短音', 'this._closeDue(horizonMs);     // 剛發聲就到期的短音\n    if (this._stallMsAt(this._clockMs) > IDLE_MS) this._noteOffAll();']],
     expect: ['停格超過閒置門檻（800ms）', '停格再久也不改音長', '壓力測試'] },
+  { name: '拿掉尾巴收尾（同譜表新音發聲時舊音照原排程收，疊音比檔案多）', edits: [['if (capMs < entry.offMs) entry.offMs = capMs;', 'void capMs;']],
+    expect: ['尾巴收尾：你按得比預估早', '尾巴收尾：檔案裡本來就有的重疊', '尾巴收尾對你的聲部同樣適用', '尾巴收尾：同音高'] },
   { name: '你的音撐到下一次按鍵才收（人為加撐住：有演奏才有聲音被破壞）', edits: [['queue[0].offMs <= limit + EPS_MS) {\n          try', 'queue[0].offMs <= limit + EPS_MS && staff.kind !== \'human\') {\n          try']],
     expect: ['相連音不撐：你的音在自己的結尾就收', '壓力測試'] },
   { name: '拿掉每個 tick 的 dt 上限', edits: [['const dt = this._lastTickMs == null ? 0 : Math.min(MAX_TICK_DT_MS, Math.max(0, nowMs - this._lastTickMs));', 'const dt = this._lastTickMs == null ? 0 : Math.max(0, nowMs - this._lastTickMs);']],

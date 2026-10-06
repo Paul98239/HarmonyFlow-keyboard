@@ -288,6 +288,51 @@ run('提早按：上一段沒放完的電腦音照自己的時刻繼續放完（
   assert(onMs(log, 41, 'human') === t1 && onMs(log, 56, 'assist') === t1, '第二下那一刻：你的 41 與屬於下一段起點的電腦音 56 同刻（重新對時，沒有累積落後）');
 });
 
+run('尾巴收尾：你按得比預估早，同譜表還在響的電腦舊音在新音起音處收，不比檔案多疊（檔案裡有空隙就收在新音發聲那一刻）', () => {
+  // a1 的 70 在拍 0.25、長 0.3s（檔案裡 0.425s 結束，離拍 1 的 71 還有 75ms 空隙）；第二下提早到 320ms，71 在那一刻發聲
+  const { log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2], a1: [{ beat: 0.25, dur: 0.3, note: 70 }, { beat: 1, dur: 0.1, note: 71 }] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 320);
+  d.runMs(400);
+  assert(onMs(log, 70, 'assist') !== undefined && onMs(log, 71, 'assist') === t0 + 320, '70、71 都發聲（不丟音），71 在第二下那一刻');
+  assert(offMs(log, 70, 'assist') <= onMs(log, 71, 'assist'), `70 在 71 發聲時就收（沒有疊到 71），實際 off ${offMs(log, 70, 'assist') - t0}、71 on ${onMs(log, 71, 'assist') - t0}`);
+});
+
+run('尾巴收尾：檔案裡本來就有的重疊要留著——舊音的收音是「新音起音 ＋ 檔案重疊量依速度換算」，只提早、不延長', () => {
+  // 70 長 0.5s（0.625s 結束），71 在 0.5s 起音：檔案裡重疊 125ms。第二下提早到 320ms → 速度 1.5625× → 重疊 125 ÷ 1.5625 ＝ 80ms
+  const { log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2], a1: [{ beat: 0.25, dur: 0.5, note: 70 }, { beat: 1, dur: 0.1, note: 71 }] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 320);
+  d.runMs(500);
+  assert(near(offMs(log, 70, 'assist') - t0, 320 + 80, TICK_MS), `70 在新音後約 80ms 收（320＋80），實際 ${offMs(log, 70, 'assist') - t0}`);
+});
+
+run('尾巴收尾對你的聲部同樣適用：你的舊音在你按下一個起音時，收音不晚於「新音 ＋ 檔案重疊量依速度換算」', () => {
+  // p0 的 60 長 0.7s（檔案裡跟拍 1 的 61 重疊 200ms）；第二下提早到 320ms → 重疊 200 ÷ 1.5625 ＝ 128ms，原本會響到 700ms
+  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 0.7, note: 60 }, { beat: 1, dur: 0.1, note: 61 }, 2] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 320);
+  d.runMs(600);
+  assert(near(offMs(log, 60, 'human') - t0, 320 + 128, TICK_MS), `60 在 448ms 左右收，實際 ${offMs(log, 60, 'human') - t0}`);
+});
+
+run('尾巴收尾：同音高的舊音要在新音 noteOn 之前先收（先收再放），新音不會被連帶關掉', () => {
+  const { log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2], a1: [{ beat: 0.25, dur: 0.3, note: 70 }, { beat: 1, dur: 0.1, note: 70 }] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 320);
+  d.runMs(500);
+  const seq = log.filter((e) => e.note === 70 && (e.t === 'on' || e.t === 'off')).map((e) => e.t).join();
+  assert(seq === 'on,off,on,off', `應為 on,off,on,off，實際 ${seq}`);
+});
+
 run('電腦音的發聲時刻與長度依估到的速度換算：你按得比檔案快，電腦音也跟著變快、變短', () => {
   // 兩次按鍵隔 320ms、樂譜 0.5s → 估到 1.5625×。電腦音 53 在拍 1.5（離第二個起音 0.25s）、長 0.2s：
   // 發聲在 0.25 ÷ 1.5625 ＝ 160ms 後（不是 250ms）、長度 0.2 ÷ 1.5625 ＝ 128ms（不是 200ms）。

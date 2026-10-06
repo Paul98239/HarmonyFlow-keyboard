@@ -16,13 +16,16 @@
 //  同刻發聲）。第 0 段（第一個 driver 起音之前的前奏）在 play() 後用 1× 起算，所以前奏照原速播、停在你的入場點。前奏還沒播完
 //  時按鍵不放行（前奏鎖：不然第 1 段重新對時，前奏剩下的音就被跳過），只記預按，播到入場點由 tick() 自動放行第一個起音。
 //    · 你按得比預估早：上一段沒放完的 follower 音照自己排好的時刻繼續放完（長度照 MIDI 音符長度，依速度換算），不跳、不一次
-//      放出（不擠）、不丟；它們最多比該有的時間晚「你早按的量」，下一次按鍵重新對時就歸零（不累積）。
+//      放出（不擠）、不丟；它們最多比該有的時間晚「你早按的量」，下一次按鍵重新對時就歸零（不累積）。唯一的修剪是尾巴收尾
+//      （見「收音」）：同譜表的新音發聲時，舊音不會比檔案裡的重疊響得更久。
 //    · 你按得比預估晚：這一段放完就靜止等你，不會越過你的下一個起音；已經開始的音照 MIDI 音長收完。
 //  playbackRate（命名同官方 Sequencer：樂譜秒 ÷ 真實秒）＝最近 8 個按鍵的頭尾比值（pressTiming.js，模擬評估選出來的）。
 //  去抖（pressTiming.js）：兩次按鍵太近就忽略第二次（擋手抖、手勢重複觸發）。
 //
 //  收音：driver 的音到期（對應時刻）或下一次按鍵時 endTick ≤ 新錨點的先收掉，follower 的音從它發聲的時刻起算原始時值。
-//  每顆音都在自己的結尾收，不延長：你猶豫時音結束、之後是安靜，像真的樂器；放行時先收再放。同音高重疊的音依發聲順序先進先出
+//  每顆音都在自己的結尾收，不延長：你猶豫時音結束、之後是安靜，像真的樂器；放行時先收再放。尾巴收尾：同一個譜表的新音發聲時，
+//  還在響的舊音（起音 tick 比新音早）的收音時刻上限＝新音發聲時刻 ＋ 檔案裡這兩顆音的重疊量（結尾 tick − 新音起音 tick，
+//  最少 0）依目前速度換算——你按得比預估早時，舊音不會比檔案裡的重疊多響一截（糊在一起），也不丟音；只會提早、不會延長。同音高重疊的音依發聲順序先進先出
 //  收音（跟官方合成器對 note-off 的解讀一致），每個 noteOn 都送出一個 noteOff。
 //
 //  lookahead：tick(nowMs, audioNow) 有給 AudioContext 時間時，電腦輔助聲部 LOOKAHEAD_MS 以內要發聲／收音的事件提早帶時間戳（eventOptions.time）
@@ -537,20 +540,45 @@ export class Scheduler {
     this._anchorSlice(j + 1, clock, scoreSec, this.playbackRate);   // 先更新錨點與已啟動的段
     this._closeByTick(seg.ticks);                                   // driver 的音 endTick ≤ 這個起音的，先收
     this._closeDue();
-    for (const { staff, note } of seg.items) this._sound(staff, note, clock + ((this._secOf(note.endTick) - scoreSec) * 1000) / this.playbackRate);
+    for (const { staff, note } of seg.items) this._sound(staff, note, clock + ((this._secOf(note.endTick) - scoreSec) * 1000) / this.playbackRate, clock);
     this._emitPending();                                            // 同 tick 的 follower 音（dueMs ＝ 這一刻）跟你的音同刻
     this._closeDue();                                               // 零長度的音
   }
 
-  // 讓一顆音發聲：記進 _sounded（每顆音恰好一次），noteOn，記進正在響的佇列（同音高先進先出）。dueMs＝預定發聲的時鐘時刻，
-  // 只有 tick() 裡的電腦音（lookahead）才會帶時間戳；onTime 記下那顆 noteOn 的 AudioContext 時間（沒帶時間戳＝undefined）。
+  // 讓一顆音發聲：記進 _sounded（每顆音恰好一次），noteOn，記進正在響的佇列（同音高先進先出）。dueMs＝預定發聲的時鐘時刻
+  // （你的音就是按下的那一刻），只有 tick() 裡的電腦音（lookahead）才會帶時間戳；onTime 記下那顆 noteOn 的 AudioContext 時間
+  // （沒帶時間戳＝undefined）。
   _sound(staff, note, offMs, dueMs) {
     this._sounded.add(note);
+    this._capOverlaps(staff, note, dueMs);
     let queue = staff.sounding.get(note.midiNote);
     if (!queue) staff.sounding.set(note.midiNote, (queue = []));
     const opts = this._stamp(staff, dueMs);
     queue.push({ endTick: note.endTick, offMs, note, onTime: opts?.time }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
     try { this._synthOf(staff)?.noteOn(staff.channel, note.midiNote, note.velocity, opts); } catch (err) {}
+  }
+
+  // 尾巴收尾：同一個譜表的新音在 onsetMs 發聲時，還在響的舊音（起音 tick 比新音早）的收音時刻不能晚於
+  // 「onsetMs ＋ 檔案裡這兩顆音的重疊量依目前速度換算」（檔案裡舊音結尾在新音起音之前＝重疊 0，就在新音發聲時收）。
+  // 為什麼：舊音是依「上一次按鍵估到的速度」排好結尾的，你這次按得比預估早，舊音就會比檔案裡的重疊多響一截（糊在一起）；
+  // 照檔案的 tick 位置收尾，重疊量就跟檔案一樣，也不會丟音、不會擠。只會把收音提早，不會延長（所以你按得晚時不撐）。
+  // 同譜表內起音 tick 相同的音（和弦）不算「下一個音」，不互相截。
+  _capOverlaps(staff, note, onsetMs) {
+    const startSec = this._secOf(note.startTick);
+    for (const queue of staff.sounding.values()) {
+      for (const entry of queue) {
+        if (entry.note.startTick >= note.startTick) continue;
+        const capMs = onsetMs + (Math.max(0, this._secOf(entry.endTick) - startSec) * 1000) / this.playbackRate;
+        if (capMs < entry.offMs) entry.offMs = capMs;
+      }
+    }
+    // 同音高的舊音若因此到期，要在新音 noteOn 之前先收（先收再放：不然同音高的 noteOff 會連新音一起關掉）
+    const same = staff.sounding.get(note.midiNote);
+    while (same?.length && same[0].offMs <= onsetMs + EPS_MS) {
+      try { this._synthOf(staff)?.noteOff(staff.channel, note.midiNote, this._offOpts(staff, same[0], same[0].offMs)); } catch (err) {}
+      same.shift();
+    }
+    if (same && !same.length) staff.sounding.delete(note.midiNote);
   }
 
   // 時鐘時刻 ms 對應的 AudioContext 時間，包成 eventOptions。只有 tick() 裡（_audioBase 有值）的電腦輔助聲部才有；

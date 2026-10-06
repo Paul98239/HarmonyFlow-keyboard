@@ -6,9 +6,11 @@
 //  前一顆「超過下一顆起音多少」也要等於檔案裡的值 × factor。這支工具量排程器偏離這兩個理想多少（用 sim.mjs 的假合成器，
 //  假時間 12ms 一個 tick）：
 //    音長多出＝實際音長 − 檔案音長 × factor（正＝比理想長）；
-//    多疊＝（前一顆實際收音 − 後一顆實際起音）− （檔案裡的同一個差 × factor）：正＝比檔案更疊（斷音相反：負）。
+//    多疊＝max(0, 前一顆實際收音 − 後一顆實際起音) − max(0, 檔案裡的同一個差 × factor)：正＝比檔案疊得更多。兩邊都先取 max(0, ·)：
+//    檔案裡本來就有空隙（舊音在新音起音之前結束）時，實際重疊是 0 也不算「多疊」。
 //  每個譜表的音依實際發聲時間排序後取相鄰一對（同譜表＝同一個樂器的同一行譜，疊在一起就是同一個聲音裡兩顆音糊在一起）。
-//  報：每千顆音中「多疊 > 30ms」「多疊 > 100ms」的次數、音長多出的 p50／p90／p99。你的聲部與電腦聲部分開報。
+//  報：每千顆音中「多疊 > 30ms」「多疊 > 100ms」的次數、音長多出的 p50／p90／p99、「音長被縮短 > 30ms」的次數（收尾規則的代價：
+//  舊音被新音的起音截短，音長就少於 MIDI 音長 × 速度）。你的聲部與電腦聲部分開報。
 //  情境：完美（1.0×、手抖 15%）／慢 1.4×／快 0.7×／猶豫（每 12 下停 1.2 秒，其餘 1.0×、手抖 15%）。
 //
 //  用法：node test/tools/overlap-eval.mjs [--dir=資料夾（預設：src/assets 加上 test/tools/library 前 --limit 首）] [--limit=20] [--exclude=檔名片段]
@@ -70,7 +72,7 @@ for (const f of files) {
         if (j + 1 < list.length) {
           const nx = list[j + 1];
           const fileOvl = (r.note.endSeconds - nx.note.startSeconds) * 1000; // 檔案裡：前一顆結束 − 後一顆起音（正＝疊、負＝斷）
-          a.ovl.push(r.offMs - nx.onMs - fileOvl * sc.factor);
+          a.ovl.push(Math.max(0, r.offMs - nx.onMs) - Math.max(0, fileOvl * sc.factor));
         }
       }
     }
@@ -79,10 +81,10 @@ for (const f of files) {
 console.log(`曲數（≥ 2 個聲部、主聲部起音 ≥ 60 個）：${songs}；單位 ms，正＝比理想長／比檔案更疊\n`);
 for (const [i, sc] of SCENARIOS.entries()) {
   console.log(`■ ${sc.name}`);
-  console.log('  種類    音數   音長多出 p50  p90  p99 ｜ 多疊 >30ms（每千顆） >100ms（每千顆）  多疊 p99');
+  console.log('  種類    音數   音長多出 p50  p90  p99 ｜ 多疊 >30ms（每千顆） >100ms（每千顆）  多疊 p99 ｜ 音長縮短 >30ms（每千顆）');
   for (const [label, title] of [['human', '你的'], ['assist', '電腦']]) {
     const a = acc[i][label];
     const per = (n) => (a.notes ? ((1000 * n) / a.notes).toFixed(1).padStart(6) : '     -');
-    console.log(`  ${title}  ${String(a.notes).padStart(6)}   ${r0(quantile(a.ext, 0.5))} ${r0(quantile(a.ext, 0.9))} ${r0(quantile(a.ext, 0.99))} ｜ ${per(a.ovl.filter((x) => x > 30).length)}        ${per(a.ovl.filter((x) => x > 100).length)}          ${r0(quantile(a.ovl, 0.99))}`);
+    console.log(`  ${title}  ${String(a.notes).padStart(6)}   ${r0(quantile(a.ext, 0.5))} ${r0(quantile(a.ext, 0.9))} ${r0(quantile(a.ext, 0.99))} ｜ ${per(a.ovl.filter((x) => x > 30).length)}        ${per(a.ovl.filter((x) => x > 100).length)}          ${r0(quantile(a.ovl, 0.99))} ｜ ${per(a.ext.filter((x) => x < -30).length)}`);
   }
 }
