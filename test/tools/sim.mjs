@@ -66,13 +66,15 @@ function makeRecorder(getPerformer, clock) {
  * 跑一場模擬。players：[{ partIds: [...], presses: [ms, ...] }]，第 i 位演奏者的槽位是 i+1，任何一位按一下都放行被指派聲部
  * 的下一個起音；players 是空陣列＝沒有人被指派（整首自動播放）。跑到播完（而且所有按鍵都送完）或超過上限。
  * players[i].keepGoing＝true：按鍵排完、曲子還沒按完（有的按鍵被去抖擋掉）時，每 RETRY_MS 繼續按，直到曲子結束。
+ * players[i].retryBlocked＝true：每一個被去抖擋掉的按鍵（前奏預按除外）過 RETRY_MS 再按一次，直到按上（時間表不會因為被擋而錯位）。
  * pressLog：每次按鍵嘗試的 { slot, ms, released }（released＝trigger() 的回傳值；被去抖擋掉的是 false）。
+ * config：交給排程器建構子的設定（例如 { holdMaxMs }，評估工具掃值用）。
  */
-export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {}) {
+export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS, config } = {}) {
   const clock = { ms: 0 };
   let hp;
   const rec = makeRecorder(() => hp, clock);
-  hp = new Scheduler();
+  hp = new Scheduler(config);
   hp.setSynths(rec.assist, rec.human);
   const slotOf = new Map();
   players.forEach((p, i) => p.partIds.forEach((id) => slotOf.set(id, i + 1)));
@@ -101,6 +103,13 @@ export function simulate(score, players, { tailMs = 8000, tickMs = TICK_MS } = {
       const released = hp.trigger(a.slot, clock.ms);
       pressLog.push({ slot: a.slot, ms: clock.ms, released });
       remaining[a.slot]--;
+      // retryBlocked：被去抖擋掉的按鍵（前奏預按不算）過 RETRY_MS 再按，直到按上——真人發現沒聲音會再按。不重按的話，這位演奏者
+      // 之後的時間表整個錯位一個起音，越到後面越多按鍵被擋、最後變成連按（速度倍率被夾到上限，落音統計被稀釋）
+      if (!released && players[a.slot - 1].retryBlocked && !hp._preludeCredit && hp._playing && hp._segIndex < hp._driverSegs.length) {
+        remaining[a.slot]++;
+        attempts.push({ ms: clock.ms + RETRY_MS, slot: a.slot });
+        attempts.sort((x, y) => x.ms - y.ms);
+      }
       // 按鍵排完了、曲子還沒按完（有的按鍵被去抖擋掉就少了一下）：「應該按完整首」的演奏者會繼續按，每 RETRY_MS 一下，直到曲子
       // 結束——就像你發現沒聲音或曲子還沒完，會再按。只有排好一串按鍵、不再重複的（中途停手那種）不會。
       if (players[a.slot - 1].keepGoing && remaining[a.slot] === 0 && hp._playing && hp._assignedSlots.has(a.slot) && hp._segIndex < hp._driverSegs.length) {
@@ -144,16 +153,18 @@ export function driverPressLoad(score, partIds) {
  * ＋樂譜間隔 × factor × (1 ± jitter)」。factor＝按鍵間隔是樂譜間隔的幾倍（<1 快、>1 慢）。
  * skipFrom／skipCount：從第 skipFrom 個起音起連續 skipCount 個不按（停手後回來，之後照原本的時間表繼續）；
  * pause[index, ms]：按完第 index 個之後停 ms 毫秒（Infinity＝從此不按）；fromIndex：從這個起音才開始按（晚進場）；
+ * reading：看譜起伏的強度（0＝沒有；0.25＝中等；每個間隔乘 exp(常態 × reading)）；
  * offsetMs：整張時間表平移；burst＝true：每 24ms 連按一下、每個起音按 BURST_REPEAT 下（比樂譜快很多，會被去抖擋掉，直到按上）。
  */
 export function onsetPresses(secs, { factor = 1, jitter = 0, rnd = Math.random, leadMs = 0, offsetMs = 0, skipFrom = -1, skipCount = 0,
-  pause = null, fromIndex = 0, burst = false } = {}) {
+  pause = null, fromIndex = 0, burst = false, reading = 0 } = {}) {
   if (burst) return Array.from({ length: secs.length * BURST_REPEAT }, (_, k) => ORIGIN_MS + offsetMs + k * 24);
   const presses = [];
   let t = ORIGIN_MS + Math.max(0, secs[0] * 1000 + leadMs) + offsetMs;
   for (let k = 0; k < secs.length; k++) {
     if (k >= fromIndex && !(k >= skipFrom && k < skipFrom + skipCount)) presses.push(t);
-    if (k + 1 < secs.length) t += (secs[k + 1] - secs[k]) * 1000 * factor * (1 + jitter * (rnd() * 2 - 1));
+    // reading：看譜起伏——每個間隔再乘一個對數常態的隨機倍率（三個均勻亂數相加近似常態，強度 ≈ reading），真人看譜時快時慢
+    if (k + 1 < secs.length) t += (secs[k + 1] - secs[k]) * 1000 * factor * (1 + jitter * (rnd() * 2 - 1)) * (reading ? Math.exp((rnd() + rnd() + rnd() - 1.5) * 2 * reading) : 1);
     if (pause && k === pause[0]) { if (!Number.isFinite(pause[1])) break; t += pause[1]; }
   }
   return presses;
@@ -162,6 +173,44 @@ export function onsetPresses(secs, { factor = 1, jitter = 0, rnd = Math.random, 
 /* ═══════════════════════════════════════════
    量測
    ═══════════════════════════════════════════ */
+
+/**
+ * 落音量測：電腦音的時間範圍「跨過」你的某個起音時（起音 tick 嚴格落在 (startTick, endTick) 之內），你按那個起音的時刻，
+ * 這顆音應該還在響。回傳每顆這種電腦音的「你按下最後一個被跨過的起音的假時間 − 它實際收音的假時間」（ms）：> 0 ＝ 你還沒按
+ * 它就收了（落音）。沒有收音紀錄或沒有跨過任何起音的音不算。
+ */
+export function earlyOffGaps(sim) {
+  const { hp, records } = sim;
+  const segOf = new Map();                                       // 你的音 → 它屬於第幾個 driver segment
+  hp._driverSegs.forEach((seg, i) => seg.items.forEach((it) => segOf.set(it.note, i)));
+  const pressedAt = new Map();                                   // driver segment 編號 → 它實際放行（你的音發聲）的假時間
+  for (const r of records) if (r.label === 'human') pressedAt.set(segOf.get(r.note), r.onMs);
+  const gaps = [];
+  for (const r of records) {
+    if (r.label !== 'assist' || r.offMs == null) continue;
+    const last = hp._holdSegOf(r.note);                          // 它要等你按到的最後一個起音（跟排程器 hold 用同一個判斷）
+    if (last >= 0 && pressedAt.has(last)) gaps.push(pressedAt.get(last) - r.offMs);
+  }
+  return gaps;
+}
+
+/**
+ * 電腦聲部的靜音：把電腦音依發聲時間排好，相鄰兩顆之間「前面所有音都收了、下一顆還沒開始」的空白（ms）。檔案本身的休止也會算進去，
+ * 所以只拿來比較同一首歌、同一份按鍵在不同設定下的差異。回傳 { over100, over300, over300Sec }。
+ */
+export function silenceStats(sim) {
+  const as = sim.records.filter((r) => r.label === 'assist' && r.offMs != null).sort((a, b) => a.onMs - b.onMs);
+  let maxOff = -1, over100 = 0, over300 = 0, over300Ms = 0;
+  for (const r of as) {
+    if (maxOff > 0) {
+      const gap = r.onMs - maxOff;
+      if (gap > 100) over100++;
+      if (gap > 300) { over300++; over300Ms += gap; }
+    }
+    maxOff = Math.max(maxOff, r.offMs);
+  }
+  return { over100, over300, over300Sec: over300Ms / 1000 };
+}
 
 /**
  * 不變量（任何按鍵速度、任何人數都該成立）：

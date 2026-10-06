@@ -29,6 +29,10 @@ window.__stats = () => {
   };
 };
 
+// 開發用：彈完在 console 輸入 copy(__pressLog())，貼進 test/tools/recordings/<名稱>.json，再用 test/tools/hold-eval.mjs 離線重放。
+// 時間是排程器時鐘（暫停不計），跟 sim.mjs 的座標一樣。
+window.__pressLog = midiPlayer.pressLog;
+
 async function bootSystem() {
   midiPlayer.startPlayer(); // 200ms UI tick 與 12ms 排程 tick，不靠 import 副作用
   // 畫面先接好（同步、不等網路）：ui.js 不 import 播放器，由這裡交進去；開機期間 #app-shell 是 inert。
