@@ -144,6 +144,11 @@ export function lateStats() {
   return synth.scheduler.lateStats();
 }
 
+// 量測（同上）：你現在的速度估計（樂譜秒 ÷ 真實秒，見 scheduler.js 的 playbackRate）。<1 ＝ 比檔案慢，音長是檔案音長 ÷ 這個值。
+export function playbackRate() {
+  return synth.scheduler.playbackRate;
+}
+
 // 量測（同上）：AudioContext 回報的音訊輸出延遲，見 synth.js 的 audioLatencyInfo()。
 export function audioLatency() {
   return synth.audioLatencyInfo();

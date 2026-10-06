@@ -17,7 +17,7 @@
 //  時按鍵不放行（前奏鎖：不然第 1 段重新對時，前奏剩下的音就被跳過），只記預按，播到入場點由 tick() 自動放行第一個起音。
 //    · 你按得比預估早：上一段沒放完的 follower 音照自己排好的時刻繼續放完（長度照 MIDI 音符長度，依速度換算），不跳、不一次
 //      放出（不擠）、不丟；它們最多比該有的時間晚「你早按的量」，下一次按鍵重新對時就歸零（不累積）。
-//    · 你按得比預估晚：這一段放完就靜止等你，不會越過你的下一個起音；停格超過 IDLE_MS 把還在響的音全部收掉。
+//    · 你按得比預估晚：這一段放完就靜止等你，不會越過你的下一個起音；停格超過 IDLE_MS 只解除相連音的撐住，音照 MIDI 音長收完。
 //  playbackRate（命名同官方 Sequencer：樂譜秒 ÷ 真實秒）＝最近 8 個按鍵的頭尾比值（pressTiming.js，模擬評估選出來的）。
 //  去抖（pressTiming.js）：兩次按鍵太近就忽略第二次（擋手抖、手勢重複觸發）。
 //
@@ -55,8 +55,8 @@ export const DEFAULT_PORTS = 4;
 /* ═══════════════════════════════════════════
    應用層常數——不是規格
    ═══════════════════════════════════════════ */
-// 「播放頭停在你的下一個起音多久就把還在響的音全部收掉」的門檻：相連音撐住與長音只是不在停格那一下提早收，不能無限期響著。
-// 800ms 吸收你按鍵的停頓；你完全停手時電腦聲部放完這一段就靜止，超過這個時間就安靜下來。
+// 「播放頭停在你的下一個起音多久就解除相連音的撐住」的門檻：撐住只是不在停格那一下提早收，不能無限期響著；其他音有固定
+// 結束時刻，不受它影響。800ms 吸收你按鍵的停頓；你完全停手時電腦聲部放完這一段就靜止，已經開始的音照音長收完。
 const IDLE_MS = 800;
 // 相連音的「小間隔」門檻 θ ＝ timeDivision / LEGATO_GAP_DIVISOR（480 tpq 時 30 tick）：音符結尾到同一個譜表
 // 下一個起音點的間隔 ≤ θ 才算相連的音。MuseScore 把相連音符寫成「記譜長度 − 1 tick」（間隙固定 1 tick），真正的
@@ -581,7 +581,7 @@ export class Scheduler {
     return { time: this._audioBase.audio + (ms - this._audioBase.clock) / 1000 };
   }
 
-  // 收音的 eventOptions：tick() 裡依預定時刻（offMs）帶時間戳；其餘情況（按鍵、暫停、閒置收音）立刻處理。但這顆音的 noteOn
+  // 收音的 eventOptions：tick() 裡依預定時刻（offMs）帶時間戳；其餘情況（按鍵、暫停）立刻處理。但這顆音的 noteOn
   // 如果是提早送出、還沒響（時間戳在未來），noteOff 一定要排在它後面（發聲後 1ms）：立刻處理的 noteOff 會比它早到，
   // 之後那顆 noteOn 響了就再也收不掉（卡音）；兩個時間戳的換算來自不同的 tick，差幾毫秒的誤差也靠這個下限擋掉。
   _offOpts(staff, entry, offMs) {
@@ -641,7 +641,6 @@ export class Scheduler {
       const reach = this._reachClockMs();
       if (reach !== null && this._clockMs >= reach - EPS_MS) { this._preludeCredit = false; this._release(reach); }
     }
-    if (this._stallMsAt(this._clockMs) > IDLE_MS) this._noteOffAll(); // 停格太久：長音、相連音都不能無限期響著
   }
 
   // 收掉到期的音（offMs ≤ limitMs，沒被撐住）。同音高重疊時只看佇列最前面那一顆（先進先出）。limitMs 預設是時鐘；tick()
@@ -679,6 +678,9 @@ export class Scheduler {
   // 相連音要不要繼續撐：它的後繼音還沒發聲，而且落在還沒被按鍵啟動的段（要等你按才會發聲）。後繼音在已啟動的段裡就不撐——
   // 它自己有排好的時刻；整首自動播放只有第 0 段，永遠不撐，每個 noteOff 都照檔案。
   _isHeld(staff, entry) {
+    // 停格超過閒置門檻就不再撐：撐住是唯一沒有固定結束時刻的音，不放開就會無限期響著。放開之後它照自己的結尾（offMs）收，
+    // 結尾已經過了就在下一次收音檢查時收掉；有固定結束時刻的音（長音、電腦的音）本來就不需要閒置收音，照 MIDI 音長放完。
+    if (this._stallMsAt(this._clockMs) > IDLE_MS) return false;
     const successor = staff.notes[entry.legatoTo]; // legatoTo ＝ -1 時是 undefined
     return !!successor && !this._sounded.has(successor) && this._sliceOfTick(successor.startTick) > this._anchoredSlice;
   }

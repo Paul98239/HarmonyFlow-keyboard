@@ -21,6 +21,7 @@ window.__stats = () => {
   // 固定音訊段：worklet 平均等半個渲染區塊 ＋ 內部延遲 ＋ 輸出延遲。瀏覽器沒提供的欄位（null）算 0，所以是下限、不是上限。
   const audioFixedMs = audio ? Math.round(((audio.渲染區塊ms ?? 0) / 2 + (audio.內部延遲ms ?? 0) + (audio.輸出延遲ms ?? 0)) * 10) / 10 : null;
   return {
+    速度倍率: Math.round(midiPlayer.playbackRate() * 100) / 100,
     電腦音遲到ms: midiPlayer.lateStats(),
     按鍵事件等待ms: summarizeMs(keyWaits),
     音訊輸出: audio,

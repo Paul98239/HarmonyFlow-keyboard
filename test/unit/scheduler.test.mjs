@@ -161,12 +161,12 @@ function makeInvariantRig(seed) {
       state.balance.set(k, (state.balance.get(k) ?? 0) - 1);
       check(state.balance.get(k) >= 0, `${k} 沒有對應的 noteOn 就 noteOff`);
       const e = staff.sounding.get(pitch)?.[0];
-      // 收音只有四個理由：到期（照 MIDI 音符長度）、driver 的音在下一次按鍵時 endTick ≤ 新錨點、停格超過閒置門檻、暫停／重播清場
+      // 收音只有三個理由：到期（照 MIDI 音符長度；被撐住的相連音停格超過閒置門檻後也是「到期才收」）、driver 的音在下一次
+      // 按鍵時 endTick ≤ 新錨點、暫停／重播清場。閒置門檻不再提早收有固定結束時刻的音。
       if (!state.silencing && e) {
         const due = e.offMs <= hp._clockMs + 1e-6;
         const byPress = staff.kind === 'human' && state.inTrigger && e.endTick <= state.triggerTicks;
-        const idle = hp._stallMsAt(hp._clockMs) > 800;
-        check(due || byPress || idle, `${k} 提早收音（offMs ${e.offMs}、時鐘 ${hp._clockMs}）`);
+        check(due || byPress, `${k} 提早收音（offMs ${e.offMs}、時鐘 ${hp._clockMs}）`);
       }
     },
   });
@@ -332,17 +332,28 @@ run('慢按：電腦聲部放完這一段就停，不越過你的下一個起音
   assert(near(onMs(log, 57, 'assist') - t1, 500, TICK_MS), '速度維持 1×：拍 5 的電腦音 57 在 500ms 後發聲');
 });
 
-run('停格超過閒置門檻（800ms）：還在響的長音收掉，不能無限期掛著；之後照常往下按', () => {
+run('停格超過閒置門檻（800ms）：已經開始的有固定長度的音照 MIDI 音長放完，不被閒置收音切掉；之後照常往下按', () => {
   const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 5 }, 1] }), [['p0', 1]]); // 長音 5s，下一個起音在 0.5s
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(1100);                                              // 0.5s 到達下一個起音停格，停格約 600ms：還沒到門檻
-  assert(count(log, 'off', 40) === 0, '停格還沒超過 800ms，長音還在響');
-  d.runMs(500);
-  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40) - t0, 500 + 800, 40), `停格超過 800ms 收掉，實際在 ${offMs(log, 40) - t0}ms`);
+  d.runMs(2500);                                              // 0.5s 到達下一個起音停格，停格已 2s：早就超過門檻
+  assert(count(log, 'off', 40) === 0, '停格超過 800ms，長音還沒到它自己的結尾，不能被閒置收音切掉');
+  d.runMs(3000);
+  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40) - t0, 5000, TICK_MS), `長音在它自己的結尾（5000ms）收，實際在 ${offMs(log, 40) - t0}ms`);
   d.press();
   assert(count(log, 'on', 41) === 1 && count(log, 'off', 40) === 1, '之後照常放行，長音不會再收第二次');
+});
+
+run('停格超過閒置門檻（800ms）：電腦聲部已經開始的長音同樣照 MIDI 音長放完', () => {
+  const { log, d } = makeHp(buildBeatScore({ p0: [0, 4], a1: [{ beat: 0, dur: 3 }] }), [['p0', 1]]); // 電腦的長音 3s，你的下一個起音在 2s
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.runMs(2900);                                              // 2s 起停格，停格 0.9s：超過門檻
+  assert(count(log, 'on', 52) === 1 && count(log, 'off', 52) === 0, `電腦的長音還沒到結尾，不能被切掉，實際 off ${count(log, 'off', 52)} 個`);
+  d.runMs(500);
+  assert(near(offMs(log, 52, 'assist') - t0, 3000, TICK_MS), `電腦的長音在 3000ms 收，實際 ${offMs(log, 52, 'assist') - t0}`);
 });
 
 run('最後一個 driver 起音之後的電腦音照節奏自己放完，尾音照時值收完才算播完；進度夾在總長以內', () => {
@@ -489,6 +500,18 @@ run('相連音撐住也會被閒置收音收掉（停格超過 800ms），不能
   d.tick(); d.press();
   d.runMs(2000);
   assert(count(log, 'off', 40) === 1, `停格超過門檻，撐住的相連音收掉，實際 ${count(log, 'off', 40)} 個 noteOff`);
+});
+
+run('停格超過門檻只放開「撐住」，不提早收：很長的相連音在它自己的結尾之前不收，結尾過了才收', () => {
+  // 40：0～5s−1tick，後繼音 42 在 5s（間隙 1 tick ＝ 相連音，被撐住）；你的下一個起音 41 在 0.5s，之後停手
+  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 5 - 0.5 / 480 }, 1, 10] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.runMs(3000);                                              // 0.5s 起停格，停格 2.5s：超過門檻，但 40 還沒到它自己的結尾
+  assert(count(log, 'off', 40) === 0, '停格超過門檻，撐住解除，但音還沒到結尾，不能收');
+  d.runMs(2500);
+  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40) - t0, 5000, TICK_MS), `40 在它自己的結尾（約 5000ms）收，實際 ${offMs(log, 40) - t0}`);
 });
 
 run('相連音遇到同音高重複：先關舊音再開新音，新音不會被連帶關掉', () => {
@@ -997,10 +1020,10 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者、�
       prevPos = pos;
       const next = hp._driverSegs[hp._segIndex];
       assert(!next || pos <= next.ticks + 1e-6, `seed ${seed}：播放頭 ${pos} 越過你的下一個起音（tick ${next?.ticks}）`);
-      if (hp._stallMsAt(hp._clockMs) > 800 + 1e-9) {     // 停格超過閒置門檻：沒有任何音還在響
+      if (hp._stallMsAt(hp._clockMs) > 800 + 1e-9) {     // 停格超過閒置門檻：撐住解除，還在響的音都該是「還沒到自己的結尾」的
         idleSeen++;
-        const sounding = [...hp._staves.values()].reduce((a, v) => a + [...v.sounding.values()].reduce((b, q) => b + q.length, 0), 0);
-        assert(sounding === 0, `seed ${seed}：停格超過門檻，還有 ${sounding} 個音在響`);
+        const overdue = [...hp._staves.values()].reduce((a, v) => a + [...v.sounding.values()].reduce((b, q) => b + q.filter((e) => e.offMs <= hp._clockMs - 1e-6).length, 0), 0);
+        assert(overdue === 0, `seed ${seed}：停格超過門檻，有 ${overdue} 個音過了自己的結尾還在響（被撐住沒放開）`);
       }
     }
     assert(accepted > 50, `seed ${seed}：前提：60 秒內應該真的放行很多個 segment（實際 ${accepted} 次）`);
