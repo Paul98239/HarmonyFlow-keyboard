@@ -8,15 +8,13 @@
 //  怎麼判讀：每顆音算兩個差（毫秒，正＝比預期長）：
 //    對檔案＝實際音長 − 檔案音長（試聽就是檔案音長）；
 //    對演奏速度＝實際音長 − 檔案音長 × factor（factor＝你的按鍵間隔是樂譜間隔的幾倍；排程器該做到的是照你的速度等比例縮放）。
-//  · 「完美」情境（factor＝1、無手抖）若「對檔案」只差一個 tick 量級，排程器本身不是主因；差更大就是 tick 粒度或相連音撐住。
+//  · 「完美」情境（factor＝1、無手抖）若「對檔案」只差一個 tick 量級，排程器本身不是主因；差更大就是 tick 粒度。
 //  · 「慢 1.4×」情境「對演奏速度」接近 0、「對檔案」接近 +40％，代表音長變長只是跟著你的速度縮放（設計如此）。
-//  聲部：每首歌音符最多的非打擊 part 當你的聲部（跟 rate-eval／early-eval 同一組），其餘是電腦音。你的音再依「相連音」
-//  （`legatoTo ≥ 0`：後繼音沒放行就會被撐住，見根目錄 CLAUDE.md N4）與其他分開報：相連音多出來的長度是撐住造成的（跟 tick
-//  無關），其他音多出來的長度只會是 tick 粒度（≤ 12ms：收音要等到下一個 tick 才送）。
+//  聲部：每首歌音符最多的非打擊 part 當你的聲部（跟 rate-eval／early-eval 同一組），其餘是電腦音。沒有撐住，音多出來的
+//  長度只會是 tick 粒度（≤ 12ms：收音要等到下一個 tick 才送）。
 //  再依檔案音長分「短音（< 250ms）」「長音（≥ 250ms）」：tick 粒度對短音的比例影響大。
 //
-//  錄製式的檔（例如 oguri）相鄰起音只差幾 ms，完美演奏者的按鍵會被去抖擋掉、40ms 後重按，後繼音晚放行就把前一顆相連音撐得
-//  很長，尾端數字會被它拉大；要看一般檔的行為用 --exclude=oguri。
+//  錄製式的檔（例如 oguri）相鄰起音只差幾 ms，完美演奏者的按鍵會被去抖擋掉、40ms 後重按，尾端數字會被它拉大；要看一般檔的行為用 --exclude=oguri。
 //
 //  用法：node test/tools/note-length-eval.mjs [--dir=資料夾（預設：src/assets 加上 test/tools/library 前 --limit 首）] [--limit=30] [--exclude=檔名片段]
 // ============================================================
@@ -47,7 +45,7 @@ const f0 = (x) => (Number.isFinite(x) ? String(Math.round(x)).padStart(5) : '   
 const pct = (n, d) => (d ? `${Math.round((100 * n) / d)}%`.padStart(4) : '   -');
 
 // 每個情境、每種音（你的相連／你的其他／電腦的 × 短／長）累積樣本
-const GROUPS = [['humanLegato', '你的相連'], ['humanOther', '你的其他'], ['assist', '電腦']];
+const GROUPS = [['human', '你的'], ['assist', '電腦']]; // r.label：human＝你的聲部、assist＝電腦聲部
 const acc = SCENARIOS.map(() => Object.fromEntries(GROUPS.map(([g]) => [g, { short: [], long: [] }])));
 let songs = 0;
 for (const f of files) {
@@ -67,7 +65,7 @@ for (const f of files) {
       const fileMs = (r.note.endSeconds - r.note.startSeconds) * 1000;
       if (fileMs <= 0) continue;
       const actual = r.offMs - r.onMs;
-      const group = r.label === 'assist' ? 'assist' : r.note.legatoTo >= 0 ? 'humanLegato' : 'humanOther';
+      const group = r.label;
       acc[i][group][fileMs < SHORT_MS ? 'short' : 'long'].push({ vsFile: actual - fileMs, vsPlayer: actual - fileMs * sc.factor });
     }
   });

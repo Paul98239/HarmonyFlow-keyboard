@@ -161,8 +161,7 @@ function makeInvariantRig(seed) {
       state.balance.set(k, (state.balance.get(k) ?? 0) - 1);
       check(state.balance.get(k) >= 0, `${k} 沒有對應的 noteOn 就 noteOff`);
       const e = staff.sounding.get(pitch)?.[0];
-      // 收音只有三個理由：到期（照 MIDI 音符長度；被撐住的相連音停格超過閒置門檻後也是「到期才收」）、driver 的音在下一次
-      // 按鍵時 endTick ≤ 新錨點、暫停／重播清場。閒置門檻不再提早收有固定結束時刻的音。
+      // 收音只有三個理由：到期（照 MIDI 音符長度）、driver 的音在下一次按鍵時 endTick ≤ 新錨點、暫停／重播清場。
       if (!state.silencing && e) {
         const due = e.offMs <= hp._clockMs + 1e-6;
         const byPress = staff.kind === 'human' && state.inTrigger && e.endTick <= state.triggerTicks;
@@ -305,7 +304,7 @@ run('電腦音的發聲時刻與長度依估到的速度換算：你按得比檔
 });
 
 run('你的音在下一次按鍵時，endTick ≤ 新起音的先收：按得比預估早，也不等排好的收音時刻（先收再放）', () => {
-  // 40 長 0.45s（結尾在 tick 432，離下一個起音 tick 480 的間隙 48 > θ，不是相連音）；第一次按鍵時速度還是 1×，排好的收音時刻在 450ms 後。
+  // 40 長 0.45s（結尾在 tick 432）；第一次按鍵時速度還是 1×，排好的收音時刻在 450ms 後。
   // 第二下提早到 320ms：這時 40 已經過了它的結尾 tick，要在這一下先關掉，而不是掛到 450ms。
   const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 0.45 }, 1] }), [['p0', 1]]);
   d.tick();
@@ -427,7 +426,7 @@ run('沒有放行的情況：沒在播放、槽位沒有指派聲部、暫停中
 });
 
 /* ═══════════════════════════════════════════
-   收音、相連音、零長度、先進先出
+   收音、零長度、先進先出
    ═══════════════════════════════════════════ */
 
 run('音長照 MIDI 的音符長度，再依估到的速度換算成真實時間（速度 1× 時就是檔案寫的長度）', () => {
@@ -466,27 +465,28 @@ run('零長度的音（起點＝終點，軌尾收尾的音）：照樣發聲、
   assert(hp.isFinished(), '放行完而且沒有音在響＝播完');
 });
 
-run('相連音（你的聲部）在等你按下一個起音時撐住：下一個起音放行的那一刻先關舊音再開新音，中間沒有空白', () => {
-  // 第一顆音比下一拍短 1 tick（MuseScore 的相連音寫法）：到期了但後繼音還沒放行，撐住。
+run('相連音不撐：你的音在自己的結尾就收，不等你按下一個起音（有演奏才有聲音，猶豫時是安靜）', () => {
+  // 第一顆音比下一拍短 1 tick（MuseScore 的相連音寫法），你按了第一下就停手
   const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: ONE_TICK_SHORT }, { beat: 1, dur: 0.4 }] }), [['p0', 1]]);
-  d.tick(); d.press();
-  d.runMs(700);                                               // 停格約 200ms，未超過閒置門檻
-  assert(count(log, 'off', 40) === 0, '後繼音還沒放行，相連音撐住不收');
+  d.tick();
+  const t0 = d.nowMs;
   d.press();
-  const iOff = log.findIndex((e) => e.t === 'off' && e.note === 40), iOn = log.findIndex((e) => e.t === 'on' && e.note === 41);
-  assert(iOff !== -1 && iOff < iOn && log[iOff].ms === log[iOn].ms, `後繼音放行的同一刻：先關舊音、再開新音，實際 off#${iOff}@${log[iOff]?.ms} on#${iOn}@${log[iOn]?.ms}`);
-});
-
-run('相連音撐住同樣適用電腦聲部：後繼音落在你的下一個起音那一段，要等你按下去那一刻才關', () => {
-  const { log, d } = makeHp(buildBeatScore({ a0: [{ beat: 0, dur: ONE_TICK_SHORT }, { beat: 1, dur: 0.4 }], p1: [0, 1] }), [['p1', 1]]);
-  d.tick(); d.press();
   d.runMs(700);
-  assert(count(log, 'off', 40) === 0, '電腦聲部的相連音（後繼音在你的下一個起音那一段）在你還沒按時撐住');
+  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40) - t0, 1000 * ONE_TICK_SHORT, TICK_MS), `40 在自己的結尾（約 ${Math.round(1000 * ONE_TICK_SHORT)}ms）收，實際 ${offMs(log, 40) - t0}`);
   d.press();
-  assert(offMs(log, 40, 'assist') === onMs(log, 41, 'assist') && log.findIndex((e) => e.t === 'off' && e.note === 40) < log.findIndex((e) => e.t === 'on' && e.note === 41), '你按下的那一刻先關舊音再開新音');
+  assert(count(log, 'off', 40) === 1 && count(log, 'on', 41) === 1, '下一個起音放行時沒有額外的收音，只是開新音');
 });
 
-run('相連音的後繼音就在同一段裡（不用等你按）：不撐，照自己的時刻關、再開', () => {
+run('電腦聲部的相連音同樣不撐：在自己的結尾收，不等你按下去', () => {
+  const { log, d } = makeHp(buildBeatScore({ a0: [{ beat: 0, dur: ONE_TICK_SHORT }, { beat: 1, dur: 0.4 }], p1: [0, 1] }), [['p1', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.runMs(700);
+  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40, 'assist') - t0, 1000 * ONE_TICK_SHORT, TICK_MS), `電腦的 40 在自己的結尾收，實際 ${offMs(log, 40, 'assist') - t0}`);
+});
+
+run('相連音的後繼音就在同一段裡（不用等你按）：照自己的時刻關、再開', () => {
   // a0 的兩顆音在拍 0 與拍 0.5（相連），你的起音在拍 0 與拍 2：後繼音屬於同一段，自己會發聲
   const { log, d } = makeHp(buildBeatScore({ a0: [{ beat: 0, dur: 239 / 960 }, { beat: 0.5, dur: 0.1 }], p1: [0, 2] }), [['p1', 1]]);   // a0 第一顆 239 tick（比下一顆早 1 tick 結束）
   d.tick(); d.press();
@@ -495,21 +495,14 @@ run('相連音的後繼音就在同一段裡（不用等你按）：不撐，照
   assert(iOff !== -1 && iOn !== -1 && iOff < iOn, `後繼音自己發聲，舊音先收、再開新音，實際 off#${iOff} on#${iOn}`);
 });
 
-run('相連音撐住也會被閒置收音收掉（停格超過 800ms），不能無限期掛著', () => {
-  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: ONE_TICK_SHORT }, 1] }), [['p0', 1]]);
-  d.tick(); d.press();
-  d.runMs(2000);
-  assert(count(log, 'off', 40) === 1, `停格超過門檻，撐住的相連音收掉，實際 ${count(log, 'off', 40)} 個 noteOff`);
-});
-
-run('停格超過門檻只放開「撐住」，不提早收：很長的相連音在它自己的結尾之前不收，結尾過了才收', () => {
-  // 40：0～5s−1tick，後繼音 42 在 5s（間隙 1 tick ＝ 相連音，被撐住）；你的下一個起音 41 在 0.5s，之後停手
+run('停格再久也不改音長：很長的音在自己的結尾收，不被閒置切掉、也不被延長', () => {
+  // 40：0～5s−1tick；你的下一個起音 41 在 0.5s，之後停手
   const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 5 - 0.5 / 480 }, 1, 10] }), [['p0', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(3000);                                              // 0.5s 起停格，停格 2.5s：超過門檻，但 40 還沒到它自己的結尾
-  assert(count(log, 'off', 40) === 0, '停格超過門檻，撐住解除，但音還沒到結尾，不能收');
+  d.runMs(3000);                                              // 0.5s 起停格 2.5s：超過閒置門檻，但 40 還沒到它自己的結尾
+  assert(count(log, 'off', 40) === 0, '停格超過門檻，音還沒到結尾，不能收');
   d.runMs(2500);
   assert(count(log, 'off', 40) === 1 && near(offMs(log, 40) - t0, 5000, TICK_MS), `40 在它自己的結尾（約 5000ms）收，實際 ${offMs(log, 40) - t0}`);
 });
@@ -521,11 +514,11 @@ run('相連音遇到同音高重複：先關舊音再開新音，新音不會被
   assert(seq === 'on,off,on,off', `應為 on,off,on,off，實際 ${seq}`);
 });
 
-run('沒有 tick 換算的檔案（SMPTE division，timeDivision＝null）也能照常按：不丟例外，相連音不撐', () => {
+run('沒有 tick 換算的檔案（SMPTE division，timeDivision＝null）也能照常按：不丟例外', () => {
   const smpte = { ...buildBeatScore({ p0: [{ beat: 0, dur: ONE_TICK_SHORT }, 1] }), timeDivision: null };
   const { log, d } = makeHp(smpte, [['p0', 1]]);
   d.tick(); d.press(); d.runMs(700);
-  assert(count(log, 'off', 40) === 1, '沒有 tick 換算就沒有相連音判斷：照檔案收音，不撐');
+  assert(count(log, 'off', 40) === 1, '照檔案收音');
   d.press();
   assert(count(log, 'on', 41) === 1, '照常放行下一個 segment');
 });
@@ -581,8 +574,8 @@ run('整首自動播放（沒有指派）：每顆音在樂譜時間發聲（誤
   assert(count(log, 'on') === 6 && count(log, 'off') === 6, `6 個 noteOn、6 個 noteOff，實際 ${count(log, 'on')}／${count(log, 'off')}`);
 });
 
-run('整首自動播放：每顆音照編碼收，不撐——舊音在檔案寫的結尾收，再開新音', () => {
-  // 第一顆音比下一拍短 20 tick（小於相連音門檻 30 tick）：手動演奏時它會被撐住等你按，自動播放不撐，照檔案在 tick 460 收。
+run('整首自動播放：每顆音照編碼收——舊音在檔案寫的結尾收，再開新音', () => {
+  // 第一顆音比下一拍短 20 tick：照檔案在 tick 460 收。
   const { hp, log, d } = makeHp(buildBeatScore({ a0: [{ beat: 0, dur: 0.5 * 460 / 480 }, { beat: 1, dur: 0.4 }] }), []);
   while (!hp.isFinished() && d.nowMs < 5000) d.tick();
   const iOff = log.findIndex((e) => e.t === 'off' && e.note === 40), iOn = log.findIndex((e) => e.t === 'on' && e.note === 41);
@@ -991,7 +984,7 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者、�
     hp.load(score, new Map(assignments));
     hp.play();
     const pPress = 12 / (beatSec * 1000 * 0.5);          // 平均約 0.5 拍按一次
-    // 一開始全體先不按 3.8 秒（前奏自己播、停在入場點），之後隨機全體停手 1.2~3 秒（壓到停格釋放）；偶爾手抖連按（壓到去抖）。
+    // 一開始全體先不按 3.8 秒（前奏自己播、停在入場點），之後隨機全體停手 1.2~3 秒（壓到停格）；偶爾手抖連按（壓到去抖）。
     let now = 0, prevPos = 0, accepted = 0, ignored = 0, idleSeen = 0, quietUntil = 320, burstUntil = -1;
     for (let i = 0; i < 5000; i++) {
       now += 12;
@@ -1020,15 +1013,14 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者、�
       prevPos = pos;
       const next = hp._driverSegs[hp._segIndex];
       assert(!next || pos <= next.ticks + 1e-6, `seed ${seed}：播放頭 ${pos} 越過你的下一個起音（tick ${next?.ticks}）`);
-      if (hp._stallMsAt(hp._clockMs) > 800 + 1e-9) {     // 停格超過閒置門檻：撐住解除，還在響的音都該是「還沒到自己的結尾」的
-        idleSeen++;
-        const overdue = [...hp._staves.values()].reduce((a, v) => a + [...v.sounding.values()].reduce((b, q) => b + q.filter((e) => e.offMs <= hp._clockMs - 1e-6).length, 0), 0);
-        assert(overdue === 0, `seed ${seed}：停格超過門檻，有 ${overdue} 個音過了自己的結尾還在響（被撐住沒放開）`);
-      }
+      // 沒有任何音會被撐住：這個 tick 結束時，每個音高佇列的最前面那一顆（同音高先進先出，後面的音要等前面的收掉）都該還沒到自己的結尾（停格再久也一樣）
+      const overdue = [...hp._staves.values()].reduce((a, v) => a + [...v.sounding.values()].reduce((b, q) => b + (q.length && q[0].offMs <= hp._clockMs - 1e-6 ? 1 : 0), 0), 0);
+      assert(overdue === 0, `seed ${seed}：有 ${overdue} 個音過了自己的結尾還在響`);
+      if (hp._stallMsAt(hp._clockMs) > 800 + 1e-9) idleSeen++;
     }
     assert(accepted > 50, `seed ${seed}：前提：60 秒內應該真的放行很多個 segment（實際 ${accepted} 次）`);
     assert(ignored > 0, `seed ${seed}：前提：這個壓力測試應該真的壓到去抖（有按鍵被忽略）`);
-    assert(idleSeen > 0, `seed ${seed}：前提：這個壓力測試應該真的壓到停格釋放`);
+    assert(idleSeen > 0, `seed ${seed}：前提：這個壓力測試應該真的壓到停格超過閒置門檻`);
     assert(rig.maxSimultaneous >= 2, `seed ${seed}：前提：這個壓力測試應該真的壓到同音高重疊`);
     rig.silencing = true; hp.pause(); rig.silencing = false;    // 收掉還在響的音之後，每個 noteOn 都剛好有一個 noteOff
     rig.flush();
@@ -1147,17 +1139,15 @@ run('lookahead：暫停時已經送出、還沒響的電腦音，另外送一個
   assert(!log.some((e) => e.t === 'off' && e.note === 53 && e.time === undefined), '不能送立刻處理的 noteOff（會比那顆 noteOn 早到）');
 });
 
-run('lookahead：相連音撐住照舊——後繼音落在還沒被按鍵啟動的段，收音就不能提早送出', () => {
+run('lookahead：相連音（後繼音在你還沒按的那一段）的收音也照自己的結尾提早帶時間戳送出，不等你按下去', () => {
   // a1 在拍 1 的 60 與拍 2 的 61 是相連音（間隙 1 tick）；拍 2 是你的下一個起音（p0），61 在還沒啟動的段裡
   const { log, d } = makeAudioHp(buildBeatScore({ p0: [0, 2], a1: [{ beat: 1, dur: ONE_TICK_SHORT, note: 60 }, { beat: 2, dur: 0.025, note: 61 }] }), [['p0', 1]]);
   d.tick();
   d.press();
-  d.runMs(1100);                                                          // 60 的收音時刻（約 998ms）早已落在 lookahead 範圍內
-  assert(log.some((e) => e.t === 'on' && e.note === 60) && !log.some((e) => e.t === 'off' && e.note === 60), `還沒按：60 被撐住、不能送收音，實際 ${JSON.stringify(log.filter((e) => e.note === 60))}`);
-  const t1 = d.nowMs;
-  assert(d.press() === true, '第二下');
-  const off60 = log.find((e) => e.t === 'off' && e.note === 60), on61 = log.find((e) => e.t === 'on' && e.note === 61);
-  assert(off60 && off60.ms === t1 && on61 && on61.ms === t1, '按下的那一刻先收 60、再放 61（相連音在後繼音放行時才收）');
+  d.runMs(1100);                                                          // 60 的收音時刻（約 998ms）早已落在 lookahead 範圍內，你還沒按第二下
+  const off60 = log.find((e) => e.t === 'off' && e.note === 60);
+  assert(off60 && off60.time !== undefined, `60 在自己的結尾收，而且帶時間戳（lookahead），實際 ${JSON.stringify(log.filter((e) => e.note === 60))}`);
+  assert(!log.some((e) => e.t === 'on' && e.note === 61), '你還沒按，61 不會發聲');
 });
 
 // 依 worklet 的規則重播事件：時間戳在未來才排進佇列、已過就在送出的當下立刻處理，同一刻依送出順序。
