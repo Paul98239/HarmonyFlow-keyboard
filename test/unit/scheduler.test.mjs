@@ -288,6 +288,17 @@ run('提早按：上一段沒放完的電腦音照自己的時刻繼續放完（
   assert(onMs(log, 41, 'human') === t1 && onMs(log, 56, 'assist') === t1, '第二下那一刻：你的 41 與屬於下一段起點的電腦音 56 同刻（重新對時，沒有累積落後）');
 });
 
+run('你的音在下一次按鍵時依 endTick 先收：同一位演奏者的另一個聲部在這個起音有音、這個聲部休止（尾巴收尾管不到，靠 endTick）', () => {
+  // p0 的 40 在拍 0、長 0.45s（結尾 tick 432，之後休止）；p1 在拍 0、1 有音，兩個聲部都給演奏者 1。第二下提早到 320ms：
+  // 40 的排好收音時刻是 450ms，但這一下起音 tick 480 已經過了它的結尾，要在按下的那一刻收。
+  const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 0.45, note: 40 }, 2], p1: [0, 1] }), [['p0', 1], ['p1', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  assert(d.pressAt(t0 + 320) === true, '第二下提早');
+  assert(offMs(log, 40, 'human') === t0 + 320, `40 在第二下按下的那一刻收，實際 ${offMs(log, 40, 'human') - t0}`);
+});
+
 run('尾巴收尾：你按得比預估早，同譜表還在響的電腦舊音在新音起音處收，不比檔案多疊（檔案裡有空隙就收在新音發聲那一刻）', () => {
   // a1 的 70 在拍 0.25、長 0.3s（檔案裡 0.425s 結束，離拍 1 的 71 還有 75ms 空隙）；第二下提早到 320ms，71 在那一刻發聲
   const { log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2], a1: [{ beat: 0.25, dur: 0.3, note: 70 }, { beat: 1, dur: 0.1, note: 71 }] }), [['p0', 1]]);
@@ -360,12 +371,13 @@ run('你的音在下一次按鍵時，endTick ≤ 新起音的先收：按得比
   assert(onMs(log, 41, 'human') === t0 + 320, '41 在同一刻發聲');
 });
 
-run('慢按：電腦聲部放完這一段就停，不越過你的下一個起音；你停手太久（停格超過 800ms）這次間隔不拿來估速', () => {
+run('慢按：電腦聲部放完這一段就停，不越過你的下一個起音；你停手太久這次間隔不拿來估速', () => {
+  // 速度還沒學到（只按過一下）時，停格要超過預測間隔的 3 倍（2000ms × 3）才算停手，所以停 10 秒
   const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 4], a1: [0, 1, 2, 3, 4, 5, 6, 7] }), [['p0', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(6000);
+  d.runMs(10000);
   [0, 1, 2, 3].forEach((b) => assert(near(onMs(log, 52 + b, 'assist') - t0, b * 500, TICK_MS), `第 ${b} 拍的電腦音照時刻發聲`));
   assert(onMs(log, 56) === undefined && onMs(log, 41) === undefined, '拍 4 是你的下一個起音，電腦音 56 與你的 41 都要等你按');
   assert(near(hp.getPositionTicks(), 1920, 1e-6), `播放頭停在下一個起音（tick 1920），實際 ${hp.getPositionTicks()}`);
@@ -374,6 +386,35 @@ run('慢按：電腦聲部放完這一段就停，不越過你的下一個起音
   assert(hp.playbackRate === 1, `停手超過閒置門檻之後的間隔不拿來估速：速度維持 1，實際 ${hp.playbackRate}`);
   d.runMs(600);
   assert(near(onMs(log, 57, 'assist') - t1, 500, TICK_MS), '速度維持 1×：拍 5 的電腦音 57 在 500ms 後發聲');
+});
+
+run('速度還沒學到時，你很慢（比預測慢很多）不是停手：這次間隔照常拿來估速（不然慢速演奏者永遠學不到速度）', () => {
+  // 預測 500ms、實際 1500ms：停格 1000ms 超過 800ms，但沒超過預測的 3 倍（1500ms）
+  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  assert(d.pressAt(t0 + 1500) === true, '第二下');
+  assert(near(hp.playbackRate, 1 / 3, 1e-9), `速度要學到 1/3，實際 ${hp.playbackRate}`);
+});
+
+run('速度還沒學到時，停格超過預測的 3 倍才算停手：這次間隔不拿來估速', () => {
+  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  assert(d.pressAt(t0 + 5000) === true, '第二下');         // 預測 500ms，停格 4500ms > 1500ms
+  assert(hp.playbackRate === 1, `停手：速度維持 1，實際 ${hp.playbackRate}`);
+});
+
+run('速度學到之後（≥ 3 個間隔），停格超過 800ms 就算停手：這次間隔不拿來估速', () => {
+  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3, 4, 5] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  [500, 1000, 1500].forEach((ms) => assert(d.pressAt(t0 + ms) === true, `第 ${ms} 下`));   // 3 個間隔，速度 1×
+  assert(d.pressAt(t0 + 3500) === true, '停 2 秒後再按');    // 預測 500ms，停格 1500ms > 800ms
+  assert(hp.playbackRate === 1, `停手：歷史清空、速度維持 1（不被拖慢），實際 ${hp.playbackRate}`);
 });
 
 run('停格超過閒置門檻（800ms）：已經開始的有固定長度的音照 MIDI 音長放完，不被閒置收音切掉；之後照常往下按', () => {

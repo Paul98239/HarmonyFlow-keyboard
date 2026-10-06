@@ -12,9 +12,9 @@
 //  模擬的排程器行為（照 scheduler.js 的 _release()）：
 //    · 速度＝ estimatePlaybackRate(歷史)，歷史不足 2 個按鍵時維持上一個值（一開始是 1）。
 //    · 停手判斷：這次按鍵時，播放頭停在你的下一個起音已經多久（＝實際間隔 − 依「上一次錨點速度」預測的間隔）超過
-//      IDLE_MS（800ms）就視為停手，歷史清空、這一下不拿來估速。這是「現行」策略。
+//      IDLE_MS（800ms）就視為停手，歷史清空、這一下不拿來估速。這是「舊規則」；表中標「採用」的是現在 scheduler.js 的 _isIdleBreak()。
 //  策略（idleRule × shrink）：
-//    現行            ：停手＝停格 > 800ms
+//    舊規則          ：停手＝停格 > 800ms（採用新規則之前的 scheduler.js）
 //    不判停手        ：永遠不清歷史（對照用：看停手判斷到底幫了多少）
 //    停格 > 800ms 且 > m × 預測間隔 ：預測太快（低估你的間隔）時停格會跟著變大，不該算停手；m＝2、3、4
 //    ＋收縮 K         ：估到的速度跟「清空前的速度（沒有就 1）」依資料量加權（對數域）：w ＝ n ÷ (n + K)，n＝間隔數
@@ -73,12 +73,12 @@ const players = {
 // ── 策略：idle(stallMs, expectedMs, intervals)＝是不是停手（intervals＝清空後目前累積的有效間隔數：不足時速度還沒學到，
 //    「實際間隔 − 預測間隔」大可能只是預測太快，不是你停手） ──
 const strategies = {
-  '現行（停格 > 800ms 就清歷史）': { idle: (stall) => stall > IDLE_MS },
+  '舊規則（停格 > 800ms 就清歷史）': { idle: (stall) => stall > IDLE_MS },
   '不判停手（永遠不清歷史）': { idle: () => false },
   '停格 > 800ms 且 > 3×預測間隔': { idle: (stall, exp) => stall > IDLE_MS && stall > 3 * exp },
   '≥ 3 個間隔才判停手（之前不判）': { idle: (stall, exp, n) => n >= 3 && stall > IDLE_MS },
   '≥ 3 個間隔用 800ms；之前要停格 > 4 秒': { idle: (stall, exp, n) => stall > (n >= 3 ? IDLE_MS : 4000) },
-  '≥ 3 個間隔用 800ms；之前要停格 > 3×預測間隔': { idle: (stall, exp, n) => stall > (n >= 3 ? IDLE_MS : Math.max(IDLE_MS, 3 * exp)) },
+  '≥ 3 個間隔用 800ms；之前要停格 > 3×預測間隔（採用）': { idle: (stall, exp, n) => stall > (n >= 3 ? IDLE_MS : Math.max(IDLE_MS, 3 * exp)) },
 };
 
 function evaluate(song, player, strat, seed) {

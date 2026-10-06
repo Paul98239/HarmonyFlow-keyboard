@@ -61,6 +61,10 @@ export const DEFAULT_PORTS = 4;
 // 「播放頭停在你的下一個起音多久」算停手的門檻：這次間隔不拿來估速。800ms 吸收你按鍵的停頓；你完全停手時電腦聲部放完這一段
 // 就靜止，已經開始的音照音長收完（閒置不切音）。
 const IDLE_MS = 800;
+// 速度還沒學到（歷史裡的間隔不到 IDLE_LEARNED_INTERVALS 個）時，「實際間隔 − 預測間隔」變大可能只是預測太快（你很慢），
+// 不是你停手：停格要超過預測間隔的 IDLE_UNLEARNED_FACTOR 倍才算停手，不然慢速演奏者的歷史每一下都被清掉、永遠學不到速度。
+const IDLE_LEARNED_INTERVALS = 3;
+const IDLE_UNLEARNED_FACTOR = 3;
 // 每個 tick 的時間步長上限：分頁被瀏覽器節流（背景分頁的計時器可能隔好幾秒才醒來）後恢復時，時鐘最多只前進這麼多，
 // 不會一次把空窗期的音全部放出來或收掉。
 const MAX_TICK_DT_MS = 100;
@@ -526,12 +530,20 @@ export class Scheduler {
     return true;
   }
 
+  // 這次按鍵是不是「停手之後」的第一下：播放頭停在你的下一個起音超過門檻。速度已經學到（≥ IDLE_LEARNED_INTERVALS 個間隔）
+  // 時門檻是 IDLE_MS；還沒學到時預測不可靠，門檻放寬到預測間隔的 IDLE_UNLEARNED_FACTOR 倍（見常數的說明）。
+  _isIdleBreak(clock) {
+    if (this._stallMsAt(clock) <= IDLE_MS) return false;
+    const learned = this._history.length - 1 >= IDLE_LEARNED_INTERVALS;
+    const predictedMs = this._reachClockMs() - this._anchor.clockMs;   // 停格 > 0 表示有下一個起音，錨點一定在
+    return learned || this._stallMsAt(clock) > IDLE_UNLEARNED_FACTOR * predictedMs;
+  }
+
   // 放行 _segIndex 這個 driver segment（按鍵 trigger() 與前奏結束時的預按放行共用），時刻 clock（排程器時鐘）。
   _release(clock) {
     const j = this._segIndex, seg = this._driverSegs[j];
     const scoreSec = this._secOf(seg.ticks);
-    const idleBreak = this._stallMsAt(clock) > IDLE_MS;     // 停手超過閒置門檻：這次間隔不拿來估速（速度維持原本的值）
-    if (idleBreak) this._history = [];
+    if (this._isIdleBreak(clock)) this._history = [];      // 停手：這次間隔不拿來估速（速度維持原本的值）
     this._history.push({ scoreSec, ms: clock });
     this.playbackRate = estimatePlaybackRate(this._history, this.playbackRate);
     this._lastAcceptClock = clock;
