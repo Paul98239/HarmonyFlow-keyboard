@@ -30,7 +30,7 @@ src/
 
 ## 第三方套件
 
-`@mediapipe/tasks-vision`（`src/vision/vision.js`）與 `spessasynth_lib`（`src/midi/synth.js`）都直接寫死完整 CDN 網址（jsDelivr）匯入，版本綁 `@latest`；沒有 import map、沒有本地副本。
+`@mediapipe/tasks-vision`（`src/vision/vision.js`）與 `spessasynth_lib`（`src/midi/synth.js`）都直接寫死完整 CDN 網址（jsDelivr）匯入，`tasks-vision` 固定 `@1.1.0`、`spessasynth_lib` 綁 `@latest`；沒有 import map、沒有本地副本。
 
 ## 文件
 

@@ -3,13 +3,13 @@
 //  WebGL 視訊渲染 + 多人 ID 鎖定追蹤 + 自適應平滑濾波（最多 4 人）
 // ============================================================
 
-// 直接從 CDN 匯入（不經 import map），版本綁 @latest：不手動維護版本號，代價是
-// jsDelivr 對 @latest 有快取（瀏覽器端 7 天／邊緣節點 12 小時），版本可能在快取到期
-// 後無預警改變，且不同使用者吃到新版的時間點不一致。
+// 直接從 CDN 匯入（不經 import map），版本固定為 1.1.0：bundle、loader JS、.wasm 三個檔案必須同一版。
+// 不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm（2026-10-07 實測），
+// 載入時 assignWasmExports 讀到 undefined 而失敗。升級時下面兩個網址（import 與 forVisionTasks）一起改。
 import {
   PoseLandmarker,
   FilesetResolver,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/vision_bundle.mjs";
 import { PersonTracker, buildDetection } from "./tracking.js";
 import { ArcDetector } from "./gesture.js";
 
@@ -903,7 +903,7 @@ async function initSystem() {
 
     setStatus("正在載入 WASM 視覺模組⋯");
     visionFileset = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm"
     );
 
     // Pose landmarker 完全懶惰載入，開機不建：chosenPoseCount 這時候是 0，使用者選人數之前
