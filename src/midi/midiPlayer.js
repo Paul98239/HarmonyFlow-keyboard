@@ -154,7 +154,7 @@ export function audioLatency() {
   return synth.audioLatencyInfo();
 }
 
-// 量測（同上）：這一輪的按鍵記錄與目前的指派，給 main.js 的 window.__pressLog 匯出，離線重放用（test/tools/hold-eval.mjs）。
+// 量測（同上）：這一輪的按鍵記錄與目前的指派，給 main.js 的 window.__pressLog 匯出，離線重放用（test/tools/symmetry-eval.mjs）。
 export function pressLog() {
   return { assignments: [...playerStore.state.assignments], presses: synth.scheduler.pressLog() };   // Map 展開成 [partId, 槽位][]，才能轉成 JSON
 }

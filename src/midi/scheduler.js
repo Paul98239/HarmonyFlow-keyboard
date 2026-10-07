@@ -23,7 +23,8 @@
 //  去抖（pressTiming.js）：兩次按鍵太近就忽略第二次（擋手抖、手勢重複觸發）。
 //
 //  收音：driver 的音到期（對應時刻）或下一次按鍵時 endTick ≤ 新錨點的先收掉，follower 的音從它發聲的時刻起算原始時值。
-//  每顆音都在自己的結尾收，不延長：你猶豫時音結束、之後是安靜，像真的樂器；放行時先收再放。尾巴收尾：同一個譜表的新音發聲時，
+//  每顆音都在自己的結尾收、不撐住（你的與電腦的一樣）：你猶豫時音結束、之後是安靜，像真的樂器；放行時先收再放。跨過你起音、
+//  還在響的電腦音，在你按下那個起音時依剩下的長度重新對時（只延後，見 _retimeCrossing）。尾巴收尾：同一個譜表的新音發聲時，
 //  還在響的舊音（起音 tick 比新音早）的收音時刻上限＝新音發聲時刻 ＋ 檔案裡這兩顆音的重疊量（結尾 tick − 新音起音 tick，
 //  最少 0）依目前速度換算——你按得比預估早時，舊音不會比檔案裡的重疊多響一截（糊在一起），也不丟音；只會提早、不會延長。同音高重疊的音依發聲順序先進先出
 //  收音（跟官方合成器對 note-off 的解讀一致），每個 noteOn 都送出一個 noteOff。
@@ -45,9 +46,6 @@ import { estimatePlaybackRate, debounceWindowMs, summarizeMs } from './pressTimi
 
 export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
   drumChannel: 9, // MIDI 規格：第 10 個 channel（索引 9）是打擊
-  // 跨過你起音的電腦音，預定收音時刻到了你卻還沒按那個起音時，最多再多響幾毫秒（見 _isHeld）。800 沿用 IDLE_MS 當起點，
-  // 不是推導出來的（固定毫秒不跟速度走），由 test/tools/hold-eval.mjs 掃值決定。0＝不延長（等於舊行為）。
-  holdMaxMs: 800,
 });
 
 // channel 的單一來源（synth.js 也從這裡 import，不再各寫一份）。模仿官方 SpessaSynth Sequencer：一個 port 16 個 channel，
@@ -80,8 +78,6 @@ const EPS_MS = 1e-6;
 const LOOKAHEAD_MS = 50;
 // 量測用：電腦音遲到量最多留幾筆（超過就丟最舊的），避免長時間播放無限成長。
 const LATE_SAMPLES_MAX = 5000;
-// 電腦音的結尾離你的下一個起音在這個 tick 數以內，就當作「接著你的起音」（MuseScore 匯出把音的結尾寫成下一拍 − 1，所以是 1）。
-const HOLD_END_TOLERANCE_TICKS = 1;
 // 按鍵記錄最多留幾筆（超過就丟最舊的），避免長時間播放無限成長。
 const PRESS_LOG_MAX = 20000;
 // GM 預設的混音值（CC121 不會重設音量、聲像、Program，見 GML-v1 §3.2.5.2；channel 又是跨曲重複使用，所以沒有 init 的 staff
@@ -578,8 +574,8 @@ export class Scheduler {
     let queue = staff.sounding.get(note.midiNote);
     if (!queue) staff.sounding.set(note.midiNote, (queue = []));
     const opts = this._stamp(staff, dueMs);
-    // holdSeg：電腦音跨過的最後一個 driver segment（-1＝沒有跨過；你的音一律 -1，永遠在時鐘到了才收）；capped：被同譜表的新音截短過
-    queue.push({ endTick: note.endTick, offMs, note, onTime: opts?.time, holdSeg: staff.kind === 'human' ? -1 : this._holdSegOf(note), capped: false }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
+    // capped：之後不再被重新對時延長（被同譜表的新音截短過，或後面排著同音高的新音，見 _capOverlaps）
+    queue.push({ endTick: note.endTick, offMs, note, onTime: opts?.time, capped: false }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
     try { this._synthOf(staff)?.noteOn(staff.channel, note.midiNote, note.velocity, opts); } catch (err) {}
   }
 
@@ -595,10 +591,10 @@ export class Scheduler {
         if (entry.note.startTick >= note.startTick) continue;
         const capMs = onsetMs + (Math.max(0, this._secOf(entry.endTick) - startSec) * 1000) / this.playbackRate;
         // 只有「真的截短」才標成不再延長（EPS：capMs 與 offMs 從同一個錨點算出來，相等時只差浮點誤差，不算截短；多聲部譜表的
-        // 內聲部短音常在長音中間起音，不能因為同譜表有別的音就放棄 hold）
+        // 內聲部短音常在長音中間起音，不能因為同譜表有別的音就不再重新對時）
         if (capMs < entry.offMs - EPS_MS) { entry.offMs = capMs; entry.capped = true; }
-        // 同音高：舊音正在 hold 時，同音高的新音收音在先進先出佇列裡排在它後面，舊音若繼續 hold，新音的收音也會被拖住
-        else if (entry.note.midiNote === note.midiNote && entry.holdSeg >= this._segIndex) entry.capped = true;
+        // 同音高：新音的收音在先進先出佇列裡排在舊音後面，舊音之後若再被重新對時延長，新音的收音也會被拖住
+        else if (entry.note.midiNote === note.midiNote) entry.capped = true;
       }
     }
     // 同音高的舊音若因此到期，要在新音 noteOn 之前先收（先收再放：不然同音高的 noteOff 會連新音一起關掉）
@@ -608,24 +604,6 @@ export class Scheduler {
       same.shift();
     }
     if (same && !same.length) staff.sounding.delete(note.midiNote);
-  }
-
-  // 電腦音「要等你按到哪個起音」：起音 tick 落在 (startTick, endTick + HOLD_END_TOLERANCE_TICKS] 的最後一個 driver segment 編號，
-  // 沒有就 -1。_sliceOfTick(t)＝起音 tick ≤ t 的 driver segment 有幾個（二分搜尋），所以 first 是「第一個起音 tick > startTick」的
-  // 編號、last 是「最後一個起音 tick ≤ endTick ＋ 容許誤差」的編號。包含「結尾剛好等於你的起音」與 MuseScore 的「下一拍 − 1」：
-  // 這類音在樂譜上就是接到你的下一個音，你比預估慢時它不能比你先結束（實測卡農：小提琴整音符結尾 21119、你的大提琴下一個起音
-  // 21120，被預測收掉後電腦靜音等你）。
-  _holdSegOf(note) {
-    const first = this._sliceOfTick(note.startTick);
-    const last = this._sliceOfTick(note.endTick + HOLD_END_TOLERANCE_TICKS) - 1;
-    return last >= first ? last : -1;
-  }
-
-  // 這顆電腦音現在是不是被「跨過你起音」的規則留著不收：它跨過的最後一個起音你還沒按（_segIndex 還沒越過它）、沒有被同譜表的
-  // 新音截短過（尾巴收尾優先），而且還沒超過「預定收音時刻 ＋ holdMaxMs」。用真正的時鐘（_clockMs），不吃 lookahead 的提早量：
-  // hold 中的音不能提早送帶時間戳的 noteOff，worklet 取消不了，送了它就一定會在你按之前響完。
-  _isHeld(entry) {
-    return entry.holdSeg >= this._segIndex && !entry.capped && this._clockMs < entry.offMs + this.cfg.holdMaxMs;
   }
 
   // 時鐘時刻 ms 對應的 AudioContext 時間，包成 eventOptions。只有 tick() 裡（_audioBase 有值）的電腦輔助聲部才有；
@@ -716,7 +694,6 @@ export class Scheduler {
       const limit = staff.kind === 'human' ? this._clockMs : limitMs;
       for (const [pitch, queue] of staff.sounding) {
         while (queue.length && queue[0].offMs <= limit + EPS_MS) {
-          if (this._isHeld(queue[0])) break;   // 跨過你起音、你還沒按：先不收（同音高佇列先進先出，後面的也等）
           try { synth?.noteOff(staff.channel, pitch, this._offOpts(staff, queue[0], queue[0].offMs)); } catch (err) {}
           queue.shift();
         }
@@ -728,7 +705,8 @@ export class Scheduler {
   // 你按下起音 ticks（樂譜秒 scoreSec）時，還在響、跨過這個起音的電腦音（startTick < ticks < endTick）：收音時刻至少是
   // 「按下時刻 ＋ 剩下的樂譜長度 ÷ 新速度」。為什麼：舊的收音時刻是它發聲當下依當時速度估的，你比估到的慢時，這個起音之後它該
   // 還剩的長度要從你真正按下的時刻重新算，音才會對齊你的 tick。只延後、不提前（max），所以你按得比預估早時行為不變（N2：
-  // 沒放完的電腦音照原長放完）；被尾巴收尾截短過的不動。
+  // 沒放完的電腦音照原長放完）；標成 capped 的（被尾巴收尾截短過、後面排著同音高的新音）不動。只在按下的那一刻調整：
+  // 收音時刻到了你還沒按下一個起音，照樣收（不撐住，跟你的音一樣）。
   _retimeCrossing(ticks, scoreSec, clock) {
     for (const staff of this._staves.values()) {
       if (staff.kind === 'human') continue;

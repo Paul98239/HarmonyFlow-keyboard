@@ -344,61 +344,19 @@ run('尾巴收尾：同音高的舊音要在新音 noteOn 之前先收（先收�
   assert(seq === 'on,off,on,off', `應為 on,off,on,off，實際 ${seq}`);
 });
 
-// ── 跨過你起音的電腦音（hold ＋ retime）：譜是 120 BPM（拍長 0.5s）；你（me）每拍一個起音，電腦（cpu）有一顆長音跨過你的起音 ──
-run('跨過你起音的電腦音：你晚按，按下去之前不收，按下去後依剩下的長度重新對時', () => {
-  // cpu 的 60 從拍 0 到拍 2（1s，endTick 960），跨過你在拍 1 的起音（tick 480）。你第二下晚到 1250ms（預測 500ms，晚 750ms，沒超過停手門檻）
-  const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 1.0, note: 60 }] }), [['me', 1]]);
+// ── 跨過你起音的電腦音（重新對時）：譜是 120 BPM（拍長 0.5s）；你（me）每拍一個起音，電腦（cpu）有一顆長音跨過你的起音 ──
+run('跨過你起音的電腦音：你晚按、它還在響時，按下去的那一刻依剩下的長度重新對時；之後你不按，照重新對時的時刻收（不撐住）', () => {
+  // cpu 的 60 從拍 0 到拍 3（1.5s，endTick 1440），跨過你在拍 1、拍 2 的起音。你第二下晚到 700ms（預測 500ms），60 還在響（預定 1500ms 收）
+  const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2, 3], cpu: [{ beat: 0, dur: 1.5, note: 60 }] }), [['me', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(1100);                                             // 預定收音時刻是 1000ms，已經過了，但你還沒按拍 1 的起音
-  assert(count(log, 'off', 60) === 0, `你還沒按它跨過的起音，60 不能收，實際 off ${count(log, 'off', 60)} 個`);
-  assert(d.pressAt(t0 + 1250) === true, '第二下放行');
-  assert(count(log, 'off', 60) === 0, '按下去的那一刻 60 還在響');
-  // 速度＝0.5s ÷ 1.25s ＝ 0.4；剩下的樂譜長度 0.5s ÷ 0.4 ＝ 1250ms → 預定收在 1250 + 1250 ＝ 2500ms，正好是你的下一個起音（拍 2）
-  d.runMs(1100);                                             // 2350ms：還沒到
-  assert(count(log, 'off', 60) === 0, `重新對時後預定 2500ms 才收，2350ms 時還在響，實際 off ${count(log, 'off', 60)} 個`);
-  d.pressAt(t0 + 2500);                                      // 你按拍 2 的起音：60 的結尾接著它，在你按下去的那一刻收
-  assert(near(offMs(log, 60, 'assist') - t0, 2500, TICK_MS * 2), `60 在 2500ms 左右收（按下的時刻 ＋ 剩下長度 ÷ 新速度），實際 ${offMs(log, 60, 'assist') - t0}`);
-});
-
-run('跨過你起音的電腦音：你一直不按，最多多響 holdMaxMs（800ms）就收，不會無限撐住', () => {
-  const { hp, log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 1.0, note: 60 }] }), [['me', 1]]);
-  assert(hp.cfg.holdMaxMs === 800, `holdMaxMs 預設 800，實際 ${hp.cfg.holdMaxMs}`);
-  d.tick();
-  const t0 = d.nowMs;
-  d.press();
-  d.runMs(1700);                                             // 預定 1000ms ＋ 800ms ＝ 1800ms 才到期
-  assert(count(log, 'off', 60) === 0, `1700ms 還在 hold，實際 off ${count(log, 'off', 60)} 個`);
-  d.runMs(300);
-  assert(count(log, 'off', 60) === 1 && near(offMs(log, 60, 'assist') - t0, 1800, TICK_MS * 2), `60 在 1800ms 左右收，實際 ${offMs(log, 60, 'assist') - t0}`);
-  assert(hp.isFinished() === false, '你的聲部還有起音沒按，不算播完');
-});
-
-run('跨過你起音的電腦音：結尾剛好接著你的下一個起音（含 MuseScore 的「少 1 tick」），你一直不按，最多多響 holdMaxMs；離你的起音遠的音不 hold', () => {
-  // 60 的結尾 tick ＝ 480（等於你的起音）、62 的結尾 tick ＝ 479（MuseScore 寫法）：都算「接著你的起音」，預定 500ms 收的音等你按下去；
-  // 64 的結尾 tick ＝ 432（離你的起音 48 tick）：不 hold，450ms 照收
-  const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 0.5, note: 60 }, { beat: 0, dur: ONE_TICK_SHORT, note: 62 }, { beat: 0, dur: 0.45, note: 64 }] }), [['me', 1]]);
-  d.tick();
-  const t0 = d.nowMs;
-  d.press();
-  d.runMs(900);                                              // 你不按第二下
-  assert(near(offMs(log, 64, 'assist') - t0, 450, TICK_MS * 2), `64 在 450ms 左右收（離你的起音遠，不 hold），實際 ${offMs(log, 64, 'assist') - t0}`);
-  assert(count(log, 'off', 60) === 0 && count(log, 'off', 62) === 0, `60、62 接著你的起音，900ms 時還在 hold，實際 off ${count(log, 'off', 60)}／${count(log, 'off', 62)} 個`);
-  d.runMs(500);
-  assert(near(offMs(log, 60, 'assist') - t0, 1300, TICK_MS * 2), `60 在 1300ms 左右收（預定 500 ＋ holdMaxMs 800），實際 ${offMs(log, 60, 'assist') - t0}`);
-  assert(near(offMs(log, 62, 'assist') - t0, 1300, TICK_MS * 2), `62 在 1300ms 左右收，實際 ${offMs(log, 62, 'assist') - t0}`);
-});
-
-run('跨過你起音的電腦音：結尾接著你的起音的音，你晚按時在你按下去的那一刻收（不再多響）', () => {
-  const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 0.5, note: 60 }, { beat: 0, dur: ONE_TICK_SHORT, note: 62 }] }), [['me', 1]]);
-  d.tick();
-  const t0 = d.nowMs;
-  d.press();
-  d.runMs(600);                                              // 預定 500ms 過了，你還沒按
-  assert(count(log, 'off', 60) === 0 && count(log, 'off', 62) === 0, '你還沒按，兩顆都還在響');
-  d.pressAt(t0 + 700);
-  assert(near(offMs(log, 60, 'assist') - t0, 700, TICK_MS * 2) && near(offMs(log, 62, 'assist') - t0, 700, TICK_MS * 2), `按下去的那一刻收，實際 ${offMs(log, 60, 'assist') - t0}／${offMs(log, 62, 'assist') - t0}`);
+  assert(d.pressAt(t0 + 700) === true, '第二下放行');
+  // 速度＝0.5s ÷ 0.7s；剩下的樂譜長度 1.0s ÷ 速度 ＝ 1400ms → 收音延後到 700 ＋ 1400 ＝ 2100ms（你的時間軸走到拍 3 的時刻）
+  d.runMs(900);                                              // 1600ms：原本預定的 1500ms 已過
+  assert(count(log, 'off', 60) === 0, `重新對時後預定 2100ms 才收，1600ms 時還在響，實際 off ${count(log, 'off', 60)} 個`);
+  d.runMs(1000);                                             // 你不再按：照重新對時的時刻收，不等你按拍 2
+  assert(near(offMs(log, 60, 'assist') - t0, 2100, TICK_MS), `60 在 2100ms 左右收，實際 ${offMs(log, 60, 'assist') - t0}`);
 });
 
 run('跨過你起音的電腦音：你按得比預估早，收音時刻不縮短（照原長放完，行為跟以前一樣）', () => {
@@ -430,56 +388,45 @@ run('跨過你起音的電腦音：跨過多個起音，每次按下都重新對
   assert(near(offMs(log, 60, 'assist') - t0, 3600, TICK_MS * 2), `60 在 3600ms 左右收，實際 ${offMs(log, 60, 'assist') - t0}`);
 });
 
-run('跨過你起音的電腦音：同譜表較晚起音的短音發聲，但沒有截短舊音（檔案重疊量一樣長）時，舊音照樣 hold', () => {
+run('跨過你起音的電腦音：同譜表較晚起音的短音發聲，但沒有截短舊音（檔案重疊量一樣長）時，舊音照樣重新對時', () => {
   // cpu 的 60（拍 0～1.5，endTick 720）跨過你在拍 1 的起音；同譜表的 61 在拍 0.5（tick 240）發聲，檔案裡 60 在 61 之後還要響 500ms。
-  // 61 發聲時（250ms）舊音 60 的收音上限 ＝ 250 ＋ 500 ＝ 750ms，剛好等於它原本預定的收音時刻：沒有截短，不能因為「同譜表有別的音」就放棄 hold
-  // （多聲部的譜表，內聲部的短音常在長音中間起音；你晚按時長音還是要等你按下去）。你一直不按 → 照 hold 上限收在 750 ＋ 800 ＝ 1550ms
+  // 61 發聲時（250ms）舊音 60 的收音上限 ＝ 250 ＋ 500 ＝ 750ms，剛好等於它原本預定的收音時刻：沒有截短，不能因為「同譜表有別的音」就不再
+  // 重新對時（多聲部的譜表，內聲部的短音常在長音中間起音）。你第二下晚到 650ms（60 還在響）→ 剩下 0.25s ÷ 速度（0.5 ÷ 0.65）＝ 325ms → 收在 975ms
   const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 0.75, note: 60 }, { beat: 0.5, dur: 0.1, note: 61 }] }), [['me', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(1400);
+  d.pressAt(t0 + 650);
+  d.runMs(600);
   assert(onMs(log, 61, 'assist') !== undefined, '61 發聲');
-  assert(count(log, 'off', 60) === 0, `1400ms 時 60 還在 hold，實際 off ${count(log, 'off', 60)} 個`);
-  d.runMs(300);
-  assert(near(offMs(log, 60, 'assist') - t0, 1550, TICK_MS * 2), `60 在 1550ms 左右收（預定 750 ＋ holdMaxMs 800），實際 ${offMs(log, 60, 'assist') - t0}`);
+  assert(near(offMs(log, 60, 'assist') - t0, 975, TICK_MS * 2), `60 在 975ms 左右收（重新對時），實際 ${offMs(log, 60, 'assist') - t0}`);
 });
 
-run('跨過你起音的電腦音：同譜表的新音發聲而真的截短了舊音時，尾巴收尾優先，不再延長', () => {
+run('跨過你起音的電腦音：同譜表的新音發聲而真的截短了舊音時，尾巴收尾優先，之後你按下去也不再重新對時延長', () => {
   // cpu 的 60 是整音符（拍 0～4，endTick 1920），跨過你在拍 1、2、3 的起音；你第二下早按（360ms，預測 500ms，速度變 1.389×）。
   // 同譜表的 61 在拍 1.25 發聲（按下後 90ms ＝ 450ms）：舊音 60 的收音上限 ＝ 450 ＋ 檔案重疊量 1.375s ÷ 1.389 ＝ 1440ms，比原本預定的 2000ms 早
-  // → 真的被截短，收在 1440ms，之後不再 hold（你到 2500ms 都沒按拍 2）
+  // → 真的被截短。你在 1200ms 按拍 2（60 還在響）：重新對時會把它延後到 1200 ＋ 1.0s ÷ 0.833 ＝ 2400ms，但截短過的音不動，照樣收在 1440ms
   const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2, 3, 4], cpu: [{ beat: 0, dur: 2.0, note: 60 }, { beat: 1.25, dur: 0.1, note: 61 }] }), [['me', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
   d.pressAt(t0 + 360);
-  d.runMs(2300);
-  assert(near(offMs(log, 60, 'assist') - t0, 1440, TICK_MS * 2), `60 在 1440ms 左右收（被尾巴收尾截短、不再 hold），實際 ${offMs(log, 60, 'assist') - t0}`);
+  d.pressAt(t0 + 1200);
+  d.runMs(1500);
+  assert(near(offMs(log, 60, 'assist') - t0, 1440, TICK_MS * 2), `60 在 1440ms 左右收（被尾巴收尾截短、不再重新對時延長），實際 ${offMs(log, 60, 'assist') - t0}`);
 });
 
-run('跨過你起音的電腦音：同音高的舊音正在 hold 時新音發聲，舊音不再延長（不然同音高先進先出佇列的新音收音被它擋住）', () => {
-  // 兩顆同音高 60：A 拍 0～2（跨過你在拍 1 的起音），B 在拍 0.25 發聲、很短。B 的收音排在 A 後面（先進先出），
-  // A 若繼續 hold 到 1800ms，B 也會被拖到 1800ms；A 被標成不再延長時，兩顆都在 A 預定的 1000ms 收
-  const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 1.0, note: 60 }, { beat: 0.25, dur: 0.1, note: 60 }] }), [['me', 1]]);
+run('跨過你起音的電腦音：後面排著同音高的新音時，你晚按也不重新對時延長舊音（不然同音高先進先出佇列的新音收音被它拖住）', () => {
+  // 兩顆同音高 60：A 拍 0～1.5（跨過你在拍 1 的起音），B 在拍 0.25 發聲、很短。B 的收音排在 A 後面（先進先出）。A 若在你晚按（650ms）時
+  // 被重新對時延後到 975ms，B 也會被拖到 975ms；A 被標成不再延長時，兩顆都在 A 預定的 750ms 收
+  const { log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 0.75, note: 60 }, { beat: 0.25, dur: 0.1, note: 60 }] }), [['me', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(1500);
-  assert(count(log, 'off', 60) === 2 && near(offMs(log, 60, 'assist') - t0, 1000, TICK_MS * 2), `兩顆 60 都在 1000ms 左右收，實際 off ${count(log, 'off', 60)} 個，第一個在 ${offMs(log, 60, 'assist') - t0}`);
-});
-
-run('跨過你起音的電腦音：hold 中按暫停，收一次；續播後不重複收', () => {
-  const { hp, log, d } = makeHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 1.0, note: 60 }] }), [['me', 1]]);
-  d.tick();
-  d.press();
-  d.runMs(1100);
-  assert(count(log, 'off', 60) === 0, 'hold 中還沒收');
-  hp.pause();
-  assert(count(log, 'off', 60) === 1, `暫停收掉它，實際 off ${count(log, 'off', 60)} 個`);
-  hp.play();
-  d.runMs(2000);
-  assert(count(log, 'off', 60) === 1, `續播後不再重複收，實際 off ${count(log, 'off', 60)} 個`);
+  d.pressAt(t0 + 650);
+  d.runMs(800);
+  const offs = log.filter((e) => e.t === 'off' && e.note === 60).map((e) => e.ms - t0);
+  assert(offs.length === 2 && offs.every((ms) => near(ms, 750, TICK_MS * 2)), `兩顆 60 都在 750ms 左右收，實際 ${offs}`);
 });
 
 run('按鍵記錄：每次按鍵嘗試都記（含被去抖擋掉、前奏預按），沒有資格的不記；重設清空；回傳的是複本', () => {
@@ -589,17 +536,15 @@ run('停格超過閒置門檻（800ms）：已經開始的有固定長度的音�
   assert(count(log, 'on', 41) === 1 && count(log, 'off', 40) === 1, '之後照常放行，長音不會再收第二次');
 });
 
-run('停格超過閒置門檻（800ms）：電腦聲部已經開始、跨過你下一個起音的長音，最多多響 holdMaxMs（800ms）就收，不會被閒置收音切掉、也不會無限撐住', () => {
-  const { log, d } = makeHp(buildBeatScore({ p0: [0, 4], a1: [{ beat: 0, dur: 3 }] }), [['p0', 1]]); // 電腦的長音 3s（拍 0～6），跨過你在拍 4（2s）的起音
+run('停格超過閒置門檻（800ms）：電腦聲部已經開始的長音同樣照 MIDI 音長放完', () => {
+  const { log, d } = makeHp(buildBeatScore({ p0: [0, 4], a1: [{ beat: 0, dur: 3 }] }), [['p0', 1]]); // 電腦的長音 3s，你的下一個起音在 2s
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(2900);                                              // 2s 起停格，停格 0.9s：超過閒置門檻，預定收音時刻（3000ms）還沒到
+  d.runMs(2900);                                              // 2s 起停格，停格 0.9s：超過門檻
   assert(count(log, 'on', 52) === 1 && count(log, 'off', 52) === 0, `電腦的長音還沒到結尾，不能被切掉，實際 off ${count(log, 'off', 52)} 個`);
-  d.runMs(500);                                               // 3400ms：預定的 3000ms 過了，你還沒按拍 4，hold 中
-  assert(count(log, 'off', 52) === 0, '預定時刻過了、你還沒按它跨過的起音，hold 中不收');
-  d.runMs(600);
-  assert(near(offMs(log, 52, 'assist') - t0, 3800, TICK_MS * 2), `電腦的長音在 3800ms（預定 3000 ＋ holdMaxMs 800）收，實際 ${offMs(log, 52, 'assist') - t0}`);
+  d.runMs(500);
+  assert(near(offMs(log, 52, 'assist') - t0, 3000, TICK_MS), `電腦的長音在 3000ms 收，實際 ${offMs(log, 52, 'assist') - t0}`);
 });
 
 run('最後一個 driver 起音之後的電腦音照節奏自己放完，尾音照時值收完才算播完；進度夾在總長以內', () => {
@@ -724,15 +669,21 @@ run('相連音不撐：你的音在自己的結尾就收，不等你按下一個
   assert(count(log, 'off', 40) === 1 && count(log, 'on', 41) === 1, '下一個起音放行時沒有額外的收音，只是開新音');
 });
 
-run('電腦聲部的相連音（結尾接著你的下一個起音）：你不按，最多多響 holdMaxMs 就收，不是無限撐住', () => {
-  const { log, d } = makeHp(buildBeatScore({ a0: [{ beat: 0, dur: ONE_TICK_SHORT }, { beat: 1, dur: 0.4 }], p1: [0, 1] }), [['p1', 1]]);
+run('電腦聲部的相連音也不撐：結尾接著你的下一個起音（含 MuseScore 的「少 1 tick」），你晚按時跟同起訖的你的音同時在自己的結尾收', () => {
+  // 你的 40 與電腦的 60 起訖完全相同（拍 0 到拍 1 − 1 tick）；電腦的 62 結尾剛好等於你的下一個起音（tick 480）。
+  // 第二下晚到 900ms（預測 500ms）：三顆都在自己的結尾（約 499／500ms）收，電腦音不等你按下去（不然電腦音比你的長）
+  const { log, d } = makeHp(buildBeatScore({
+    me: [{ beat: 0, dur: ONE_TICK_SHORT, note: 40 }, { beat: 1, dur: 0.4, note: 41 }],
+    cpu: [{ beat: 0, dur: ONE_TICK_SHORT, note: 60 }, { beat: 0, dur: 0.5, note: 62 }],
+  }), [['me', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(700);
-  assert(count(log, 'off', 40) === 0, `結尾接著你的起音，你還沒按，700ms 時 40 還在 hold，實際 off ${count(log, 'off', 40)} 個`);
-  d.runMs(700);
-  assert(count(log, 'off', 40) === 1 && near(offMs(log, 40, 'assist') - t0, 1000 * ONE_TICK_SHORT + 800, TICK_MS * 2), `40 在自己的結尾 ＋ holdMaxMs（約 1298ms）收，實際 ${offMs(log, 40, 'assist') - t0}`);
+  d.pressAt(t0 + 900);
+  const mine = offMs(log, 40, 'human') - t0;
+  assert(near(mine, 1000 * ONE_TICK_SHORT, TICK_MS), `你的 40 在自己的結尾（約 ${Math.round(1000 * ONE_TICK_SHORT)}ms）收，實際 ${mine}`);
+  assert(near(offMs(log, 60, 'assist') - t0, mine, TICK_MS), `電腦的 60（跟你的 40 同起訖）跟你的音同時收、不等你按，實際 ${offMs(log, 60, 'assist') - t0}`);
+  assert(near(offMs(log, 62, 'assist') - t0, 500, TICK_MS), `電腦的 62 在自己的結尾（500ms）收、不等你按，實際 ${offMs(log, 62, 'assist') - t0}`);
 });
 
 run('相連音的後繼音就在同一段裡（不用等你按）：照自己的時刻關、再開', () => {
@@ -1262,9 +1213,8 @@ run('固定種子的整體不變量壓力測試：隨機譜、3 位演奏者、�
       prevPos = pos;
       const next = hp._driverSegs[hp._segIndex];
       assert(!next || pos <= next.ticks + 1e-6, `seed ${seed}：播放頭 ${pos} 越過你的下一個起音（tick ${next?.ticks}）`);
-      // 沒有任何音會被撐住：這個 tick 結束時，每個音高佇列的最前面那一顆（同音高先進先出，後面的音要等前面的收掉）都該還沒到自己的結尾（停格再久也一樣）。
-      // 唯一的例外是電腦音的 hold（跨過你起音、你還沒按、且沒超過 holdMaxMs，見 _isHeld）；你的音 holdSeg 一律 -1，不會被放過
-      const overdue = [...hp._staves.values()].reduce((a, v) => a + [...v.sounding.values()].reduce((b, q) => b + (q.length && q[0].offMs <= hp._clockMs - 1e-6 && !hp._isHeld(q[0]) ? 1 : 0), 0), 0);
+      // 沒有任何音會被撐住：這個 tick 結束時，每個音高佇列的最前面那一顆（同音高先進先出，後面的音要等前面的收掉）都該還沒到自己的結尾（停格再久也一樣）
+      const overdue = [...hp._staves.values()].reduce((a, v) => a + [...v.sounding.values()].reduce((b, q) => b + (q.length && q[0].offMs <= hp._clockMs - 1e-6 ? 1 : 0), 0), 0);
       assert(overdue === 0, `seed ${seed}：有 ${overdue} 個音過了自己的結尾還在響`);
       if (hp._stallMsAt(hp._clockMs) > 800 + 1e-9) idleSeen++;
     }
@@ -1389,24 +1339,15 @@ run('lookahead：暫停時已經送出、還沒響的電腦音，另外送一個
   assert(!log.some((e) => e.t === 'off' && e.note === 53 && e.time === undefined), '不能送立刻處理的 noteOff（會比那顆 noteOn 早到）');
 });
 
-run('lookahead：結尾接著你的下一個起音的電腦音，預定收音時刻到了、你還沒按時不提早送收音；hold 到期才收', () => {
-  // a1 在拍 1 的 60 結尾比拍 2（你的下一個起音，p0）早 1 tick；61 在拍 2、在還沒啟動的段裡
+run('lookahead：相連音（後繼音在你還沒按的那一段）的收音也照自己的結尾提早帶時間戳送出，不等你按下去', () => {
+  // a1 在拍 1 的 60 與拍 2 的 61 是相連音（間隙 1 tick）；拍 2 是你的下一個起音（p0），61 在還沒啟動的段裡
   const { log, d } = makeAudioHp(buildBeatScore({ p0: [0, 2], a1: [{ beat: 1, dur: ONE_TICK_SHORT, note: 60 }, { beat: 2, dur: 0.025, note: 61 }] }), [['p0', 1]]);
   d.tick();
   d.press();
-  d.runMs(1100);                                                          // 60 的預定收音時刻（約 998ms）過了，你還沒按第二下：hold 中，lookahead 範圍內也不能送收音
-  assert(!log.some((e) => e.t === 'off' && e.note === 60), `hold 中不能送收音，實際 ${JSON.stringify(log.filter((e) => e.note === 60))}`);
+  d.runMs(1100);                                                          // 60 的收音時刻（約 998ms）早已落在 lookahead 範圍內，你還沒按第二下
+  const off60 = log.find((e) => e.t === 'off' && e.note === 60);
+  assert(off60 && off60.time !== undefined, `60 在自己的結尾收，而且帶時間戳（lookahead），實際 ${JSON.stringify(log.filter((e) => e.note === 60))}`);
   assert(!log.some((e) => e.t === 'on' && e.note === 61), '你還沒按，61 不會發聲');
-  d.runMs(1000);                                                          // 預定 998 ＋ holdMaxMs 800 ＝ 約 1798ms 到期
-  assert(log.some((e) => e.t === 'off' && e.note === 60), '到了 hold 的上限就收');
-});
-
-run('跨過你起音的電腦音：lookahead 開著，hold 中的音不提早送帶時間戳的收音（worklet 取消不了）', () => {
-  const { log, d } = makeAudioHp(buildBeatScore({ me: [0, 1, 2], cpu: [{ beat: 0, dur: 1.0, note: 60 }] }), [['me', 1]]);
-  d.tick();
-  d.press();
-  d.runMs(1100);                                             // 預定 1000ms 過了、你還沒按：lookahead 範圍內也不能送 noteOff
-  assert(!log.some((e) => e.t === 'off' && e.note === 60), `hold 中不能送收音（含帶時間戳的），實際 ${JSON.stringify(log.filter((e) => e.note === 60 && e.t === 'off'))}`);
 });
 
 // 依 worklet 的規則重播事件：時間戳在未來才排進佇列、已過就在送出的當下立刻處理，同一刻依送出順序。
